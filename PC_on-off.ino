@@ -76,10 +76,6 @@ void loop()
   workTime += millis()-lastMillis;  // Додаємо час роботи
   onPcTime = OnPC;  // Оновлюємо температуру
   lastMillis = millis();
-  // if (WiFi.status() != WL_CONNECTED)
-  // {
-  //   connectWiFi();  // Перезапускаємо пристрій
-  // }
   saveData();  // Зберігаємо нові дані
   bot.tick();
   

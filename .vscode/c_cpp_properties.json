@@ -1,0 +1,31 @@
+{
+  "configurations": [
+    {
+      "name": "Arduino",
+      "includePath": [
+        "C:/Users/MAX/AppData/Local/Arduino15/libraries/**",
+        "C:/Users/MAX/Documents/Arduino/libraries/**",
+        "C:/Users/MAX/AppData/Local/Arduino15/packages/**"
+      ],
+      "browse": {
+        "path": [
+          "C:/Users/MAX/AppData/Local/Arduino15/libraries",
+          "C:/Users/MAX/Documents/Arduino/libraries",
+          "C:/Users/MAX/AppData/Local/Arduino15/packages"
+        ],
+        "limitSymbolsToIncludedHeaders": true
+      },
+      "defines": [
+        "ARDUINO=10819",       // або інша версія, наприклад 10819 = 1.8.19
+        "ESP8266",             // або ESP32, залежно від плати
+        "F_CPU=160000000L",
+        "ARDUINO_ARCH_ESP8266" // або ARDUINO_ARCH_ESP32
+      ],
+      "compilerPath": "C:/Users/MAX/AppData/Local/Arduino15/packages/esp8266/tools/xtensa-lx106-elf-gcc/3.1.0-gcc10.3-e5f9fec/bin/xtensa-lx106-elf-gcc.exe",  // ← шлях до компілятора (точний шлях уточнимо за потреби)
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "windows-gcc-x64"
+    }
+  ],
+  "version": 4
+}

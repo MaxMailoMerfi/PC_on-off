@@ -2,14 +2,13 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Copy BIN to folder",
+      "label": "build+copy",
       "type": "shell",
-      "command": "copy",
-      "args": [
-        "${workspaceFolder}/build/PC_on-off.ino.bin",
-        "${workspaceFolder}/PC_on-off.ino.bin"
-      ],
-      "group": "build",
+      "command": "arduino-cli compile --fqbn esp8266:esp8266:d1_mini PC_on-off.ino && .vscode\\copy_bin.bat",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
       "problemMatcher": []
     }
   ]

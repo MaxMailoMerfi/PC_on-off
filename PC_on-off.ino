@@ -1,3 +1,5 @@
+//To create a bin file, click [Complite] at the bottom right
+//bin файл копіюється за натисканням [Ctrl+Shift+B] і знаходиться біля ino
   const char* wifiList[][2] = {
     {"deti_podzemelia", "12345678"},
     {"Xiaomi 14T", ""},

@@ -1,0 +1,17 @@
+#line 1 "D:\\Max\\WEMOS\\PC_on-off\\.vscode\\tasks.json"
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Copy BIN to folder",
+      "type": "shell",
+      "command": "copy",
+      "args": [
+        "${workspaceFolder}/build/PC_on-off.ino.bin",
+        "${workspaceFolder}/PC_on-off.ino.bin"
+      ],
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}

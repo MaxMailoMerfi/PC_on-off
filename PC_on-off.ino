@@ -1,10 +1,12 @@
-//To create a bin file, click [Complite] at the bottom right
-//bin файл копіюється за натисканням [Ctrl+Shift+B] і знаходиться біля ino
-  const char* wifiList[][2] = {
-    {"deti_podzemelia", "12345678"},
-    {"Xiaomi 14T", ""},
-    {"Ingener_Technology", ""}
-  };
+//Arduino Maker Workshop
+//Щоб створити файл кошика, натисніть [Complite] внизу праворуч
+//файл bin копіюється натисканням [Ctrl+Shift+B] та вибором [build+copy] і знаходиться поруч з ino
+
+const char* wifiList[][2] = {
+  {"deti_podzemelia", "12345678"},
+  {"Xiaomi 14T", ""},
+  {"Ingener_Technology", ""}
+};
 
 #define BOT_TOKEN "7714508177:AAEt_BhjKln3t6FgsjBMV5biA4iMw6zKw-E" // 
 #define relePin   4 // номер контакту для підключення реле

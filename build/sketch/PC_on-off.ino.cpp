@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #line 1 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+//To create a bin file, click [Complite] at the bottom right
+//bin файл копіюється за натисканням [Ctrl+Shift+B] і знаходиться біля ino
   const char* wifiList[][2] = {
     {"deti_podzemelia", "12345678"},
     {"Xiaomi 14T", ""},
@@ -26,21 +28,21 @@ unsigned long workTime = 0,onPcTime = 0, lastMillis = 0, lastOnPC = 0;
 
 
 
-#line 27 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 29 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void setup();
-#line 73 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 75 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void loop();
-#line 115 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 117 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void newMsg(FB_msg& msg);
-#line 252 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 254 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void connectWiFi();
-#line 285 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 287 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void saveData();
-#line 305 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 307 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void loadData();
-#line 330 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 332 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void deleteJSON();
-#line 27 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 29 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void setup()
 {
   Serial.begin(115200);

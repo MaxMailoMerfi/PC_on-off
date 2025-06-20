@@ -9,7 +9,7 @@ set "DST=PC_on-off.ino.bin"
 REM --- Копіювання ---
 if exist "%SRC%" (
     copy /Y "%SRC%" "%DST%"
-    echo ✓ The BIN file has been copied!
+    echo The BIN file has been copied!
 ) else (
-    echo ⚠ BIN file not found!
+    echo BIN file not found!
 )

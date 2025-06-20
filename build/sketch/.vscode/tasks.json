@@ -3,14 +3,14 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "build+copy",
+      "label": "copy_bin",
       "type": "shell",
-      "command": "arduino-cli compile --fqbn esp8266:esp8266:d1_mini PC_on-off.ino && .vscode\\copy_bin.bat",
+      "command": ".vscode\\copy_bin.bat",
+      "problemMatcher": [],
       "group": {
         "kind": "build",
-        "isDefault": true
-      },
-      "problemMatcher": []
+        "isDefault": false
+      }
     }
   ]
 }

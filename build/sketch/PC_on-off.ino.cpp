@@ -377,7 +377,9 @@ String textMenu(String menu)
 {
   String text;
   if (menu == "start"){text = "Увімкнути \t  Вимкнути \n Аптайм \t Стан \t Ресет";}
-  else {text = "невідома команда лоя меню";}
+  else if (menu == "wifi"){text = "Переглянути Log";}
+  
+  else {text = "невідома команда для меню";}
 
   return text;
 }

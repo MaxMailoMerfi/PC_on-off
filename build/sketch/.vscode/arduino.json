@@ -1,4 +1,4 @@
-#line 1 "D:\\Max\\WEMOS\\PC_on-off\\.vscode\\arduino.json"
+#line 1 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\.vscode\\arduino.json"
 {
   "port": "COM1",
   "configuration": "baud=921600,xtal=80,eesz=4M2M,dbg=Disabled,lvl=None____,ip=lm2f,vt=flash,exception=disabled,stacksmash=disabled,wipe=none,ssl=all,mmu=3232,non32xfer=fast",

@@ -1,4 +1,4 @@
-#line 1 "D:\\Max\\WEMOS\\PC_on-off\\.vscode\\settings.json"
+#line 1 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\.vscode\\settings.json"
 {
   "arduino.path": "C:\\Program Files\\Arduino IDE",   // або інший шлях
   "arduino.defaultBoard": "esp8266:esp8266:d1_mini",

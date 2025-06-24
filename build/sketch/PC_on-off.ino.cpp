@@ -1,23 +1,21 @@
 #include <Arduino.h>
-#line 1 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
-//To create a bin file, click [Complite] at the bottom right
-//bin файл копіюється за натисканням [Ctrl+Shift+B] і знаходиться біля ino
-  const char* wifiList[][2] = {
-    {"deti_podzemelia", "12345678"},
-    {"Xiaomi 14T", ""},
-    {"Ingener_Technology", ""}
-  };
+#line 1 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+//Arduino Maker Workshop
+//Щоб створити файл кошика, натисніть [Complite] внизу праворуч
+//файл bin копіюється натисканням [Ctrl+Shift+B] та вибором [build+copy] і знаходиться поруч з ino
+
+const char* wifiList[][2] = {
+  {"deti_podzemelia", "12345678"},
+  {"Xiaomi 14T", ""},
+  {"Ingener_Technology", ""}
+};
 
 #define BOT_TOKEN "7714508177:AAEt_BhjKln3t6FgsjBMV5biA4iMw6zKw-E" // 
 #define relePin   4 // номер контакту для підключення реле
 #define POWER_PIN A0
 #define CHAT_ID_ADMIN "1031379571"
 String myNameBot = "Головний комп'ютер";
-unsigned long checkAlarmWiFi = millis();
-unsigned long previousMillis;             // для заміру часу роботи сирени
-unsigned long currentMillis;
-int POWER, OnPC = 0, OffPC = 0, OnOffPower;
-int rowsWifiList;
+int POWER, OnPC = 0, OffPC = 0, OnOffPower,rowsWifiList;
   String PC = "";
 
 #include <FastBot.h>                      //https://github.com/GyverLibs/FastBot
@@ -28,21 +26,21 @@ unsigned long workTime = 0,onPcTime = 0, lastMillis = 0, lastOnPC = 0;
 
 
 
-#line 29 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 27 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void setup();
-#line 75 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 71 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void loop();
-#line 117 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 113 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void newMsg(FB_msg& msg);
-#line 254 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 250 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void connectWiFi();
-#line 287 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 283 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void saveData();
-#line 307 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 303 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void loadData();
-#line 332 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 328 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void deleteJSON();
-#line 29 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
+#line 27 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void setup()
 {
   Serial.begin(115200);
@@ -63,9 +61,7 @@ void setup()
   pinMode(relePin, OUTPUT);               // налаштовуємо контакт для реле як вихід
   digitalWrite(relePin, 1);            // вимикаємо реле
   
-
   loadData();  // Завантажуємо дані
-
 
   rowsWifiList = (sizeof(wifiList) / sizeof(wifiList[0]));
 
@@ -309,8 +305,8 @@ void saveData() {
 
   File file = LittleFS.open("/data.json", "w");
   if (!file) {
-    Serial.println("❌ Помилка відкриття файлу для запису");
-    bot.sendMessage("❌ Помилка відкриття файлу для запису", CHAT_ID_ADMIN);
+    Serial.println("❌ Помилка відкриття файлу для запису (відсутній)");
+    bot.sendMessage("❌ Помилка відкриття файлу для запису (відсутній)", CHAT_ID_ADMIN);
     return;
   }
 
@@ -325,7 +321,7 @@ void loadData() {
   File file = LittleFS.open("/data.json", "r");
   if (!file) {
     Serial.println("⚠️ Файл не знайдено, створюємо новий");
-    // bot.sendMessage("⚠️ Файл не знайдено, створюємо новий", CHAT_ID_ADMIN);
+    bot.sendMessage("⚠️ Файл не знайдено, створюємо новий", CHAT_ID_ADMIN);
     saveData();  // Створюємо файл із початковими значеннями
     return;
   }
@@ -346,7 +342,8 @@ void loadData() {
   file.close();
 }
 
-void deleteJSON() {
+void deleteJSON()
+{
   if (LittleFS.exists("/data.json")) {  // Перевіряємо, чи існує файл
     if (LittleFS.remove("/data.json")) 
     {  // Видаляємо файл

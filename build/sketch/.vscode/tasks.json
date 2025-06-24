@@ -1,16 +1,19 @@
-#line 1 "D:\\Max\\WEMOS\\PC_on-off\\.vscode\\tasks.json"
+#line 1 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\.vscode\\tasks.json"
 {
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "copy_bin",
+      "label": "copy-bin-only",
       "type": "shell",
       "command": ".vscode\\copy_bin.bat",
-      "problemMatcher": [],
-      "group": {
-        "kind": "build",
-        "isDefault": false
-      }
+      "group": "none",
+      "problemMatcher": []
+    },
+    {
+      "label": "build+copy",
+      "dependsOn": ["arduino: build", "copy-bin-only"],
+      "group": "build",
+      "problemMatcher": []
     }
   ]
 }

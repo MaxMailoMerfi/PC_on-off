@@ -3,7 +3,7 @@
   "compiler.optimization_flags": "",
   "customBuildProperties": "build.warn_data_percentage=75",
   "fqbn": "esp8266:esp8266:d1_mini:baud=921600,xtal=80,eesz=4M2M,dbg=Disabled,lvl=None____,ip=lm2f,vt=flash,exception=disabled,stacksmash=disabled,wipe=none,ssl=all,mmu=3232,non32xfer=fast",
-  "hardwareFolders": "C:\\Users\\MAX\\AppData\\Local\\Arduino15\\packages",
-  "otherLibrariesFolders": "C:\\Users\\MAX\\Documents\\Arduino\\libraries",
-  "sketchLocation": "D:\\Max\\WEMOS\\PC_on-off"
+  "hardwareFolders": "C:\\Users\\Prepod\\AppData\\Local\\Arduino15\\packages",
+  "otherLibrariesFolders": "C:\\Users\\Prepod\\Documents\\Arduino\\libraries",
+  "sketchLocation": "C:\\Users\\Prepod\\Desktop\\PC_on-off"
 }

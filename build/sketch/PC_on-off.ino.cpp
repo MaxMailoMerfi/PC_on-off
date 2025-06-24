@@ -1,8 +1,12 @@
 #include <Arduino.h>
 #line 1 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 //Arduino Maker Workshop
-//Щоб створити файл кошика, натисніть [Complite] внизу праворуч
+//Щоб створити файли для праці і обновити [bin], натисніть [Complite] внизу праворуч
 //файл bin копіюється натисканням [Ctrl+Shift+B] та вибором [build+copy] і знаходиться поруч з ino
+
+const char* wifiTest[][2] = {
+  {"deti_podzemelia", "12345678"},
+};
 
 const char* wifiList[][2] = {
   {"deti_podzemelia", "12345678"},
@@ -26,21 +30,23 @@ unsigned long workTime = 0,onPcTime = 0, lastMillis = 0, lastOnPC = 0;
 
 
 
-#line 27 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 31 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void setup();
-#line 71 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 75 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void loop();
-#line 113 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 117 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void newMsg(FB_msg& msg);
-#line 250 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 257 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void connectWiFi();
-#line 283 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 290 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void saveData();
-#line 303 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 310 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void loadData();
-#line 328 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
-void deleteJSON();
-#line 27 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 335 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+void deleteJSON(String jsonFile);
+#line 357 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+String textMenu(String menu);
+#line 31 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
 void setup()
 {
   Serial.begin(115200);
@@ -140,19 +146,19 @@ void newMsg(FB_msg& msg)
   if (from_name == "")
     from_name = "Аноним";
 
-  int32_t msgID = msg.messageID;  // ID сообщения
-
-  // обновить, если файл имеет нужную подпись
-  if (msg.OTA /*&& msg.text == "ADMIN"*/)bot.update();
-
+  // int32_t msgID = msg.messageID;  // ID сообщения
 
   curentTime = bot.getUnix();     // поточний час в ЮНІКС форматі
   messageTime = msg.unix - 2;     // зменшимо час повідомлення щоб уникнути глюк
 
 
-  // обробляємо натискання софт-кнопки в юзер меню в месенджері
 
-  if (msgText == "/start")         // формуємо юзер меню з софт кнопками
+// обновить, если файл имеет нужную подпись
+  if (msg.OTA && msg.text == "ADMIN")bot.update();
+
+// обробляємо натискання софт-кнопки в юзер меню в месенджері
+
+  if (msgText == "/start")// формуємо юзер меню з софт кнопками
   {
     bot.tickManual();  // Скидаємо кеш отриманих повідомлень
     //String welcome = "Вітаю, " + from_name + ".\n";
@@ -160,8 +166,10 @@ void newMsg(FB_msg& msg)
     Serial.println("\nВітаю, " + from_name + ".\n");
 
     // показати юзер меню (\t - горизонтальний поділ кнопок, \n - вертикальний
-    bot.showMenu("Увімкнути \t  Вимкнути \n Аптайм \t Стан \t Ресет", msg.chatID);
+    bot.showMenu(textMenu("start"), msg.chatID);
   }
+
+  
 
   if (msgText == "Увімкнути")
   {
@@ -257,8 +265,9 @@ void newMsg(FB_msg& msg)
 
   if (msgText == "/remove")
   {
+    String jsonFile = "data";
     bot.tickManual();  // Скидаємо кеш отриманих повідомлень
-    deleteJSON();  // Видаляємо JSON-файл
+    deleteJSON("/" + jsonFile + ".json");  // Видаляємо JSON-файл
     ESP.restart();
   }
   
@@ -342,10 +351,11 @@ void loadData() {
   file.close();
 }
 
-void deleteJSON()
+void deleteJSON(String jsonFile)
 {
-  if (LittleFS.exists("/data.json")) {  // Перевіряємо, чи існує файл
-    if (LittleFS.remove("/data.json")) 
+  
+  if (LittleFS.exists(jsonFile)) {  // Перевіряємо, чи існує файл
+    if (LittleFS.remove(jsonFile)) 
     {  // Видаляємо файл
       Serial.println("✅ JSON-файл успішно видалений!");
       bot.sendMessage("✅ JSON-файл успішно видалений!", CHAT_ID_ADMIN);
@@ -363,3 +373,11 @@ void deleteJSON()
   }
 }
 
+String textMenu(String menu)
+{
+  String text;
+  if (menu == "start"){text = "Увімкнути \t  Вимкнути \n Аптайм \t Стан \t Ресет";}
+  else {text = "невідома команда лоя меню";}
+
+  return text;
+}

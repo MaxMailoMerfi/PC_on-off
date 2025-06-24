@@ -13,11 +13,7 @@ const char* wifiList[][2] = {
 #define POWER_PIN A0
 #define CHAT_ID_ADMIN "1031379571"
 String myNameBot = "Головний комп'ютер";
-unsigned long checkAlarmWiFi = millis();
-unsigned long previousMillis;             // для заміру часу роботи сирени
-unsigned long currentMillis;
-int POWER, OnPC = 0, OffPC = 0, OnOffPower;
-int rowsWifiList;
+int POWER, OnPC = 0, OffPC = 0, OnOffPower,rowsWifiList;
   String PC = "";
 
 #include <FastBot.h>                      //https://github.com/GyverLibs/FastBot
@@ -48,9 +44,7 @@ void setup()
   pinMode(relePin, OUTPUT);               // налаштовуємо контакт для реле як вихід
   digitalWrite(relePin, 1);            // вимикаємо реле
   
-
   loadData();  // Завантажуємо дані
-
 
   rowsWifiList = (sizeof(wifiList) / sizeof(wifiList[0]));
 
@@ -294,8 +288,8 @@ void saveData() {
 
   File file = LittleFS.open("/data.json", "w");
   if (!file) {
-    Serial.println("❌ Помилка відкриття файлу для запису");
-    bot.sendMessage("❌ Помилка відкриття файлу для запису", CHAT_ID_ADMIN);
+    Serial.println("❌ Помилка відкриття файлу для запису (відсутній)");
+    bot.sendMessage("❌ Помилка відкриття файлу для запису (відсутній)", CHAT_ID_ADMIN);
     return;
   }
 
@@ -310,7 +304,7 @@ void loadData() {
   File file = LittleFS.open("/data.json", "r");
   if (!file) {
     Serial.println("⚠️ Файл не знайдено, створюємо новий");
-    // bot.sendMessage("⚠️ Файл не знайдено, створюємо новий", CHAT_ID_ADMIN);
+    bot.sendMessage("⚠️ Файл не знайдено, створюємо новий", CHAT_ID_ADMIN);
     saveData();  // Створюємо файл із початковими значеннями
     return;
   }
@@ -331,7 +325,8 @@ void loadData() {
   file.close();
 }
 
-void deleteJSON() {
+void deleteJSON()
+{
   if (LittleFS.exists("/data.json")) {  // Перевіряємо, чи існує файл
     if (LittleFS.remove("/data.json")) 
     {  // Видаляємо файл

@@ -1,6 +1,10 @@
 //Arduino Maker Workshop
-//Щоб створити файлии для праці, натисніть [Complite] внизу праворуч
+//Щоб створити файли для праці і обновити [bin], натисніть [Complite] внизу праворуч
 //файл bin копіюється натисканням [Ctrl+Shift+B] та вибором [build+copy] і знаходиться поруч з ino
+
+const char* wifiTest[][2] = {
+  {"deti_podzemelia", "12345678"},
+};
 
 const char* wifiList[][2] = {
   {"deti_podzemelia", "12345678"},
@@ -123,19 +127,19 @@ void newMsg(FB_msg& msg)
   if (from_name == "")
     from_name = "Аноним";
 
-  int32_t msgID = msg.messageID;  // ID сообщения
-
-  // обновить, если файл имеет нужную подпись
-  if (msg.OTA /*&& msg.text == "ADMIN"*/)bot.update();
-
+  // int32_t msgID = msg.messageID;  // ID сообщения
 
   curentTime = bot.getUnix();     // поточний час в ЮНІКС форматі
   messageTime = msg.unix - 2;     // зменшимо час повідомлення щоб уникнути глюк
 
 
-  // обробляємо натискання софт-кнопки в юзер меню в месенджері
 
-  if (msgText == "/start")         // формуємо юзер меню з софт кнопками
+// обновить, если файл имеет нужную подпись
+  if (msg.OTA && msg.text == "ADMIN")bot.update();
+
+// обробляємо натискання софт-кнопки в юзер меню в месенджері
+
+  if (msgText == "/start")// формуємо юзер меню з софт кнопками
   {
     bot.tickManual();  // Скидаємо кеш отриманих повідомлень
     //String welcome = "Вітаю, " + from_name + ".\n";
@@ -143,8 +147,10 @@ void newMsg(FB_msg& msg)
     Serial.println("\nВітаю, " + from_name + ".\n");
 
     // показати юзер меню (\t - горизонтальний поділ кнопок, \n - вертикальний
-    bot.showMenu("Увімкнути \t  Вимкнути \n Аптайм \t Стан \t Ресет", msg.chatID);
+    bot.showMenu(textMenu("start"), msg.chatID);
   }
+
+  
 
   if (msgText == "Увімкнути")
   {
@@ -240,8 +246,9 @@ void newMsg(FB_msg& msg)
 
   if (msgText == "/remove")
   {
+    String jsonFile = "data";
     bot.tickManual();  // Скидаємо кеш отриманих повідомлень
-    deleteJSON();  // Видаляємо JSON-файл
+    deleteJSON("/" + jsonFile + ".json");  // Видаляємо JSON-файл
     ESP.restart();
   }
   
@@ -325,10 +332,11 @@ void loadData() {
   file.close();
 }
 
-void deleteJSON()
+void deleteJSON(String jsonFile)
 {
-  if (LittleFS.exists("/data.json")) {  // Перевіряємо, чи існує файл
-    if (LittleFS.remove("/data.json")) 
+  
+  if (LittleFS.exists(jsonFile)) {  // Перевіряємо, чи існує файл
+    if (LittleFS.remove(jsonFile)) 
     {  // Видаляємо файл
       Serial.println("✅ JSON-файл успішно видалений!");
       bot.sendMessage("✅ JSON-файл успішно видалений!", CHAT_ID_ADMIN);
@@ -344,4 +352,13 @@ void deleteJSON()
     Serial.println("⚠️ Файл JSON не знайдено!");
     bot.sendMessage("⚠️ Файл JSON не знайдено!", CHAT_ID_ADMIN);
   }
+}
+
+String textMenu(String menu)
+{
+  String text;
+  if (menu == "start"){text = "Увімкнути \t  Вимкнути \n Аптайм \t Стан \t Ресет";}
+  else {text = "невідома команда лоя меню";}
+
+  return text;
 }

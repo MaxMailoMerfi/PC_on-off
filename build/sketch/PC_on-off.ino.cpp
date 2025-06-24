@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#line 1 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 1 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 //Arduino Maker Workshop
 //Щоб створити файли для праці і обновити [bin], натисніть [Complite] внизу праворуч
 //файл bin копіюється натисканням [Ctrl+Shift+B] та вибором [build+copy] і знаходиться поруч з ino
@@ -30,23 +30,23 @@ unsigned long workTime = 0,onPcTime = 0, lastMillis = 0, lastOnPC = 0;
 
 
 
-#line 31 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 31 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void setup();
-#line 75 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 75 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void loop();
-#line 117 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 117 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void newMsg(FB_msg& msg);
-#line 257 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 257 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void connectWiFi();
-#line 290 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 290 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void saveData();
-#line 310 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 310 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void loadData();
-#line 335 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 335 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void deleteJSON(String jsonFile);
-#line 357 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 357 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 String textMenu(String menu);
-#line 31 "C:\\Users\\Prepod\\Desktop\\PC_on-off\\PC_on-off.ino"
+#line 31 "D:\\Max\\WEMOS\\PC_on-off\\PC_on-off.ino"
 void setup()
 {
   Serial.begin(115200);

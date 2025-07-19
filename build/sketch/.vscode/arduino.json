@@ -14,5 +14,6 @@
     "dataBits": 8,
     "parity": "none",
     "stopBits": "one"
-  }
+  },
+  "optimize_for_debug": false
 }

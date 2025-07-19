@@ -1,5 +1,5 @@
-D:\Max\WEMOS\PC_on-off\build\libraries\ESP8266HTTPClient\ESP8266HTTPClient.cpp.o: \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266HTTPClient\src\ESP8266HTTPClient.cpp \
+D:\Max\WEMOS\PC_on-off\build\libraries\ESP8266WebServer\ESP8266WebServer.cpp.o: \
+ C:\Users\MAX\Documents\Arduino\libraries\ESP8266WebServer\src\ESP8266WebServer.cpp \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266\CommonHFile.h \
  D:\Max\WEMOS\PC_on-off\build\core\PC_on-off.ino.globals.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/Arduino.h \
@@ -50,13 +50,9 @@ D:\Max\WEMOS\PC_on-off\build\libraries\ESP8266HTTPClient\ESP8266HTTPClient.cpp.o
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/debug.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\variants\d1_mini/pins_arduino.h \
  c:\users\max\appdata\local\arduino15\packages\esp8266\hardware\esp8266\3.1.2\variants\generic\common.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266HTTPClient\src\ESP8266HTTPClient.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/StreamString.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/WiFiClient.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/Client.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/Print.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/IPAddress.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/Printable.h \
+ C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/libb64/cencode.h \
+ C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/WiFiServer.h \
+ C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/wl_definitions.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwip/init.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwip/opt.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwipopts.h \
@@ -84,17 +80,23 @@ D:\Max\WEMOS\PC_on-off\build\libraries\ESP8266HTTPClient\ESP8266HTTPClient.cpp.o
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/arch/cc.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwip-git-hash.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwip/debug.h \
+ C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwip/tcpbase.h \
+ C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/Server.h \
+ C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/Print.h \
+ C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/IPAddress.h \
+ C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/Printable.h \
+ C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwip/err.h \
+ C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/WiFiClient.h \
+ C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/Client.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/IPAddress.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/include/slist.h \
+ C:\Users\MAX\Documents\Arduino\libraries\ESP8266WebServer\src\ESP8266WebServer.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/ESP8266WiFi.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/wl_definitions.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwip/tcpbase.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/ESP8266WiFiType.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/include/queue.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/ESP8266WiFiSTA.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/ESP8266WiFiGeneric.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwip/dns.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwip/err.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/LwipIntf.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwip/netif.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2/tools/sdk/lwip2/include/lwip/pbuf.h \
@@ -109,7 +111,6 @@ D:\Max\WEMOS\PC_on-off\build\libraries\ESP8266HTTPClient\ESP8266HTTPClient.cpp.o
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/ESP8266WiFiScan.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/WiFiClient.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/WiFiServer.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/Server.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/WiFiServerSecure.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/WiFiClientSecure.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/WiFiClientSecureBearSSL.h \
@@ -134,6 +135,6 @@ D:\Max\WEMOS\PC_on-off\build\libraries\ESP8266HTTPClient\ESP8266HTTPClient.cpp.o
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/FS.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/WiFiServerSecureBearSSL.h \
  C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\libraries\ESP8266WiFi\src/WiFiClientSecure.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/StreamDev.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/esp_priv.h \
- C:\Users\MAX\AppData\Local\Arduino15\packages\esp8266\hardware\esp8266\3.1.2\cores\esp8266/base64.h
+ C:\Users\MAX\Documents\Arduino\libraries\ESP8266WebServer\src\detail/RequestHandler.h \
+ C:\Users\MAX\Documents\Arduino\libraries\ESP8266WebServer\src\detail/RequestHandlersImpl.h \
+ C:\Users\MAX\Documents\Arduino\libraries\ESP8266WebServer\src\detail/RequestHandler.h

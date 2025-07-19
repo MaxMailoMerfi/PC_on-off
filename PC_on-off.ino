@@ -1,366 +1,342 @@
-//Arduino Maker Workshop
-//Щоб створити файли для праці і обновити [bin], натисніть [Complite] внизу праворуч
-//файл bin копіюється натисканням [Ctrl+Shift+B] та вибором [build+copy] і знаходиться поруч з ino
+/*
+  Переробка Telegram‑бота на веб-інтерфейс для LOLIN (WEMOS) D1 R2 (ESP8266)
+  Функції:
+    - Підключення до першої доступної Wi-Fi мережі зі списку
+    - Веб сторінка з індикацією живлення (POWER), аптаймом, часом "увімкнено" та "очікування"
+    - Кнопки Увімкнути / Вимкнути (керування реле імпульсом 500 мс)
+    - AJAX оновлення стану кожні 2 сек без перезавантаження сторінки
+    - REST API:
+        GET  /api/state      -> JSON стан
+        POST /api/rele?action=on|off
+        POST /api/reset      -> перезапуск
+        POST /api/clear      -> очистити data.json + перезапуск
+    - Збереження workTime / onPcTime у LittleFS (data.json)
 
-const char* wifiTest[][2] = {
-  {"deti_podzemelia", "12345678"},
-};
+  Примітки безпеки:
+    * НЕ зберігайте реальні паролі в прошивці (винесіть у secrets.h або використайте OTA конфігурацію).
+    * Видаліть BOT_TOKEN з колишнього коду – він більше не потрібен. (Ваш токен зараз компрометований, змініть його у BotFather.)
+*/
 
-const char* wifiList[][2] = {
-  {"deti_podzemelia", "12345678"},
-  {"Xiaomi 14T", ""},
-  {"Ingener_Technology", ""}
-};
+// Arduino Maker Workshop
+// Щоб створити файли для праці і обновити [bin], натисніть [Complite] внизу праворуч
+// файл bin копіюється натисканням [Ctrl+Shift+B] та вибором [build+copy] і знаходиться поруч з ino
 
-#define BOT_TOKEN "7714508177:AAEt_BhjKln3t6FgsjBMV5biA4iMw6zKw-E" // 
-#define relePin   4 // номер контакту для підключення реле
-#define POWER_PIN A0
-#define CHAT_ID_ADMIN "1031379571"
-String myNameBot = "Головний комп'ютер";
-int POWER, OnPC = 0, OffPC = 0, OnOffPower,rowsWifiList;
-  String PC = "";
-
-#include <FastBot.h>                      //https://github.com/GyverLibs/FastBot
-FastBot bot(BOT_TOKEN);
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
-unsigned long workTime = 0,onPcTime = 0, lastMillis = 0, lastOnPC = 0;
 
+// ---------------- Wi-Fi списки ----------------
+const char *wifiList[][2] = {
+    {"deti_podzemelia", "12345678"},
+    {"Xiaomi 14T", ""},
+    {"Ingener_Technology", ""}};
+int rowsWifiList = sizeof(wifiList) / sizeof(wifiList[0]);
 
+// ---------------- Піни ----------------
+#define RELE_PIN 4   // D2 (GPIO4) – перевірте відповідність платі
+#define POWER_PIN A0 // Аналоговий вхід
 
+// ---------------- Змінні стану ----------------
+unsigned long workTime = 0;   // Загальний час роботи (мс)
+unsigned long onPcTime = 0;   // Час коли напруга > порогу (мс)
+unsigned long lastMillis = 0; // Для інкременту
+unsigned long OffPC = 0;      // Час простою
+unsigned long OnPC = 0;       // Буфер оновлення onPcTime
+int POWER = 0;                // 1=on,0=off
+int OnOffPower = 0;           // Для детекції переходів
+
+// ---------------- Параметри логіки ----------------
+const float POWER_THRESHOLD = 3.0;         // Вольт (перевірте коефіцієнт дільника!)
+const unsigned long SAVE_INTERVAL = 10000; // 10 сек між автозбереженнями
+unsigned long lastSave = 0;
+
+ESP8266WebServer server(80);
+String deviceName = "Головний комп'ютер";
+
+// ---------------- Прототипи ----------------
+void connectWiFi();
+void saveData();
+void loadData();
+void deleteJSON(const char *path);
+void handleRoot();
+void handleAPIState();
+void handleRele();
+void handleReset();
+void handleClear();
+String formatUptime(unsigned long ms);
+
+// ---------------- SETUP ----------------
 void setup()
 {
   Serial.begin(115200);
-  pinMode(POWER_PIN, INPUT);
-  
-  int raw = analogRead(POWER_PIN);
-  float voltage = (raw / 1024.0 * 5.0);
-  if (voltage > 3.0)
+  pinMode(RELE_PIN, OUTPUT);
+  digitalWrite(RELE_PIN, HIGH); // Реле неактивне (залежно від модуля може бути LOW)
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  if (!LittleFS.begin())
   {
-    POWER = 1;//on
+    Serial.println("[FS] Помилка ініціалізації LittleFS");
+  }
+
+  loadData();
+
+  connectWiFi();
+
+  // Початкове вимірювання
+  int raw = analogRead(POWER_PIN);
+  float voltage = (raw / 1024.0f * 5.0f); // Якщо інший дільник – скоригуйте
+  POWER = (voltage > POWER_THRESHOLD) ? 1 : 0;
+  OnOffPower = POWER;
+  if (POWER)
+    OnPC = onPcTime;
+  else
+    OffPC = workTime - OnPC;
+
+  // ---------------- Маршрути ----------------
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/state", HTTP_GET, handleAPIState);
+  server.on("/api/rele", HTTP_POST, handleRele);
+  server.on("/api/reset", HTTP_POST, handleReset);
+  server.on("/api/clear", HTTP_POST, handleClear);
+  server.onNotFound([]()
+                    { server.send(404, "text/plain; charset=utf-8", "Not found"); });
+  server.begin();
+  Serial.println("[HTTP] Server started");
+  lastMillis = millis();
+}
+
+// ---------------- LOOP ----------------
+void loop()
+{
+  unsigned long now = millis();
+  // Акумуляція часу
+  workTime += now - lastMillis;
+  lastMillis = now;
+
+  int raw = analogRead(POWER_PIN);
+  float voltage = (raw / 1024.0f * 5.0f);
+  if (voltage > POWER_THRESHOLD)
+  {
+    POWER = 1;
+    OnPC = workTime - OffPC;
   }
   else
   {
-    POWER = 0;//off
-  }
-  OnOffPower = POWER;
-
-  pinMode(relePin, OUTPUT);               // налаштовуємо контакт для реле як вихід
-  digitalWrite(relePin, 1);            // вимикаємо реле
-  
-  loadData();  // Завантажуємо дані
-
-  rowsWifiList = (sizeof(wifiList) / sizeof(wifiList[0]));
-
-  OnPC = onPcTime;
-  OffPC = workTime - OnPC;
-  
-  delay(1000);
-  connectWiFi();                          // підключаємося до мережі
-  
-  
-  if (!LittleFS.begin()) {
-    Serial.println("❌ Помилка ініціалізації LittleFS");
-    bot.sendMessage("❌ Помилка ініціалізації LittleFS", CHAT_ID_ADMIN);
-    return;
-  }
-
-  Serial.println("\nWEMOS: увімкнувся!");
-  // bot.sendMessage("WEMOS: увімкнувся! \n/start", CHAT_ID_ADMIN);
-
-  bot.attach(newMsg);                     // підключаємо функцію - обробник повідомлень
-}
-
-// основний цикл
-void loop()
-{
-
-  workTime += millis()-lastMillis;  // Додаємо час роботи
-  onPcTime = OnPC;  // Оновлюємо температуру
-  lastMillis = millis();
-  saveData();  // Зберігаємо нові дані
-  bot.tick();
-  
-  int raw = analogRead(POWER_PIN);
-  float voltage = (raw / 1024.0 * 5.0);
-
-  if(voltage > 3)
-  {
-    POWER = 1;//on
-    OnPC = workTime - OffPC;
-  }
-  else if(voltage < 3)
-  {
-    POWER = 0;//off
+    POWER = 0;
     OffPC = workTime - OnPC;
   }
+  onPcTime = OnPC; // синхронізуємо для збереження
 
-  if (OnOffPower < POWER)
+  // Детекція переходів (можна додати логіку повідомлень через інші канали)
+  if (OnOffPower != POWER)
   {
     OnOffPower = POWER;
-    bot.sendMessage("✅Ввімкнувся", CHAT_ID_ADMIN);
+    Serial.println(POWER ? "[STATE] ✅ Ввімкнувся" : "[STATE] ❌ Вимкнувся");
   }
-  else if (OnOffPower > POWER)
+
+  // Автозбереження
+  if (now - lastSave >= SAVE_INTERVAL)
   {
-    OnOffPower = POWER;
-    bot.sendMessage("❌Вимкнувся", CHAT_ID_ADMIN);
+    saveData();
+    lastSave = now;
   }
 
-  //якщо минуло 1 доби, то перезавантажимося
-  if (millis() / 1000 / 60 / 60 >= 1  /*&& voltage < 4.0*/)
-  {
-    // bot.sendMessage(myNameBot + ": . Перевантажуюсь...", CHAT_ID_ADMIN);
-    ESP.restart();
-  }
-}
-// Обробник повідомлень
-void newMsg(FB_msg& msg)
-{
-  int raw = analogRead(POWER_PIN);
-  float voltage = (raw / 1024.0 * 6.0);
+  server.handleClient();
 
-  Serial.println("\n\n\n" + msg.text + "\n\n\n");
-
-  uint32_t curentTime, messageTime;
-  String msgText = msg.text;              // із структури повідомлення виділяємо сам текст
-  String from_name = msg.username;        // із структури повідомлення виділяємо хто надіслав
-  if (from_name == "")
-    from_name = "Аноним";
-
-  // int32_t msgID = msg.messageID;  // ID сообщения
-
-  curentTime = bot.getUnix();     // поточний час в ЮНІКС форматі
-  messageTime = msg.unix - 2;     // зменшимо час повідомлення щоб уникнути глюк
-
-
-
-// обновить, если файл имеет нужную подпись
-  if (msg.OTA && msg.text == "ADMIN")bot.update();
-
-// обробляємо натискання софт-кнопки в юзер меню в месенджері
-
-  if (msgText == "/start")// формуємо юзер меню з софт кнопками
-  {
-    bot.tickManual();  // Скидаємо кеш отриманих повідомлень
-    //String welcome = "Вітаю, " + from_name + ".\n";
-    bot.sendMessage("Вітаю, " + from_name + ".", msg.chatID);
-    Serial.println("\nВітаю, " + from_name + ".\n");
-
-    // показати юзер меню (\t - горизонтальний поділ кнопок, \n - вертикальний
-    bot.showMenu(textMenu("start"), msg.chatID);
-  }
-
-  
-
-  if (msgText == "Увімкнути")
-  {
-    bot.tickManual();  // Скидаємо кеш отриманих повідомлень
-    if (voltage < 4.0)
-    {
-      digitalWrite(relePin, 0);             // вмикаємо реле
-      delay(500);
-      digitalWrite(relePin, 1);
-    }
-    else
-    {
-      bot.sendMessage("Увімкнений", msg.chatID);
-    }
-  }
-
-  if (msgText == "Вимкнути")
-  {
-    bot.tickManual();  // Скидаємо кеш отриманих повідомлень
-    if (voltage > 4.0)
-    {
-      digitalWrite(relePin, 0);            // вимикаємо реле
-      delay(500);
-      digitalWrite(relePin, 1);
-    }
-    else
-    {
-      bot.sendMessage("Вимкнений", msg.chatID);
-    }
-  }
-
-  if (msgText == "Стан")
-  {
-    bot.tickManual();  // Скидаємо кеш отриманих повідомлень
-    if (voltage > 4.0)
-      {
-        PC = ": працює.✅";
-      }
-    else
-      {
-        PC = ": не працює.❌";
-      }
-    bot.sendMessage(myNameBot + PC + "\nChat ID: " + String(msg.chatID) + "\nAnalog: " + String(voltage) + "\n" + rowsWifiList, msg.chatID);
-    bot.sendMessage("Підключено до Wi-Fi: " + String(WiFi.SSID()) + " | " + myNameBot, CHAT_ID_ADMIN);
-    Serial.println(myNameBot + PC + "\nChat ID: " + String(msg.chatID) + "\nAnalog: " + String(voltage) + "\n" + rowsWifiList + "\n");
-  }
-
-  if (msgText == "Аптайм")
-  {
-    bot.tickManual();  // Скидаємо кеш отриманих повідомлень
-    unsigned long myTime = workTime;
-    int mymin = myTime / 1000 / 60;
-    int myhour = mymin / 60;
-    int myday = myhour / 24;
-
-    String msg0 = String((myTime /1000) % 60);
-    String msg1 = String(mymin % 60);
-    String msg2 = String(myhour % 24);
-    String msg3 = String(myday);
-    String msgs = String(myNameBot + "- WEMOS: працює \n" + msg3 + " діб " + msg2 + " годин " + msg1 + " хвилин " + msg0 + " секунд");
-    
-    myTime = OnPC;
-    mymin = myTime / 1000 / 60;
-    myhour = mymin / 60;
-    myday = myhour / 24;
-    msg0 = String((myTime /1000) % 60);
-    msg1 = String(mymin % 60);
-    msg2 = String(myhour % 24);
-    msg3 = String(myday);
-    String msgOnPC = String(myNameBot + ": працює \n" + msg3 + " діб " + msg2 + " годин " + msg1 + " хвилин " + msg0 + " секунд");
-    
-    myTime = OffPC;
-    mymin = myTime / 1000 / 60;
-    myhour = mymin / 60;
-    myday = myhour / 24;
-    msg0 = String((myTime /1000) % 60);
-    msg1 = String(mymin % 60);
-    msg2 = String(myhour % 24);
-    msg3 = String(myday);
-    String msgOffPC = String(myNameBot + ": в очікувані \n" + msg3 + " діб " + msg2 + " годин " + msg1 + " хвилин " + msg0 + " секунд");
-
-    bot.sendMessage(msgs + "\n\n" + msgOnPC + "\n\n" + msgOffPC + "\n\n", msg.chatID);
-    Serial.println(msgs + "\n\n" + msgOnPC + "\n\n" + msgOffPC + "\n\n");
-  }
-
-  if (msgText == "Ресет")
-  {
-    bot.tickManual();  // Скидаємо кеш отриманих повідомлень
-    bot.sendMessage(myNameBot +": Перезавантажується.....", msg.chatID);
-    Serial.println("\n" + myNameBot +": Перезавантажується.....\n");
-    ESP.restart();
-  }
-
-  if (msgText == "/remove")
-  {
-    String jsonFile = "data";
-    bot.tickManual();  // Скидаємо кеш отриманих повідомлень
-    deleteJSON("/" + jsonFile + ".json");  // Видаляємо JSON-файл
-    ESP.restart();
-  }
-  
+  // Періодичний рестарт (наприклад, 24 години) – зараз ВИМКНЕНО / приклад:
+  // if (millis() >= 24UL*60*60*1000UL) ESP.restart();
 }
 
+// ---------------- Wi-Fi ----------------
 void connectWiFi()
 {
-
-  Serial.println("\n🔍 Пошук Wi-Fi\n");
-
-  unsigned long startAttemptTime;  // Початковий час підключення
-
-  for (int i = 0; i < rowsWifiList - 1; i++) {
-    Serial.println("Пробую підключитися до " + String(wifiList[i][0]) + " | " + myNameBot);
-    WiFi.begin(wifiList[i][0], wifiList[i][1]);
-
-    startAttemptTime = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - startAttemptTime) < 5000) {
-      delay(500);
-    }
-    Serial.println(String(millis() - startAttemptTime));
-    
-    digitalWrite(LED_BUILTIN, WiFi.status() == WL_CONNECTED ? LOW : HIGH);
-
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\n✅ Підключено до Wi-Fi: " + String(WiFi.SSID()) + " | " + myNameBot);
-      Serial.println("📡 IP-адреса: " + WiFi.localIP().toString() + "\n");
-      break;  // Вийти з циклу, якщо підключилися
-    }
-  }
-  if (WiFi.status() != WL_CONNECTED)
+  Serial.println("\n[WiFi] Скан списку...");
+  for (int i = 0; i < rowsWifiList; i++)
   {
-    Serial.println("\n❌ Не вдалося підключитися до жодної мережі.\n Перезавантажую... | " + myNameBot);
-    ESP.restart();
+    Serial.print("[WiFi] Підключення до: ");
+    Serial.println(wifiList[i][0]);
+    WiFi.begin(wifiList[i][0], wifiList[i][1]);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 7000)
+    {
+      delay(500);
+      Serial.print('.');
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      Serial.print("[WiFi] ✅ Підключено: ");
+      Serial.println(WiFi.SSID());
+      Serial.print("[WiFi] IP: ");
+      Serial.println(WiFi.localIP());
+      digitalWrite(LED_BUILTIN, LOW);
+      return;
+    }
   }
+  Serial.println("[WiFi] ❌ Не вдалося підключитись. Рестарт...");
+  delay(2000);
+  ESP.restart();
 }
 
-// Функція збереження JSON у файл
-void saveData() {
-  StaticJsonDocument<200> doc;
+// ---------------- FS збереження ----------------
+void saveData()
+{
+  StaticJsonDocument<256> doc;
   doc["workTime"] = workTime;
   doc["onPcTime"] = onPcTime;
-  // doc["lastMillis"] = lastMillis;
-
-  File file = LittleFS.open("/data.json", "w");
-  if (!file) {
-    Serial.println("❌ Помилка відкриття файлу для запису (відсутній)");
-    bot.sendMessage("❌ Помилка відкриття файлу для запису (відсутній)", CHAT_ID_ADMIN);
-    return;
-  }
-
-  serializeJson(doc, file);  // Запис JSON у файл 
-  file.close();
-  Serial.println("✅ Дані збережено у JSON!");
-}
-
-
-// Функція зчитування JSON з файлу
-void loadData() {
-  File file = LittleFS.open("/data.json", "r");
-  if (!file) {
-    Serial.println("⚠️ Файл не знайдено, створюємо новий");
-    bot.sendMessage("⚠️ Файл не знайдено, створюємо новий", CHAT_ID_ADMIN);
-    saveData();  // Створюємо файл із початковими значеннями
-    return;
-  }
-
-  StaticJsonDocument<200> doc;
-  DeserializationError error = deserializeJson(doc, file);
-  if (error) {
-    Serial.println("❌ Помилка розбору JSON");
-    bot.sendMessage("❌ Помилка розбору JSON", CHAT_ID_ADMIN);
-    return;
-  }
-
-  workTime = doc["workTime"];
-  onPcTime = doc["onPcTime"];
-  // lastMillis = doc["lastMillis"];
-  
-  Serial.println("✅ Дані завантажено з JSON!");
-  file.close();
-}
-
-void deleteJSON(String jsonFile)
-{
-  
-  if (LittleFS.exists(jsonFile)) {  // Перевіряємо, чи існує файл
-    if (LittleFS.remove(jsonFile)) 
-    {  // Видаляємо файл
-      Serial.println("✅ JSON-файл успішно видалений!");
-      bot.sendMessage("✅ JSON-файл успішно видалений!", CHAT_ID_ADMIN);
-    }
-    else
-    {
-      Serial.println("❌ Помилка видалення JSON-файлу!");
-      bot.sendMessage("❌ Помилка видалення JSON-файлу!", CHAT_ID_ADMIN);
-    }
-  }
-  else 
+  File f = LittleFS.open("/data.json", "w");
+  if (!f)
   {
-    Serial.println("⚠️ Файл JSON не знайдено!");
-    bot.sendMessage("⚠️ Файл JSON не знайдено!", CHAT_ID_ADMIN);
+    Serial.println("[FS] write error");
+    return;
+  }
+  serializeJson(doc, f);
+  f.close();
+  Serial.println("[FS] Data saved");
+}
+
+void loadData()
+{
+  if (!LittleFS.exists("/data.json"))
+  {
+    Serial.println("[FS] data.json не знайдено – створюю");
+    saveData();
+    return;
+  }
+  File f = LittleFS.open("/data.json", "r");
+  if (!f)
+  {
+    Serial.println("[FS] read error");
+    return;
+  }
+  StaticJsonDocument<256> doc;
+  DeserializationError e = deserializeJson(doc, f);
+  if (e)
+  {
+    Serial.println("[FS] JSON parse error");
+    f.close();
+    return;
+  }
+  workTime = doc["workTime"].as<unsigned long>();
+  onPcTime = doc["onPcTime"].as<unsigned long>();
+  f.close();
+  Serial.println("[FS] Data loaded");
+}
+
+void deleteJSON(const char *path)
+{
+  if (LittleFS.exists(path))
+  {
+    if (LittleFS.remove(path))
+      Serial.println("[FS] JSON deleted");
+    else
+      Serial.println("[FS] JSON delete error");
+  }
+  else
+  {
+    Serial.println("[FS] JSON not found");
   }
 }
 
-String textMenu(String menu)
+// ---------------- Форматування часу ----------------
+String formatUptime(unsigned long ms)
 {
-  String text;
-  if (menu == "start"){text = "Увімкнути \t  Вимкнути \n Аптайм \t Стан \t Ресет";}
-  else if (menu == "wifi"){text = "Переглянути Log";}
-  
-  else {text = "невідома команда для меню";}
-
-  return text;
+  unsigned long s = ms / 1000UL;
+  unsigned int sec = s % 60;
+  unsigned long m = s / 60UL;
+  unsigned int min = m % 60;
+  unsigned long h = m / 60UL;
+  unsigned int hour = h % 24;
+  unsigned long day = h / 24UL;
+  char buf[48];
+  snprintf(buf, sizeof(buf), "%lu діб %02u:%02u:%02u", day, hour, min, sec);
+  return String(buf);
 }
+
+// ---------------- HTML Головна ----------------
+void handleRoot()
+{
+  String html = F("<!DOCTYPE html><html lang='uk'><head><meta charset='utf-8'/>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+                  "<title>");
+  html += deviceName;
+  html += F("</title><style>body{font-family:Arial;margin:14px;background:#111;color:#eee;}"
+            "h1{font-size:20px;margin:0 0 10px;}button{padding:10px 18px;margin:4px;font-size:14px;cursor:pointer;border:0;border-radius:6px;background:#3a6aff;color:#fff;}"
+            ".stat{margin:8px 0;padding:8px;background:#222;border-radius:6px;line-height:1.4;}"
+            "#status.on{color:#6fd96f;}#status.off{color:#ff6b6b;}"
+            "code{background:#222;padding:2px 6px;border-radius:4px;}"
+            "</style></head><body><h1>");
+  html += deviceName;
+  html += F(" – панель</h1><div class='stat'>Стан: <span id='status'>...</span><br>Напруга: <span id='voltage'>...</span> V<br>Аптайм пристрою: <span id='uptime'>...</span><br>Час 'ON': <span id='onTime'>...</span><br>Час 'OFF': <span id='offTime'>...</span></div>"
+            "<div><button onclick=sendAct('on')>Увімкнути</button><button onclick=sendAct('off')>Вимкнути</button><button onclick=resetDev()>Рестарт</button><button onclick=clearData()>Clear JSON</button></div>"
+            "<script>async function load(){const r=await fetch('/api/state');if(!r.ok)return;const j=await r.json();const st=document.getElementById('status');st.textContent=j.power?'ПРАЦЮЄ ✅':'ВИМКНЕНO ❌';st.className=j.power?'on':'off';document.getElementById('voltage').textContent=j.voltage.toFixed(2);document.getElementById('uptime').textContent=j.uptime;document.getElementById('onTime').textContent=j.onTime;document.getElementById('offTime').textContent=j.offTime;}\nfunction sendAct(a){fetch('/api/rele?action='+a,{method:'POST'}).then(()=>setTimeout(load,400));}\nfunction resetDev(){if(confirm('Перезапустити пристрій?'))fetch('/api/reset',{method:'POST'});}\nfunction clearData(){if(confirm('Очистити дані і перезапустити?'))fetch('/api/clear',{method:'POST'});}\nsetInterval(load,2000);load();</script>");
+  html += F("</body></html>");
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// ---------------- API: стан ----------------
+void handleAPIState()
+{
+  int raw = analogRead(POWER_PIN);
+  float voltage = (raw / 1024.0f * 5.0f);
+  StaticJsonDocument<256> doc;
+  doc["power"] = POWER;
+  doc["voltage"] = voltage;
+  doc["uptime"] = formatUptime(workTime);
+  doc["onTime"] = formatUptime(OnPC);
+  doc["offTime"] = formatUptime(OffPC);
+  doc["ssid"] = WiFi.SSID();
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+// ---------------- API: керування реле ----------------
+void handleRele()
+{
+  if (!server.hasArg("action"))
+  {
+    server.send(400, "text/plain", "Missing action");
+    return;
+  }
+  String a = server.arg("action");
+  if (a == "on")
+  {
+    // Імітуємо кнопку живлення – імпульс 500 мс
+    digitalWrite(RELE_PIN, LOW);
+    delay(500);
+    digitalWrite(RELE_PIN, HIGH);
+  }
+  else if (a == "off")
+  {
+    digitalWrite(RELE_PIN, LOW);
+    delay(500);
+    digitalWrite(RELE_PIN, HIGH);
+  }
+  else
+  {
+    server.send(400, "text/plain", "Bad action");
+    return;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+// ---------------- API: reset ----------------
+void handleReset()
+{
+  server.send(200, "text/plain", "Rebooting");
+  delay(200);
+  ESP.restart();
+}
+
+// ---------------- API: clear + reset ----------------
+void handleClear()
+{
+  deleteJSON("/data.json");
+  server.send(200, "text/plain", "Cleared");
+  delay(300);
+  ESP.restart();
+}
+
+// ---------------- Кінець ----------------

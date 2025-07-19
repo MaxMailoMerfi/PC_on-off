@@ -11,13 +11,23 @@
   },
   {
     "Sourcefile": "D:\\Max\\WEMOS\\PC_on-off\\build\\sketch\\PC_on-off.ino.cpp",
-    "Include": "ESP8266WiFi.h",
+    "Include": "FastBot.h",
+    "Includepath": "C:\\Users\\MAX\\Documents\\Arduino\\libraries\\FastBot\\src"
+  },
+  {
+    "Sourcefile": "D:\\Max\\WEMOS\\PC_on-off\\build\\sketch\\PC_on-off.ino.cpp",
+    "Include": "ESP8266HTTPClient.h",
+    "Includepath": "C:\\Users\\MAX\\AppData\\Local\\Arduino15\\packages\\esp8266\\hardware\\esp8266\\3.1.2\\libraries\\ESP8266HTTPClient\\src"
+  },
+  {
+    "Sourcefile": "D:\\Max\\WEMOS\\PC_on-off\\build\\sketch\\PC_on-off.ino.cpp",
+    "Include": "WiFiClient.h",
     "Includepath": "C:\\Users\\MAX\\AppData\\Local\\Arduino15\\packages\\esp8266\\hardware\\esp8266\\3.1.2\\libraries\\ESP8266WiFi\\src"
   },
   {
     "Sourcefile": "D:\\Max\\WEMOS\\PC_on-off\\build\\sketch\\PC_on-off.ino.cpp",
-    "Include": "ESP8266WebServer.h",
-    "Includepath": "C:\\Users\\MAX\\Documents\\Arduino\\libraries\\ESP8266WebServer\\src"
+    "Include": "ESP8266httpUpdate.h",
+    "Includepath": "C:\\Users\\MAX\\AppData\\Local\\Arduino15\\packages\\esp8266\\hardware\\esp8266\\3.1.2\\libraries\\ESP8266httpUpdate\\src"
   },
   {
     "Sourcefile": "D:\\Max\\WEMOS\\PC_on-off\\build\\sketch\\PC_on-off.ino.cpp",
@@ -31,6 +41,16 @@
   },
   {
     "Sourcefile": "D:\\Max\\WEMOS\\PC_on-off\\build\\sketch\\PC_on-off.ino.cpp",
+    "Include": "",
+    "Includepath": null
+  },
+  {
+    "Sourcefile": "C:\\Users\\MAX\\Documents\\Arduino\\libraries\\FastBot\\src\\utils.cpp",
+    "Include": "",
+    "Includepath": null
+  },
+  {
+    "Sourcefile": "C:\\Users\\MAX\\AppData\\Local\\Arduino15\\packages\\esp8266\\hardware\\esp8266\\3.1.2\\libraries\\ESP8266HTTPClient\\src\\ESP8266HTTPClient.cpp",
     "Include": "",
     "Includepath": null
   },
@@ -115,12 +135,7 @@
     "Includepath": null
   },
   {
-    "Sourcefile": "C:\\Users\\MAX\\Documents\\Arduino\\libraries\\ESP8266WebServer\\src\\ESP8266WebServer.cpp",
-    "Include": "",
-    "Includepath": null
-  },
-  {
-    "Sourcefile": "C:\\Users\\MAX\\Documents\\Arduino\\libraries\\ESP8266WebServer\\src\\Parsing.cpp",
+    "Sourcefile": "C:\\Users\\MAX\\AppData\\Local\\Arduino15\\packages\\esp8266\\hardware\\esp8266\\3.1.2\\libraries\\ESP8266httpUpdate\\src\\ESP8266httpUpdate.cpp",
     "Include": "",
     "Includepath": null
   },

@@ -2,233 +2,375 @@
 // Щоб створити файли для праці і обновити [bin], натисніть [Complite] внизу праворуч
 // файл bin копіюється натисканням [Ctrl+Shift+B] та вибором [build+copy] і знаходиться поруч з ino
 
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <LittleFS.h>
-#include <ArduinoJson.h>
+const char *wifiTest[][2] = {
+    {"deti_podzemelia", "12345678"},
+};
 
-// ---------------- Параметри Wi-Fi ----------------
 const char *wifiList[][2] = {
     {"deti_podzemelia", "12345678"},
     {"Xiaomi 14T", ""},
     {"Ingener_Technology", ""}};
-int rowsWifiList = sizeof(wifiList) / sizeof(wifiList[0]);
 
-// ---------------- Піни ----------------
-#define RELE_PIN 4   // D2
-#define POWER_PIN A0 // Analog
+#define BOT_TOKEN "7714508177:AAEt_BhjKln3t6FgsjBMV5biA4iMw6zKw-E" //
+#define relePin 4                                                  // номер контакту для підключення реле
+#define POWER_PIN A0
+#define CHAT_ID_ADMIN "1031379571"
+String myNameBot = "Головний комп'ютер";
+int POWER, OnPC = 0, OffPC = 0, OnOffPower, rowsWifiList;
+String PC = "";
 
-// ---------------- Стани ----------------
-unsigned long workTime = 0, onPcTime = 0, lastMillis = 0;
-unsigned long OffPC = 0, OnPC = 0, lastSave = 0, lastIpPrint = 0;
-int POWER = 0, OnOffPower = 0;
-const float POWER_THRESHOLD = 3.0;
-const unsigned long SAVE_INTERVAL = 10000, IP_PRINT_INTERVAL = 1000;
+#include <FastBot.h> //https://github.com/GyverLibs/FastBot
+FastBot bot(BOT_TOKEN);
+#include <LittleFS.h>
+#include <ArduinoJson.h>
+unsigned long workTime = 0, onPcTime = 0, lastMillis = 0, lastOnPC = 0;
 
-ESP8266WebServer server(80);
-String deviceName = "Головний комп'ютер";
-
-// ---------------- Прототипи ----------------
-void connectWiFi(), saveData(), loadData(), deleteJSON(const char *);
-void handleRoot(), handleAPIState(), handleRele(), handleReset(), handleClear();
-String formatUptime(unsigned long);
-
-// ---------------- SETUP ----------------
-void setup() {
+void setup()
+{
   Serial.begin(115200);
-  pinMode(RELE_PIN, OUTPUT); digitalWrite(RELE_PIN, HIGH);
-  pinMode(LED_BUILTIN, OUTPUT);
-
-  if (!LittleFS.begin()) Serial.println("[FS] ❌ Помилка ініціалізації");
-
-  loadData();
-  
-  connectWiFi();
+  pinMode(POWER_PIN, INPUT);
 
   int raw = analogRead(POWER_PIN);
-  float voltage = raw / 1024.0f * 5.0f;
-  POWER = (voltage > POWER_THRESHOLD) ? 1 : 0;
+  float voltage = (raw / 1024.0 * 5.0);
+  if (voltage > 3.0)
+  {
+    POWER = 1; // on
+  }
+  else
+  {
+    POWER = 0; // off
+  }
   OnOffPower = POWER;
-  OnPC = POWER ? onPcTime : 0;
-  OffPC = !POWER ? workTime - OnPC : 0;
 
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/api/state", HTTP_GET, handleAPIState);
-  server.on("/api/rele", HTTP_POST, handleRele);
-  server.on("/api/reset", HTTP_POST, handleReset);
-  server.on("/api/clear", HTTP_POST, handleClear);
-  server.onNotFound([]() {
-    server.send(404, "text/plain; charset=utf-8", "Not found");
-  });
+  pinMode(relePin, OUTPUT); // налаштовуємо контакт для реле як вихід
+  digitalWrite(relePin, 1); // вимикаємо реле
 
-  server.begin();
-  Serial.println("[HTTP] ✅ Сервер запущено");
-  lastMillis = millis();
+  loadData(); // Завантажуємо дані
+
+  rowsWifiList = (sizeof(wifiList) / sizeof(wifiList[0]));
+
+  OnPC = onPcTime;
+  OffPC = workTime - OnPC;
+
+  delay(1000);
+  connectWiFi(); // підключаємося до мережі
+
+  if (!LittleFS.begin())
+  {
+    Serial.println("❌ Помилка ініціалізації LittleFS");
+    bot.sendMessage("❌ Помилка ініціалізації LittleFS", CHAT_ID_ADMIN);
+    return;
+  }
+
+  Serial.println("\nWEMOS: увімкнувся!");
+  // bot.sendMessage("WEMOS: увімкнувся! \n/start", CHAT_ID_ADMIN);
+
+  bot.attach(newMsg); // підключаємо функцію - обробник повідомлень
 }
 
-// ---------------- LOOP ----------------
-void loop() {
-  unsigned long now = millis();
-  workTime += now - lastMillis;
-  lastMillis = now;
+// основний цикл
+void loop()
+{
 
-  // --- Автоматична перевірка Wi-Fi ---
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] ❌ З'єднання втрачено, повторне підключення...");
-    connectWiFi();
-  }
+  workTime += millis() - lastMillis; // Додаємо час роботи
+  onPcTime = OnPC;                   // Оновлюємо температуру
+  lastMillis = millis();
+  saveData(); // Зберігаємо нові дані
+  bot.tick();
 
   int raw = analogRead(POWER_PIN);
-  float voltage = raw / 1024.0f * 5.0f;
-  POWER = (voltage > POWER_THRESHOLD) ? 1 : 0;
+  float voltage = (raw / 1024.0 * 5.0);
 
-  if (POWER) OnPC = workTime - OffPC;
-  else OffPC = workTime - OnPC;
-  onPcTime = OnPC;
+  if (voltage > 3)
+  {
+    POWER = 1; // on
+    OnPC = workTime - OffPC;
+  }
+  else if (voltage < 3)
+  {
+    POWER = 0; // off
+    OffPC = workTime - OnPC;
+  }
 
-  if (POWER != OnOffPower) {
+  if (OnOffPower < POWER)
+  {
     OnOffPower = POWER;
-    Serial.println(POWER ? "[STATE] ✅ Увімкнувся" : "[STATE] ❌ Вимкнувся");
+    bot.sendMessage("✅Ввімкнувся", CHAT_ID_ADMIN);
+  }
+  else if (OnOffPower > POWER)
+  {
+    OnOffPower = POWER;
+    bot.sendMessage("❌Вимкнувся", CHAT_ID_ADMIN);
   }
 
-  if (now - lastSave >= SAVE_INTERVAL) {
-    saveData(); lastSave = now;
+  // якщо минуло 1 доби, то перезавантажимося
+  if (millis() / 1000 / 60 / 60 >= 1 /*&& voltage < 4.0*/)
+  {
+    // bot.sendMessage(myNameBot + ": . Перевантажуюсь...", CHAT_ID_ADMIN);
+    ESP.restart();
+  }
+}
+// Обробник повідомлень
+void newMsg(FB_msg &msg)
+{
+  int raw = analogRead(POWER_PIN);
+  float voltage = (raw / 1024.0 * 6.0);
+
+  Serial.println("\n\n\n" + msg.text + "\n\n\n");
+
+  uint32_t curentTime, messageTime;
+  String msgText = msg.text;       // із структури повідомлення виділяємо сам текст
+  String from_name = msg.username; // із структури повідомлення виділяємо хто надіслав
+  if (from_name == "")
+    from_name = "Аноним";
+
+  // int32_t msgID = msg.messageID;  // ID сообщения
+
+  curentTime = bot.getUnix(); // поточний час в ЮНІКС форматі
+  messageTime = msg.unix - 2; // зменшимо час повідомлення щоб уникнути глюк
+
+  // обновить, если файл имеет нужную подпись
+  if (msg.OTA && msg.text == "ADMIN")
+    bot.update();
+
+  // обробляємо натискання софт-кнопки в юзер меню в месенджері
+
+  if (msgText == "/start") // формуємо юзер меню з софт кнопками
+  {
+    bot.tickManual(); // Скидаємо кеш отриманих повідомлень
+    // String welcome = "Вітаю, " + from_name + ".\n";
+    bot.sendMessage("Вітаю, " + from_name + ".", msg.chatID);
+    Serial.println("\nВітаю, " + from_name + ".\n");
+
+    // показати юзер меню (\t - горизонтальний поділ кнопок, \n - вертикальний
+    bot.showMenu(textMenu("start"), msg.chatID);
   }
 
-  if (now - lastIpPrint >= IP_PRINT_INTERVAL) {
-    lastIpPrint = now;
-    IPAddress ip = WiFi.localIP();
-    if (ip[0] == 0) Serial.println("[WiFi] Поточний IP: (IP unset)");
-    else {
-      Serial.print("[WiFi] Поточний IP: ");
-      Serial.println(ip);
+  if (msgText == "Увімкнути")
+  {
+    bot.tickManual(); // Скидаємо кеш отриманих повідомлень
+    if (voltage < 4.0)
+    {
+      digitalWrite(relePin, 0); // вмикаємо реле
+      delay(500);
+      digitalWrite(relePin, 1);
+    }
+    else
+    {
+      bot.sendMessage("Увімкнений", msg.chatID);
     }
   }
 
-  server.handleClient();
+  if (msgText == "Вимкнути")
+  {
+    bot.tickManual(); // Скидаємо кеш отриманих повідомлень
+    if (voltage > 4.0)
+    {
+      digitalWrite(relePin, 0); // вимикаємо реле
+      delay(500);
+      digitalWrite(relePin, 1);
+    }
+    else
+    {
+      bot.sendMessage("Вимкнений", msg.chatID);
+    }
+  }
+
+  if (msgText == "Стан")
+  {
+    bot.tickManual(); // Скидаємо кеш отриманих повідомлень
+    if (voltage > 4.0)
+    {
+      PC = ": працює.✅";
+    }
+    else
+    {
+      PC = ": не працює.❌";
+    }
+    bot.sendMessage(myNameBot + PC + "\nChat ID: " + String(msg.chatID) + "\nAnalog: " + String(voltage) + "\n" + rowsWifiList, msg.chatID);
+    bot.sendMessage("Підключено до Wi-Fi: " + String(WiFi.SSID()) + " | " + myNameBot, CHAT_ID_ADMIN);
+    Serial.println(myNameBot + PC + "\nChat ID: " + String(msg.chatID) + "\nAnalog: " + String(voltage) + "\n" + rowsWifiList + "\n");
+  }
+
+  if (msgText == "Аптайм")
+  {
+    bot.tickManual(); // Скидаємо кеш отриманих повідомлень
+    unsigned long myTime = workTime;
+    int mymin = myTime / 1000 / 60;
+    int myhour = mymin / 60;
+    int myday = myhour / 24;
+
+    String msg0 = String((myTime / 1000) % 60);
+    String msg1 = String(mymin % 60);
+    String msg2 = String(myhour % 24);
+    String msg3 = String(myday);
+    String msgs = String(myNameBot + "- WEMOS: працює \n" + msg3 + " діб " + msg2 + " годин " + msg1 + " хвилин " + msg0 + " секунд");
+
+    myTime = OnPC;
+    mymin = myTime / 1000 / 60;
+    myhour = mymin / 60;
+    myday = myhour / 24;
+    msg0 = String((myTime / 1000) % 60);
+    msg1 = String(mymin % 60);
+    msg2 = String(myhour % 24);
+    msg3 = String(myday);
+    String msgOnPC = String(myNameBot + ": працює \n" + msg3 + " діб " + msg2 + " годин " + msg1 + " хвилин " + msg0 + " секунд");
+
+    myTime = OffPC;
+    mymin = myTime / 1000 / 60;
+    myhour = mymin / 60;
+    myday = myhour / 24;
+    msg0 = String((myTime / 1000) % 60);
+    msg1 = String(mymin % 60);
+    msg2 = String(myhour % 24);
+    msg3 = String(myday);
+    String msgOffPC = String(myNameBot + ": в очікувані \n" + msg3 + " діб " + msg2 + " годин " + msg1 + " хвилин " + msg0 + " секунд");
+
+    bot.sendMessage(msgs + "\n\n" + msgOnPC + "\n\n" + msgOffPC + "\n\n", msg.chatID);
+    Serial.println(msgs + "\n\n" + msgOnPC + "\n\n" + msgOffPC + "\n\n");
+  }
+
+  if (msgText == "Ресет")
+  {
+    bot.tickManual(); // Скидаємо кеш отриманих повідомлень
+    bot.sendMessage(myNameBot + ": Перезавантажується.....", msg.chatID);
+    Serial.println("\n" + myNameBot + ": Перезавантажується.....\n");
+    ESP.restart();
+  }
+
+  if (msgText == "/remove")
+  {
+    String jsonFile = "data";
+    bot.tickManual();                     // Скидаємо кеш отриманих повідомлень
+    deleteJSON("/" + jsonFile + ".json"); // Видаляємо JSON-файл
+    ESP.restart();
+  }
 }
 
-// ---------------- Wi-Fi ----------------
-void connectWiFi() {
-  Serial.println("[WiFi] Пошук мереж...");
-  for (int i = 0; i < rowsWifiList; i++) {
-    Serial.print("[WiFi] Спроба: ");
-    Serial.println(wifiList[i][0]);
+void connectWiFi()
+{
+
+  Serial.println("\n🔍 Пошук Wi-Fi\n");
+
+  unsigned long startAttemptTime; // Початковий час підключення
+
+  for (int i = 0; i < rowsWifiList - 1; i++)
+  {
+    Serial.println("Пробую підключитися до " + String(wifiList[i][0]) + " | " + myNameBot);
     WiFi.begin(wifiList[i][0], wifiList[i][1]);
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 7000) {
+
+    startAttemptTime = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startAttemptTime) < 5000)
+    {
       delay(500);
     }
-    Serial.println();
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.print("[WiFi] ✅ Підключено до ");
-      Serial.println(WiFi.SSID());
-      Serial.print("[WiFi] IP: ");
-      Serial.println(WiFi.localIP());
-      digitalWrite(LED_BUILTIN, LOW);
-      return;
+    Serial.println(String(millis() - startAttemptTime));
+
+    digitalWrite(LED_BUILTIN, WiFi.status() == WL_CONNECTED ? LOW : HIGH);
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      Serial.println("\n✅ Підключено до Wi-Fi: " + String(WiFi.SSID()) + " | " + myNameBot);
+      Serial.println("📡 IP-адреса: " + WiFi.localIP().toString() + "\n");
+      break; // Вийти з циклу, якщо підключилися
     }
   }
-  Serial.println("[WiFi] ❌ Не вдалося підключитись. Рестарт...");
-  delay(2000); ESP.restart();
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("\n❌ Не вдалося підключитися до жодної мережі.\n Перезавантажую... | " + myNameBot);
+    ESP.restart();
+  }
 }
 
-// ---------------- FS ----------------
-void saveData() {
-  StaticJsonDocument<256> doc;
+// Функція збереження JSON у файл
+void saveData()
+{
+  StaticJsonDocument<200> doc;
   doc["workTime"] = workTime;
   doc["onPcTime"] = onPcTime;
-  File f = LittleFS.open("/data.json", "w");
-  if (f) {
-    serializeJson(doc, f);
-    f.close();
-    Serial.println("[FS] ✅ Дані збережено");
-  } else {
-    Serial.println("[FS] ❌ Помилка запису");
+  // doc["lastMillis"] = lastMillis;
+
+  File file = LittleFS.open("/data.json", "w");
+  if (!file)
+  {
+    Serial.println("❌ Помилка відкриття файлу для запису (відсутній)");
+    bot.sendMessage("❌ Помилка відкриття файлу для запису (відсутній)", CHAT_ID_ADMIN);
+    return;
   }
+
+  serializeJson(doc, file); // Запис JSON у файл
+  file.close();
+  // Serial.println("✅ Дані збережено у JSON!");
 }
 
-void loadData() {
-  if (!LittleFS.exists("/data.json")) {
-    Serial.println("[FS] data.json не знайдено – створюю");
-    saveData(); return;
+// Функція зчитування JSON з файлу
+void loadData()
+{
+  File file = LittleFS.open("/data.json", "r");
+  if (!file)
+  {
+    Serial.println("⚠️ Файл не знайдено, створюємо новий");
+    bot.sendMessage("⚠️ Файл не знайдено, створюємо новий", CHAT_ID_ADMIN);
+    saveData(); // Створюємо файл із початковими значеннями
+    return;
   }
-  File f = LittleFS.open("/data.json", "r");
-  if (!f) { Serial.println("[FS] ❌ Помилка читання"); return; }
-  StaticJsonDocument<256> doc;
-  if (deserializeJson(doc, f)) {
-    Serial.println("[FS] ❌ JSON помилка");
-  } else {
-    workTime = doc["workTime"] | 0;
-    onPcTime = doc["onPcTime"] | 0;
-    Serial.println("[FS] ✅ Дані завантажено");
+
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, file);
+  if (error)
+  {
+    Serial.println("❌ Помилка розбору JSON");
+    bot.sendMessage("❌ Помилка розбору JSON", CHAT_ID_ADMIN);
+    return;
   }
-  f.close();
+
+  workTime = doc["workTime"];
+  onPcTime = doc["onPcTime"];
+  // lastMillis = doc["lastMillis"];
+
+  Serial.println("✅ Дані завантажено з JSON!");
+  file.close();
 }
 
-void deleteJSON(const char *path) {
-  if (LittleFS.exists(path) && LittleFS.remove(path))
-    Serial.println("[FS] JSON видалено");
+void deleteJSON(String jsonFile)
+{
+
+  if (LittleFS.exists(jsonFile))
+  { // Перевіряємо, чи існує файл
+    if (LittleFS.remove(jsonFile))
+    { // Видаляємо файл
+      Serial.println("✅ JSON-файл успішно видалений!");
+      bot.sendMessage("✅ JSON-файл успішно видалений!", CHAT_ID_ADMIN);
+    }
+    else
+    {
+      Serial.println("❌ Помилка видалення JSON-файлу!");
+      bot.sendMessage("❌ Помилка видалення JSON-файлу!", CHAT_ID_ADMIN);
+    }
+  }
   else
-    Serial.println("[FS] ❌ Не вдалося видалити");
-}
-
-// ---------------- API ----------------
-void handleRoot() {
-  String html = F(R"rawliteral(
-<!DOCTYPE html><html lang='uk'><head><meta charset='utf-8'/>
-<meta name='viewport' content='width=device-width,initial-scale=1'/>
-<title>)rawliteral");
-  html += deviceName;
-  html += F(R"rawliteral(</title><style>body{font-family:sans-serif;background:#111;color:#eee;margin:14px;}h1{font-size:20px;}button{padding:10px;margin:4px;background:#3a6aff;color:#fff;border:none;border-radius:6px;}.stat{margin:8px 0;padding:8px;background:#222;border-radius:6px;}#status.on{color:#6fd96f;}#status.off{color:#ff6b6b;}</style></head><body><h1>)rawliteral");
-  html += deviceName;
-  html += F(R"rawliteral( – Панель</h1><div class='stat'>Стан: <span id='status'>...</span><br>Напруга: <span id='voltage'>...</span> V<br>Аптайм: <span id='uptime'>...</span><br>Час 'ON': <span id='onTime'>...</span><br>Час 'OFF': <span id='offTime'>...</span></div><div><button onclick="sendAct('on')">Увімкнути</button><button onclick="sendAct('off')">Вимкнути</button><button onclick="resetDev()">Рестарт</button><button onclick="clearData()">Очистити</button></div><script>async function load(){const r=await fetch('/api/state');if(!r.ok)return;const j=await r.json();document.getElementById('status').textContent=j.power?'ПРАЦЮЄ ✅':'ВИМКНЕНO ❌';document.getElementById('status').className=j.power?'on':'off';document.getElementById('voltage').textContent=j.voltage.toFixed(2);document.getElementById('uptime').textContent=j.uptime;document.getElementById('onTime').textContent=j.onTime;document.getElementById('offTime').textContent=j.offTime;}function sendAct(a){fetch('/api/rele?action='+a,{method:'POST'}).then(()=>setTimeout(load,400));}function resetDev(){if(confirm('Рестарт пристрою?'))fetch('/api/reset',{method:'POST'});}function clearData(){if(confirm('Очистити дані та рестарт?'))fetch('/api/clear',{method:'POST'});}setInterval(load,2000);load();</script></body></html>)rawliteral");
-  server.send(200, "text/html; charset=utf-8", html);
-}
-
-void handleAPIState() {
-  int raw = analogRead(POWER_PIN);
-  float voltage = raw / 1024.0f * 5.0f;
-  StaticJsonDocument<256> doc;
-  doc["power"] = POWER;
-  doc["voltage"] = voltage;
-  doc["uptime"] = formatUptime(workTime);
-  doc["onTime"] = formatUptime(OnPC);
-  doc["offTime"] = formatUptime(OffPC);
-  doc["ssid"] = WiFi.SSID();
-  String out;
-  serializeJson(doc, out);
-  server.send(200, "application/json", out);
-}
-
-void handleRele() {
-  if (!server.hasArg("action")) {
-    server.send(400, "text/plain", "Missing action"); return;
-  }
-  String a = server.arg("action");
-  if (a == "on" || a == "off") {
-    digitalWrite(RELE_PIN, LOW); delay(500); digitalWrite(RELE_PIN, HIGH);
-    server.send(200, "text/plain", "OK");
-  } else {
-    server.send(400, "text/plain", "Bad action");
+  {
+    Serial.println("⚠️ Файл JSON не знайдено!");
+    bot.sendMessage("⚠️ Файл JSON не знайдено!", CHAT_ID_ADMIN);
   }
 }
 
-void handleReset() {
-  server.send(200, "text/plain", "Rebooting"); delay(200); ESP.restart();
-}
+String textMenu(String menu)
+{
+  String text;
+  if (menu == "start")
+  {
+    text = "Увімкнути \t  Вимкнути \n Аптайм \t Стан \t Ресет";
+  }
+  else if (menu == "wifi")
+  {
+    text = "Переглянути Log";
+  }
 
-void handleClear() {
-  deleteJSON("/data.json");
-  server.send(200, "text/plain", "Cleared"); delay(300); ESP.restart();
-}
+  else
+  {
+    text = "невідома команда для меню";
+  }
 
-// ---------------- Формат часу ----------------
-String formatUptime(unsigned long ms) {
-  unsigned long s = ms / 1000;
-  unsigned int sec = s % 60, min = (s / 60) % 60, hour = (s / 3600) % 24;
-  unsigned long day = s / 86400;
-  char buf[48];
-  snprintf(buf, sizeof(buf), "%lu діб %02u:%02u:%02u", day, hour, min, sec);
-  return String(buf);
+  return text;
 }

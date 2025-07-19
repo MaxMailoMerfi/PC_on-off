@@ -1,22 +1,3 @@
-/*
-  Переробка Telegram‑бота на веб-інтерфейс для LOLIN (WEMOS) D1 R2 (ESP8266)
-  Функції:
-    - Підключення до першої доступної Wi-Fi мережі зі списку
-    - Веб сторінка з індикацією живлення (POWER), аптаймом, часом "увімкнено" та "очікування"
-    - Кнопки Увімкнути / Вимкнути (керування реле імпульсом 500 мс)
-    - AJAX оновлення стану кожні 2 сек без перезавантаження сторінки
-    - REST API:
-        GET  /api/state      -> JSON стан
-        POST /api/rele?action=on|off
-        POST /api/reset      -> перезапуск
-        POST /api/clear      -> очистити data.json + перезапуск
-    - Збереження workTime / onPcTime у LittleFS (data.json)
-
-  Примітки безпеки:
-    * НЕ зберігайте реальні паролі в прошивці (винесіть у secrets.h або використайте OTA конфігурацію).
-    * Видаліть BOT_TOKEN з колишнього коду – він більше не потрібен. (Ваш токен зараз компрометований, змініть його у BotFather.)
-*/
-
 // Arduino Maker Workshop
 // Щоб створити файли для праці і обновити [bin], натисніть [Complite] внизу праворуч
 // файл bin копіюється натисканням [Ctrl+Shift+B] та вибором [build+copy] і знаходиться поруч з ino
@@ -26,7 +7,7 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 
-// ---------------- Wi-Fi списки ----------------
+// ---------------- Параметри Wi-Fi ----------------
 const char *wifiList[][2] = {
     {"deti_podzemelia", "12345678"},
     {"Xiaomi 14T", ""},
@@ -34,139 +15,113 @@ const char *wifiList[][2] = {
 int rowsWifiList = sizeof(wifiList) / sizeof(wifiList[0]);
 
 // ---------------- Піни ----------------
-#define RELE_PIN 4   // D2 (GPIO4) – перевірте відповідність платі
-#define POWER_PIN A0 // Аналоговий вхід
+#define RELE_PIN 4   // D2
+#define POWER_PIN A0 // Analog
 
-// ---------------- Змінні стану ----------------
-unsigned long workTime = 0;   // Загальний час роботи (мс)
-unsigned long onPcTime = 0;   // Час коли напруга > порогу (мс)
-unsigned long lastMillis = 0; // Для інкременту
-unsigned long OffPC = 0;      // Час простою
-unsigned long OnPC = 0;       // Буфер оновлення onPcTime
-int POWER = 0;                // 1=on,0=off
-int OnOffPower = 0;           // Для детекції переходів
-
-// ---------------- Параметри логіки ----------------
-const float POWER_THRESHOLD = 3.0;         // Вольт (перевірте коефіцієнт дільника!)
-const unsigned long SAVE_INTERVAL = 10000; // 10 сек між автозбереженнями
-unsigned long lastSave = 0;
+// ---------------- Стани ----------------
+unsigned long workTime = 0, onPcTime = 0, lastMillis = 0;
+unsigned long OffPC = 0, OnPC = 0, lastSave = 0, lastIpPrint = 0;
+int POWER = 0, OnOffPower = 0;
+const float POWER_THRESHOLD = 3.0;
+const unsigned long SAVE_INTERVAL = 10000, IP_PRINT_INTERVAL = 1000;
 
 ESP8266WebServer server(80);
 String deviceName = "Головний комп'ютер";
 
 // ---------------- Прототипи ----------------
-void connectWiFi();
-void saveData();
-void loadData();
-void deleteJSON(const char *path);
-void handleRoot();
-void handleAPIState();
-void handleRele();
-void handleReset();
-void handleClear();
-String formatUptime(unsigned long ms);
+void connectWiFi(), saveData(), loadData(), deleteJSON(const char *);
+void handleRoot(), handleAPIState(), handleRele(), handleReset(), handleClear();
+String formatUptime(unsigned long);
 
 // ---------------- SETUP ----------------
-void setup()
-{
+void setup() {
   Serial.begin(115200);
-  pinMode(RELE_PIN, OUTPUT);
-  digitalWrite(RELE_PIN, HIGH); // Реле неактивне (залежно від модуля може бути LOW)
+  pinMode(RELE_PIN, OUTPUT); digitalWrite(RELE_PIN, HIGH);
   pinMode(LED_BUILTIN, OUTPUT);
 
-  if (!LittleFS.begin())
-  {
-    Serial.println("[FS] Помилка ініціалізації LittleFS");
-  }
+  if (!LittleFS.begin()) Serial.println("[FS] ❌ Помилка ініціалізації");
 
   loadData();
-
+  
   connectWiFi();
 
-  // Початкове вимірювання
   int raw = analogRead(POWER_PIN);
-  float voltage = (raw / 1024.0f * 5.0f); // Якщо інший дільник – скоригуйте
+  float voltage = raw / 1024.0f * 5.0f;
   POWER = (voltage > POWER_THRESHOLD) ? 1 : 0;
   OnOffPower = POWER;
-  if (POWER)
-    OnPC = onPcTime;
-  else
-    OffPC = workTime - OnPC;
+  OnPC = POWER ? onPcTime : 0;
+  OffPC = !POWER ? workTime - OnPC : 0;
 
-  // ---------------- Маршрути ----------------
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/state", HTTP_GET, handleAPIState);
   server.on("/api/rele", HTTP_POST, handleRele);
   server.on("/api/reset", HTTP_POST, handleReset);
   server.on("/api/clear", HTTP_POST, handleClear);
-  server.onNotFound([]()
-                    { server.send(404, "text/plain; charset=utf-8", "Not found"); });
+  server.onNotFound([]() {
+    server.send(404, "text/plain; charset=utf-8", "Not found");
+  });
+
   server.begin();
-  Serial.println("[HTTP] Server started");
+  Serial.println("[HTTP] ✅ Сервер запущено");
   lastMillis = millis();
 }
 
 // ---------------- LOOP ----------------
-void loop()
-{
+void loop() {
   unsigned long now = millis();
-  // Акумуляція часу
   workTime += now - lastMillis;
   lastMillis = now;
 
+  // --- Автоматична перевірка Wi-Fi ---
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] ❌ З'єднання втрачено, повторне підключення...");
+    connectWiFi();
+  }
+
   int raw = analogRead(POWER_PIN);
-  float voltage = (raw / 1024.0f * 5.0f);
-  if (voltage > POWER_THRESHOLD)
-  {
-    POWER = 1;
-    OnPC = workTime - OffPC;
-  }
-  else
-  {
-    POWER = 0;
-    OffPC = workTime - OnPC;
-  }
-  onPcTime = OnPC; // синхронізуємо для збереження
+  float voltage = raw / 1024.0f * 5.0f;
+  POWER = (voltage > POWER_THRESHOLD) ? 1 : 0;
 
-  // Детекція переходів (можна додати логіку повідомлень через інші канали)
-  if (OnOffPower != POWER)
-  {
+  if (POWER) OnPC = workTime - OffPC;
+  else OffPC = workTime - OnPC;
+  onPcTime = OnPC;
+
+  if (POWER != OnOffPower) {
     OnOffPower = POWER;
-    Serial.println(POWER ? "[STATE] ✅ Ввімкнувся" : "[STATE] ❌ Вимкнувся");
+    Serial.println(POWER ? "[STATE] ✅ Увімкнувся" : "[STATE] ❌ Вимкнувся");
   }
 
-  // Автозбереження
-  if (now - lastSave >= SAVE_INTERVAL)
-  {
-    saveData();
-    lastSave = now;
+  if (now - lastSave >= SAVE_INTERVAL) {
+    saveData(); lastSave = now;
+  }
+
+  if (now - lastIpPrint >= IP_PRINT_INTERVAL) {
+    lastIpPrint = now;
+    IPAddress ip = WiFi.localIP();
+    if (ip[0] == 0) Serial.println("[WiFi] Поточний IP: (IP unset)");
+    else {
+      Serial.print("[WiFi] Поточний IP: ");
+      Serial.println(ip);
+    }
   }
 
   server.handleClient();
-
-  // Періодичний рестарт (наприклад, 24 години) – зараз ВИМКНЕНО / приклад:
-  // if (millis() >= 24UL*60*60*1000UL) ESP.restart();
 }
 
 // ---------------- Wi-Fi ----------------
-void connectWiFi()
-{
-  Serial.println("\n[WiFi] Скан списку...");
-  for (int i = 0; i < rowsWifiList; i++)
-  {
-    Serial.print("[WiFi] Підключення до: ");
+void connectWiFi() {
+  Serial.println("[WiFi] Пошук мереж...");
+  for (int i = 0; i < rowsWifiList; i++) {
+    Serial.print("[WiFi] Спроба: ");
     Serial.println(wifiList[i][0]);
     WiFi.begin(wifiList[i][0], wifiList[i][1]);
     unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 7000)
-    {
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 7000) {
       delay(500);
-      Serial.print('.');
     }
     Serial.println();
-    if (WiFi.status() == WL_CONNECTED)
-    {
-      Serial.print("[WiFi] ✅ Підключено: ");
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("[WiFi] ✅ Підключено до ");
       Serial.println(WiFi.SSID());
       Serial.print("[WiFi] IP: ");
       Serial.println(WiFi.localIP());
@@ -175,111 +130,65 @@ void connectWiFi()
     }
   }
   Serial.println("[WiFi] ❌ Не вдалося підключитись. Рестарт...");
-  delay(2000);
-  ESP.restart();
+  delay(2000); ESP.restart();
 }
 
-// ---------------- FS збереження ----------------
-void saveData()
-{
+// ---------------- FS ----------------
+void saveData() {
   StaticJsonDocument<256> doc;
   doc["workTime"] = workTime;
   doc["onPcTime"] = onPcTime;
   File f = LittleFS.open("/data.json", "w");
-  if (!f)
-  {
-    Serial.println("[FS] write error");
-    return;
+  if (f) {
+    serializeJson(doc, f);
+    f.close();
+    Serial.println("[FS] ✅ Дані збережено");
+  } else {
+    Serial.println("[FS] ❌ Помилка запису");
   }
-  serializeJson(doc, f);
-  f.close();
-  Serial.println("[FS] Data saved");
 }
 
-void loadData()
-{
-  if (!LittleFS.exists("/data.json"))
-  {
+void loadData() {
+  if (!LittleFS.exists("/data.json")) {
     Serial.println("[FS] data.json не знайдено – створюю");
-    saveData();
-    return;
+    saveData(); return;
   }
   File f = LittleFS.open("/data.json", "r");
-  if (!f)
-  {
-    Serial.println("[FS] read error");
-    return;
-  }
+  if (!f) { Serial.println("[FS] ❌ Помилка читання"); return; }
   StaticJsonDocument<256> doc;
-  DeserializationError e = deserializeJson(doc, f);
-  if (e)
-  {
-    Serial.println("[FS] JSON parse error");
-    f.close();
-    return;
+  if (deserializeJson(doc, f)) {
+    Serial.println("[FS] ❌ JSON помилка");
+  } else {
+    workTime = doc["workTime"] | 0;
+    onPcTime = doc["onPcTime"] | 0;
+    Serial.println("[FS] ✅ Дані завантажено");
   }
-  workTime = doc["workTime"].as<unsigned long>();
-  onPcTime = doc["onPcTime"].as<unsigned long>();
   f.close();
-  Serial.println("[FS] Data loaded");
 }
 
-void deleteJSON(const char *path)
-{
-  if (LittleFS.exists(path))
-  {
-    if (LittleFS.remove(path))
-      Serial.println("[FS] JSON deleted");
-    else
-      Serial.println("[FS] JSON delete error");
-  }
+void deleteJSON(const char *path) {
+  if (LittleFS.exists(path) && LittleFS.remove(path))
+    Serial.println("[FS] JSON видалено");
   else
-  {
-    Serial.println("[FS] JSON not found");
-  }
+    Serial.println("[FS] ❌ Не вдалося видалити");
 }
 
-// ---------------- Форматування часу ----------------
-String formatUptime(unsigned long ms)
-{
-  unsigned long s = ms / 1000UL;
-  unsigned int sec = s % 60;
-  unsigned long m = s / 60UL;
-  unsigned int min = m % 60;
-  unsigned long h = m / 60UL;
-  unsigned int hour = h % 24;
-  unsigned long day = h / 24UL;
-  char buf[48];
-  snprintf(buf, sizeof(buf), "%lu діб %02u:%02u:%02u", day, hour, min, sec);
-  return String(buf);
-}
-
-// ---------------- HTML Головна ----------------
-void handleRoot()
-{
-  String html = F("<!DOCTYPE html><html lang='uk'><head><meta charset='utf-8'/>"
-                  "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
-                  "<title>");
+// ---------------- API ----------------
+void handleRoot() {
+  String html = F(R"rawliteral(
+<!DOCTYPE html><html lang='uk'><head><meta charset='utf-8'/>
+<meta name='viewport' content='width=device-width,initial-scale=1'/>
+<title>)rawliteral");
   html += deviceName;
-  html += F("</title><style>body{font-family:Arial;margin:14px;background:#111;color:#eee;}"
-            "h1{font-size:20px;margin:0 0 10px;}button{padding:10px 18px;margin:4px;font-size:14px;cursor:pointer;border:0;border-radius:6px;background:#3a6aff;color:#fff;}"
-            ".stat{margin:8px 0;padding:8px;background:#222;border-radius:6px;line-height:1.4;}"
-            "#status.on{color:#6fd96f;}#status.off{color:#ff6b6b;}"
-            "code{background:#222;padding:2px 6px;border-radius:4px;}"
-            "</style></head><body><h1>");
+  html += F(R"rawliteral(</title><style>body{font-family:sans-serif;background:#111;color:#eee;margin:14px;}h1{font-size:20px;}button{padding:10px;margin:4px;background:#3a6aff;color:#fff;border:none;border-radius:6px;}.stat{margin:8px 0;padding:8px;background:#222;border-radius:6px;}#status.on{color:#6fd96f;}#status.off{color:#ff6b6b;}</style></head><body><h1>)rawliteral");
   html += deviceName;
-  html += F(" – панель</h1><div class='stat'>Стан: <span id='status'>...</span><br>Напруга: <span id='voltage'>...</span> V<br>Аптайм пристрою: <span id='uptime'>...</span><br>Час 'ON': <span id='onTime'>...</span><br>Час 'OFF': <span id='offTime'>...</span></div>"
-            "<div><button onclick=sendAct('on')>Увімкнути</button><button onclick=sendAct('off')>Вимкнути</button><button onclick=resetDev()>Рестарт</button><button onclick=clearData()>Clear JSON</button></div>"
-            "<script>async function load(){const r=await fetch('/api/state');if(!r.ok)return;const j=await r.json();const st=document.getElementById('status');st.textContent=j.power?'ПРАЦЮЄ ✅':'ВИМКНЕНO ❌';st.className=j.power?'on':'off';document.getElementById('voltage').textContent=j.voltage.toFixed(2);document.getElementById('uptime').textContent=j.uptime;document.getElementById('onTime').textContent=j.onTime;document.getElementById('offTime').textContent=j.offTime;}\nfunction sendAct(a){fetch('/api/rele?action='+a,{method:'POST'}).then(()=>setTimeout(load,400));}\nfunction resetDev(){if(confirm('Перезапустити пристрій?'))fetch('/api/reset',{method:'POST'});}\nfunction clearData(){if(confirm('Очистити дані і перезапустити?'))fetch('/api/clear',{method:'POST'});}\nsetInterval(load,2000);load();</script>");
-  html += F("</body></html>");
+  html += F(R"rawliteral( – Панель</h1><div class='stat'>Стан: <span id='status'>...</span><br>Напруга: <span id='voltage'>...</span> V<br>Аптайм: <span id='uptime'>...</span><br>Час 'ON': <span id='onTime'>...</span><br>Час 'OFF': <span id='offTime'>...</span></div><div><button onclick="sendAct('on')">Увімкнути</button><button onclick="sendAct('off')">Вимкнути</button><button onclick="resetDev()">Рестарт</button><button onclick="clearData()">Очистити</button></div><script>async function load(){const r=await fetch('/api/state');if(!r.ok)return;const j=await r.json();document.getElementById('status').textContent=j.power?'ПРАЦЮЄ ✅':'ВИМКНЕНO ❌';document.getElementById('status').className=j.power?'on':'off';document.getElementById('voltage').textContent=j.voltage.toFixed(2);document.getElementById('uptime').textContent=j.uptime;document.getElementById('onTime').textContent=j.onTime;document.getElementById('offTime').textContent=j.offTime;}function sendAct(a){fetch('/api/rele?action='+a,{method:'POST'}).then(()=>setTimeout(load,400));}function resetDev(){if(confirm('Рестарт пристрою?'))fetch('/api/reset',{method:'POST'});}function clearData(){if(confirm('Очистити дані та рестарт?'))fetch('/api/clear',{method:'POST'});}setInterval(load,2000);load();</script></body></html>)rawliteral");
   server.send(200, "text/html; charset=utf-8", html);
 }
 
-// ---------------- API: стан ----------------
-void handleAPIState()
-{
+void handleAPIState() {
   int raw = analogRead(POWER_PIN);
-  float voltage = (raw / 1024.0f * 5.0f);
+  float voltage = raw / 1024.0f * 5.0f;
   StaticJsonDocument<256> doc;
   doc["power"] = POWER;
   doc["voltage"] = voltage;
@@ -292,51 +201,34 @@ void handleAPIState()
   server.send(200, "application/json", out);
 }
 
-// ---------------- API: керування реле ----------------
-void handleRele()
-{
-  if (!server.hasArg("action"))
-  {
-    server.send(400, "text/plain", "Missing action");
-    return;
+void handleRele() {
+  if (!server.hasArg("action")) {
+    server.send(400, "text/plain", "Missing action"); return;
   }
   String a = server.arg("action");
-  if (a == "on")
-  {
-    // Імітуємо кнопку живлення – імпульс 500 мс
-    digitalWrite(RELE_PIN, LOW);
-    delay(500);
-    digitalWrite(RELE_PIN, HIGH);
-  }
-  else if (a == "off")
-  {
-    digitalWrite(RELE_PIN, LOW);
-    delay(500);
-    digitalWrite(RELE_PIN, HIGH);
-  }
-  else
-  {
+  if (a == "on" || a == "off") {
+    digitalWrite(RELE_PIN, LOW); delay(500); digitalWrite(RELE_PIN, HIGH);
+    server.send(200, "text/plain", "OK");
+  } else {
     server.send(400, "text/plain", "Bad action");
-    return;
   }
-  server.send(200, "text/plain", "OK");
 }
 
-// ---------------- API: reset ----------------
-void handleReset()
-{
-  server.send(200, "text/plain", "Rebooting");
-  delay(200);
-  ESP.restart();
+void handleReset() {
+  server.send(200, "text/plain", "Rebooting"); delay(200); ESP.restart();
 }
 
-// ---------------- API: clear + reset ----------------
-void handleClear()
-{
+void handleClear() {
   deleteJSON("/data.json");
-  server.send(200, "text/plain", "Cleared");
-  delay(300);
-  ESP.restart();
+  server.send(200, "text/plain", "Cleared"); delay(300); ESP.restart();
 }
 
-// ---------------- Кінець ----------------
+// ---------------- Формат часу ----------------
+String formatUptime(unsigned long ms) {
+  unsigned long s = ms / 1000;
+  unsigned int sec = s % 60, min = (s / 60) % 60, hour = (s / 3600) % 24;
+  unsigned long day = s / 86400;
+  char buf[48];
+  snprintf(buf, sizeof(buf), "%lu діб %02u:%02u:%02u", day, hour, min, sec);
+  return String(buf);
+}

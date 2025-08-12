@@ -2,12 +2,14 @@
 REM --- Перехід до кореня проєкту ---
 cd /d "%~dp0\.."
 
-REM --- Задати шляхи ---
-set "SRC=build\PC_on-off.ino.bin"
-set "DST=PC_on-off.ino.bin"
+REM --- Пошук BIN файлу у build ---
+for %%f in (build\*.bin) do (
+    set "SRC=%%f"
+    set "DST=%%~nxf"
+)
 
-REM --- Копіювання ---
-if exist "%SRC%" (
+REM --- Перевірка і копіювання ---
+if defined SRC (
     copy /Y "%SRC%" "%DST%"
     echo The BIN file has been copied!
 ) else (

@@ -262,7 +262,7 @@ void connectWiFi()
     startAttemptTime = millis();
     while (WiFi.status() != WL_CONNECTED && (millis() - startAttemptTime) < 5000)
     {
-      delay(500);
+      delay(200);
     }
     Serial.println(String(millis() - startAttemptTime));
 

@@ -12,3 +12,21 @@
 
 Файл bin копіюється натисканням [Ctrl+Shift+B] та вибором [build+copy] і знаходиться поруч з ino.
 це створений код (copy_bin.bat) в папці (.vscode)
+
+Boards Manager esp8266
+LOLIN(WeMos) D1 R1
+
+Library Manager
+Arduino_DebugUtils
+Arduino_ESP32_OTA
+Arduino_MachineControl
+ArduinoHttpClient
+ArduinoJson
+ArduinoRS485
+FastBot
+FastLED
+HttpClient
+LittleFS_esp32
+Rtc by Makuna
+TFT_eSPI
+WiFi

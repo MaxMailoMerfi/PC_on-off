@@ -1,5 +1,5 @@
 {
-  "port": "COM1",
+  "port": "COM3",
   "configuration": "baud=921600,xtal=80,eesz=4M2M,dbg=Disabled,lvl=None____,ip=lm2f,vt=flash,exception=disabled,stacksmash=disabled,wipe=all,ssl=all,mmu=3232,non32xfer=fast",
   "output": "build",
   "board": "esp8266:esp8266:d1",
@@ -7,7 +7,7 @@
   "useProgrammer": false,
   "configurationRequired": true,
   "monitorPortSettings": {
-    "port": "COM1",
+    "port": "COM3",
     "baudRate": 115200,
     "lineEnding": "\r\n",
     "dataBits": 8,
@@ -15,5 +15,6 @@
     "stopBits": "one"
   },
   "optimize_for_debug": false,
-  "schemaVersion": 1
+  "schemaVersion": 1,
+  "compile_profile": "PC_on-off"
 }

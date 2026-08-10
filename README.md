@@ -14,6 +14,7 @@
 це створений код (copy_bin.bat) в папці (.vscode)
 
 Boards Manager esp8266
+https://arduino.esp8266.com/stable/package_esp8266com_index.json
 LOLIN(WeMos) D1 R1
 
 Library Manager
@@ -30,3 +31,5 @@ LittleFS_esp32
 Rtc by Makuna
 TFT_eSPI
 WiFi
+
+

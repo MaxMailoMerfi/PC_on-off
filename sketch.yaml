@@ -1,6 +1,6 @@
 profiles:
   PC_on-off:
-    fqbn: esp8266:esp8266:d1:baud=921600,xtal=80,eesz=4M2M,dbg=Disabled,lvl=None____,ip=lm2f,vt=flash,exception=disabled,stacksmash=disabled,wipe=all,ssl=all,mmu=3232,non32xfer=fast
+    fqbn: esp8266:esp8266:d1:baud=115200,xtal=80,eesz=4M2M,dbg=Disabled,lvl=None____,ip=lm2f,vt=flash,exception=disabled,stacksmash=disabled,wipe=all,ssl=all,mmu=3232,non32xfer=fast
     platforms:
       - platform: esp8266:esp8266 (3.1.2)
         platform_index_url: https://arduino.esp8266.com/stable/package_esp8266com_index.json
@@ -8,9 +8,10 @@ profiles:
       - FastBot (2.27.4)
       - ArduinoJson (7.4.3)
     programmer: ""
-    port: COM1
+    port: COM3
     port_config:
       baudrate: "115200"
+      lineEnding: "\r\n"
       bits: "8"
       parity: none
       stop_bits: one

@@ -25,7 +25,7 @@ struct MultiLaneDevice::Impl : public DeviceImplBase {
     u8 backend_type;  // 1, 2, 4, or 8 (number of lanes supported by backend)
 
     Impl(const Config& cfg)
-        : DeviceImplBase()
+        FL_NO_EXCEPT : DeviceImplBase()
         , config(cfg)
         , backend_type(0) {
 
@@ -36,13 +36,13 @@ struct MultiLaneDevice::Impl : public DeviceImplBase {
         }
     }
 
-    ~Impl() FL_NOEXCEPT {
+    ~Impl() FL_NO_EXCEPT {
         if (initialized && backend) {
             releaseBackend();
         }
     }
 
-    void releaseBackend() {
+    void releaseBackend() FL_NO_EXCEPT {
         if (!backend) return;
 
         // Use polymorphic interface - no casting needed!
@@ -57,25 +57,24 @@ struct MultiLaneDevice::Impl : public DeviceImplBase {
 // ============================================================================
 
 MultiLaneDevice::MultiLaneDevice(const Config& config)
-    : pImpl(fl::make_unique<Impl>(config)) {
+    FL_NO_EXCEPT : pImpl(fl::make_unique<Impl>(config)) {
 
     // Validate configuration
     size_t num_lanes = config.data_pins.size();
     if (num_lanes < 1 || num_lanes > 8) {
-        FL_WARN("MultiLaneDevice: Invalid number of data pins (" << num_lanes
-                << "), must be 1-8");
+        FL_WARN("MultiLaneDevice: Invalid number of data pins (" << num_lanes << "), must be 1-8");
     }
 
     FL_DBG("MultiLaneDevice: Created with " << num_lanes << " lane(s)");
 }
 
-MultiLaneDevice::~MultiLaneDevice() FL_NOEXCEPT {
+MultiLaneDevice::~MultiLaneDevice() FL_NO_EXCEPT {
     if (pImpl && pImpl->initialized) {
         end();
     }
 }
 
-fl::optional<fl::task::Error> MultiLaneDevice::begin() {
+fl::optional<fl::task::Error> MultiLaneDevice::begin() FL_NO_EXCEPT {
     if (!pImpl) {
         return fl::task::Error("Device not initialized");
     }
@@ -261,7 +260,7 @@ fl::optional<fl::task::Error> MultiLaneDevice::begin() {
     return fl::nullopt;
 }
 
-void MultiLaneDevice::end() {
+void MultiLaneDevice::end() FL_NO_EXCEPT {
     if (!pImpl || !pImpl->initialized) {
         return;
     }
@@ -280,11 +279,11 @@ void MultiLaneDevice::end() {
     FL_DBG("MultiLaneDevice: Shutdown complete");
 }
 
-bool MultiLaneDevice::isReady() const {
+bool MultiLaneDevice::isReady() const FL_NO_EXCEPT {
     return pImpl && pImpl->isReady();
 }
 
-Lane& MultiLaneDevice::lane(size_t lane_id) {
+Lane& MultiLaneDevice::lane(size_t lane_id) FL_NO_EXCEPT {
     if (!pImpl || lane_id >= pImpl->lanes.size()) {
         FL_WARN("MultiLaneDevice: Invalid lane ID " << lane_id);
         // Return first lane as fallback (avoid crash)
@@ -294,11 +293,11 @@ Lane& MultiLaneDevice::lane(size_t lane_id) {
     return pImpl->lanes[lane_id];
 }
 
-size_t MultiLaneDevice::numLanes() const {
+size_t MultiLaneDevice::numLanes() const FL_NO_EXCEPT {
     return pImpl ? pImpl->lanes.size() : 0;
 }
 
-Result<void> MultiLaneDevice::flush() {
+Result<void> MultiLaneDevice::flush() FL_NO_EXCEPT {
     if (!isReady()) {
         return Result<void>::failure(SPIError::NOT_INITIALIZED,
             "Device not initialized");
@@ -318,8 +317,7 @@ Result<void> MultiLaneDevice::flush() {
                 found_first = true;
             } else if (lane_size != expected_size) {
                 // Size mismatch detected
-                FL_WARN("MultiLaneDevice: Lane size mismatch - expected " << expected_size
-                        << " bytes (lane 0), but lane " << i << " has " << lane_size << " bytes");
+                FL_WARN("MultiLaneDevice: Lane size mismatch - expected " << expected_size << " bytes (lane 0), but lane " << i << " has " << lane_size << " bytes");
                 return Result<void>::failure(SPIError::INVALID_PARAMETER,
                     "Lane size mismatch: all lanes must have identical sizes");
             }
@@ -356,8 +354,7 @@ Result<void> MultiLaneDevice::flush() {
 
             // Verify sizes match (DMA buffer should be exactly the size we requested)
             if (lane_data.size() != dma_data.size()) {
-                FL_WARN("MultiLaneDevice: DMA buffer size mismatch - expected " << lane_data.size()
-                        << " bytes, got " << dma_data.size() << " bytes");
+                FL_WARN("MultiLaneDevice: DMA buffer size mismatch - expected " << lane_data.size() << " bytes, got " << dma_data.size() << " bytes");
                 error = "DMA buffer size mismatch";
                 transpose_ok = false;
             } else {
@@ -417,7 +414,7 @@ Result<void> MultiLaneDevice::flush() {
     }
 
     if (!transpose_ok) {
-        FL_WARN("MultiLaneDevice: Transposition failed - " << (error ? error : "unknown error"));
+        FL_WARN("MultiLaneDevice: Transposition failed - " << ((error ? error : "unknown error")));
         return Result<void>::failure(SPIError::ALLOCATION_FAILED,
             error ? error : "Transposition failed");
     }
@@ -436,15 +433,14 @@ Result<void> MultiLaneDevice::flush() {
         lane.clear();
     }
 
-    FL_DBG("MultiLaneDevice: Flushed " << pImpl->lanes.size() << " lanes ("
-           << max_size << " bytes per lane)");
+    FL_DBG("MultiLaneDevice: Flushed " << pImpl->lanes.size() << " lanes (" << max_size << " bytes per lane)");
 
     // Success - transmission started asynchronously
     // User must call waitComplete() manually to block until transmission completes
     return Result<void>::success();
 }
 
-bool MultiLaneDevice::waitComplete(u32 timeout_ms) {
+bool MultiLaneDevice::waitComplete(u32 timeout_ms) FL_NO_EXCEPT {
     if (!isReady()) {
         return false;
     }
@@ -453,7 +449,7 @@ bool MultiLaneDevice::waitComplete(u32 timeout_ms) {
     return pImpl->backend->waitComplete(timeout_ms);
 }
 
-bool MultiLaneDevice::isBusy() const {
+bool MultiLaneDevice::isBusy() const FL_NO_EXCEPT {
     if (!isReady()) {
         return false;
     }
@@ -462,15 +458,14 @@ bool MultiLaneDevice::isBusy() const {
     return pImpl->backend->isBusy();
 }
 
-WriteResult MultiLaneDevice::writeImpl(fl::span<const fl::span<const u8>> lane_data) {
+WriteResult MultiLaneDevice::writeImpl(fl::span<const fl::span<const u8>> lane_data) FL_NO_EXCEPT {
     if (!isReady()) {
         FL_WARN("MultiLaneDevice: Not ready for write");
         return WriteResult("Device not ready");
     }
 
     if (lane_data.size() > pImpl->lanes.size()) {
-        FL_WARN("MultiLaneDevice: Too many lanes provided (" << lane_data.size()
-                << " > " << pImpl->lanes.size() << ")");
+        FL_WARN("MultiLaneDevice: Too many lanes provided (" << lane_data.size() << " > " << pImpl->lanes.size() << ")");
         return WriteResult("Too many lanes provided");
     }
 
@@ -479,8 +474,7 @@ WriteResult MultiLaneDevice::writeImpl(fl::span<const fl::span<const u8>> lane_d
         size_t first_size = lane_data[0].size();
         for (size_t i = 1; i < lane_data.size(); i++) {
             if (lane_data[i].size() != first_size) {
-                FL_WARN("MultiLaneDevice: Lane size mismatch - lane 0 has " << first_size
-                        << " bytes, lane " << i << " has " << lane_data[i].size() << " bytes");
+                FL_WARN("MultiLaneDevice: Lane size mismatch - lane 0 has " << first_size << " bytes, lane " << i << " has " << lane_data[i].size() << " bytes");
                 return WriteResult("Lane size mismatch: all lanes must have identical sizes");
             }
         }
@@ -507,7 +501,7 @@ WriteResult MultiLaneDevice::writeImpl(fl::span<const fl::span<const u8>> lane_d
     return WriteResult();
 }
 
-const MultiLaneDevice::Config& MultiLaneDevice::getConfig() const {
+const MultiLaneDevice::Config& MultiLaneDevice::getConfig() const FL_NO_EXCEPT {
     static const Config empty_config;
     return pImpl ? pImpl->config : empty_config;
 }

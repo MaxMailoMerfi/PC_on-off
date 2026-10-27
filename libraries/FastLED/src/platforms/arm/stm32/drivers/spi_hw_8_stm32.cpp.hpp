@@ -252,12 +252,12 @@ bool SPIOctalSTM32::begin(const SpiHw8::Config& config) {
 
     // Validate all pins using GPIO helper functions
     if (!isValidPin(mClockPin)) {
-        FL_WARN("SPIOctalSTM32: Invalid clock pin " << static_cast<int>(mClockPin));
+        FL_WARN("SPIOctalSTM32: Invalid clock pin " << (static_cast<int>(mClockPin)));
         return false;
     }
     for (int i = 0; i < 8; ++i) {
         if (!isValidPin(mDataPins[i])) {
-            FL_WARN("SPIOctalSTM32: Invalid data pin " << i << ": " << static_cast<int>(mDataPins[i]));
+            FL_WARN("SPIOctalSTM32: Invalid data pin " << i << ": " << (static_cast<int>(mDataPins[i])));
             return false;
         }
     }
@@ -273,11 +273,8 @@ bool SPIOctalSTM32::begin(const SpiHw8::Config& config) {
     }
 
     FL_DBG("SPIOctalSTM32: GPIO pins configured successfully");
-    FL_DBG("  Clock pin: " << static_cast<int>(mClockPin));
-    FL_DBG("  Data pins: " << static_cast<int>(mDataPins[0]) << ", " << static_cast<int>(mDataPins[1]) << ", "
-                           << static_cast<int>(mDataPins[2]) << ", " << static_cast<int>(mDataPins[3]) << ", "
-                           << static_cast<int>(mDataPins[4]) << ", " << static_cast<int>(mDataPins[5]) << ", "
-                           << static_cast<int>(mDataPins[6]) << ", " << static_cast<int>(mDataPins[7]));
+    FL_DBG("  Clock pin: " << (static_cast<int>(mClockPin)));
+    FL_DBG("  Data pins: " << (static_cast<int>(mDataPins[0])) << ", " << (static_cast<int>(mDataPins[1])) << ", " << (static_cast<int>(mDataPins[2])) << ", " << (static_cast<int>(mDataPins[3])) << ", " << (static_cast<int>(mDataPins[4])) << ", " << (static_cast<int>(mDataPins[5])) << ", " << (static_cast<int>(mDataPins[6])) << ", " << (static_cast<int>(mDataPins[7])));
 #endif
 
     // TODO: Implement remaining hardware initialization

@@ -109,6 +109,20 @@ def parse_args(args: Optional[list[str]] = None) -> TestArgs:
         help="Run example compilation tests only (optionally specify example names). Use with --full for complete compilation + linking + execution",
     )
     parser.add_argument(
+        "--example-group",
+        choices=[
+            "CompileTests",
+            "Nightly",
+            "Basic",
+            "Classic",
+            "Advanced",
+            "Fx",
+            "Experimental",
+            "AutoResearch",
+        ],
+        help="Select the live compile gate, all nightly examples, or one example group",
+    )
+    parser.add_argument(
         "--no-pch",
         action="store_true",
         help="Disable precompiled headers (PCH) when running example compilation tests",
@@ -130,21 +144,21 @@ def parse_args(args: Optional[list[str]] = None) -> TestArgs:
         help="Enable debug mode for C++ unit tests and examples (full debug symbols + sanitizers)",
     )
     parser.add_argument(
+        "--debug-thin",
+        action="store_true",
+        help="Linux-only shorthand for --build-mode debug-thin (sanitize FastLED core and runner only)",
+    )
+    parser.add_argument(
         "--build-mode",
         type=str,
-        choices=["quick", "debug", "release", "profile"],
+        choices=["quick", "debug", "debug-thin", "release", "profile"],
         default=None,
         help="Override build mode for unit tests and examples (default: quick, or debug if --debug flag set)",
     )
     parser.add_argument(
         "--run",
         nargs="+",
-        help="Run examples in emulation. Usage: --run esp32s3|uno [example_names...]. Auto-detects QEMU for ESP32 or avr8js for AVR.",
-    )
-    parser.add_argument(
-        "--qemu",
-        nargs="+",
-        help="(Deprecated - use --run) Run examples in QEMU emulation. Usage: --qemu esp32s3 [example_names...]",
+        help="Run examples in emulation. Usage: --run uno [example_names...]. The integrated runner currently supports avr8js; use ci/stage_fbuild_project.py plus fbuild test-emu for ESP32 QEMU.",
     )
     parser.add_argument(
         "--no-fingerprint",
@@ -157,19 +171,9 @@ def parse_args(args: Optional[list[str]] = None) -> TestArgs:
         help="Force rerun of all tests, ignore fingerprint cache (same as --no-fingerprint)",
     )
     parser.add_argument(
-        "--build",
-        action="store_true",
-        help="Build Docker images if missing (use with --qemu)",
-    )
-    parser.add_argument(
         "--no-unity",
         action="store_true",
         help="This option will be re-enabled in the near future. How we always assume no unity builds.",
-    )
-    parser.add_argument(
-        "--docker",
-        action="store_true",
-        help="Run tests inside Docker container (Linux environment). Implies --debug unless --quick or --release is specified.",
     )
     parser.add_argument(
         "--list-tests",
@@ -194,6 +198,28 @@ def parse_args(args: Optional[list[str]] = None) -> TestArgs:
     )
 
     parsed_args = parser.parse_args(args)
+    if parsed_args.example_group == "AutoResearch":
+        parser.error(
+            "AutoResearch runs on ESP32-S3, not the host runner; "
+            "use `bash compile esp32s3 --examples AutoResearch`"
+        )
+    if parsed_args.example_group is not None:
+        if parsed_args.examples:
+            parser.error(
+                "--example-group cannot be combined with specific example names"
+            )
+        if parsed_args.examples is None:
+            parsed_args.examples = []
+    if parsed_args.debug_thin:
+        if parsed_args.debug or parsed_args.build_mode is not None:
+            parser.error("--debug-thin cannot be combined with --debug or --build-mode")
+        parsed_args.build_mode = "debug-thin"
+    if parsed_args.build_mode == "debug-thin" and parsed_args.debug:
+        parser.error("--build-mode debug-thin cannot be combined with --debug")
+    if parsed_args.build_mode == "debug-thin" and not sys.platform.startswith("linux"):
+        parser.error("debug-thin is supported only on native Linux")
+    if parsed_args.build_mode == "debug-thin" and parsed_args.run:
+        parser.error("debug-thin is a native test preset, not an emulator preset")
 
     # Handle test argument - join multiple words into a single query string
     # nargs="*" returns a list, so we need to convert it
@@ -222,18 +248,16 @@ def parse_args(args: Optional[list[str]] = None) -> TestArgs:
         stack_trace=parsed_args.stack_trace,
         check=parsed_args.check,
         examples=parsed_args.examples,
+        example_group=parsed_args.example_group,
         no_pch=parsed_args.no_pch,
         full=parsed_args.full,
         no_parallel=parsed_args.no_parallel,
         debug=parsed_args.debug,
         build_mode=parsed_args.build_mode,
         run=parsed_args.run,
-        qemu=parsed_args.qemu,
         no_fingerprint=parsed_args.no_fingerprint,
         force=parsed_args.force,
-        build=parsed_args.build,
         no_unity=parsed_args.no_unity,
-        docker=parsed_args.docker,
         list_tests=parsed_args.list_tests,
         log_failures=Path(parsed_args.log_failures)
         if parsed_args.log_failures
@@ -241,31 +265,22 @@ def parse_args(args: Optional[list[str]] = None) -> TestArgs:
         setup_only=parsed_args.setup_only,
     )
 
-    # Handle --docker flag: implies --debug unless --quick or --release is specified
-    if test_args.docker:
-        # Determine the effective build mode
-        if test_args.build_mode is None and not test_args.quick:
-            # No explicit build mode and no --quick flag: default to debug
-            test_args.debug = True
-            ts_print(
-                "⚠️  --docker implies --debug mode (sanitizers enabled). "
-                "Use --quick or --build-mode release for faster builds."
-            )
-        elif test_args.quick:
-            ts_print("Docker mode: using quick build (--quick specified)")
-        elif test_args.build_mode:
-            ts_print(
-                f"Docker mode: using {test_args.build_mode} build (--build-mode specified)"
-            )
-
     # Save original test query before disambiguation modifies it
-    # (Docker runner needs the raw query, not the meson target name)
     test_args.raw_test_query = test_args.test
 
     # Auto-enable --py or --cpp mode when a specific test is provided
     if test_args.test:
+        # Dedicated no-PCH TINY ABI executable. It is intentionally excluded
+        # from normal source discovery, so smart selection must not rewrite it
+        # to a host-tier DLL target.
+        if test_args.test in (
+            "color_profile_tiny_layout",
+            "color_profile_tiny_runtime",
+        ):
+            test_args.cpp = True
+            test_args.unit = True
         # Check if this is a Python test first
-        if _python_test_exists(test_args.test):
+        elif _python_test_exists(test_args.test):
             # This is a Python test - enable Python mode
             if not test_args.py and not test_args.cpp:
                 test_args.py = True
@@ -360,14 +375,18 @@ def parse_args(args: Optional[list[str]] = None) -> TestArgs:
             test_args.clang = True
         config_parts.append("check")
 
-    # Auto-enable --cpp and --quick when --examples is provided
+    # Auto-enable --cpp and --quick when --examples is provided without an
+    # explicit build preset. An explicit preset must stay visible in the log.
     if test_args.examples is not None:
         if not test_args.cpp:
             test_args.cpp = True
-        if not test_args.quick:
+        if not test_args.quick and test_args.build_mode is None and not test_args.debug:
             test_args.quick = True
-        # Show just the build mode - "examples" is redundant since user knows what they're running
-        if test_args.quick:
+        if test_args.build_mode is not None:
+            config_parts.append(test_args.build_mode)
+        elif test_args.debug:
+            config_parts.append("debug")
+        elif test_args.quick:
             config_parts.append("quick")
         else:
             config_parts.append("examples")

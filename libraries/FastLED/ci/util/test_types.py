@@ -88,25 +88,19 @@ class TestArgs:
     stack_trace: bool = False
     check: bool = False
     examples: Optional[list[str]] = None
+    example_group: Optional[str] = None
     no_pch: bool = False
     full: bool = False
 
     no_parallel: bool = False  # Force sequential test execution
     debug: bool = False  # Enable debug mode for unit tests and examples
     build_mode: Optional[str] = None  # Override build mode (quick, debug, release)
-    qemu: Optional[list[str]] = (
-        None  # Run examples in QEMU emulation (deprecated - use --run)
-    )
     run: Optional[list[str]] = (
-        None  # Run examples in emulation (QEMU for ESP32, avr8js for AVR)
+        None  # Run examples in emulation (avr8js for AVR — ESP32 QEMU local runner retired)
     )
     no_fingerprint: bool = False  # Disable fingerprint caching
-    build: bool = False  # Build Docker images if missing (use with --run)
     force: bool = False  # Force rerun of all tests, ignore fingerprint cache
     no_unity: bool = False  # Not in use any more, maybe revived later
-    docker: bool = (
-        False  # Run tests inside Docker container (implies --debug unless overridden)
-    )
     default_mode: bool = False  # True when no specific test flags were provided
     list_tests: bool = False  # List available tests without running them
     raw_test_query: Optional[str] = None  # Original test query before disambiguation
@@ -132,8 +126,6 @@ class TestCategories:
     py_only: bool
     integration_only: bool
     wasm_only: bool
-    qemu_esp32s3: bool
-    qemu_esp32s3_only: bool
 
     def __post_init__(self):
         # Type validation
@@ -148,12 +140,137 @@ class TestCategories:
             "py_only",
             "integration_only",
             "wasm_only",
-            "qemu_esp32s3",
-            "qemu_esp32s3_only",
         ]:
             value = getattr(self, field_name)
             if not isinstance(value, bool):
                 raise TypeError(f"{field_name} must be bool, got {type(value)}")
+
+
+@dataclass(frozen=True)
+class RunBreakdown:
+    """How a test run's pass counts should be described.
+
+    ``counts`` names each population that actually executed; ``notes`` says
+    what did not, and is empty when everything requested ran. They are kept
+    apart so each surface can slot its own duration/scope text in between.
+    """
+
+    counts: str
+    notes: str
+
+    def describe(self, middle: str = "") -> str:
+        """Render as ``counts + middle + notes``.
+
+        Every surface slots its own text (" passed", " in 3.2s", a scope
+        annotation) between the two halves, which is why they are stored
+        apart. Routing all of them through here keeps one separator: both
+        halves already contain commas, so comma-joining produced strings with
+        commas at three nesting levels that could not be read apart.
+        """
+        return self.counts + middle + (f"; {self.notes}" if self.notes else "")
+
+
+def describe_test_counts(
+    *,
+    num_passed: int,
+    num_run: int,
+    num_examples_passed: Optional[int],
+    num_examples_run: Optional[int],
+    examples_included: Optional[bool],
+    filtered: bool = False,
+) -> RunBreakdown:
+    """Describe a C++ run's totals, using whatever attribution was recorded.
+
+    This is the single entry point for every reporting surface, so a run is
+    described identically in the headline, the summary table, and the replayed
+    cache line. Each surface previously repeated this three-way ``is None``
+    guard and its own fallback wording, which is how the same run came to be
+    described two different ways in one terminal output.
+
+    Three levels of knowledge are possible, and none of them may claim more
+    than was recorded (#3779):
+
+    * full split recorded -- name both populations and their counts;
+    * only *which* populations were eligible -- name them, not the split;
+    * nothing recorded -- replay the bare total and say the split is unknown.
+
+    ``filtered`` marks a run narrowed by a name/file selector. A population
+    that ran nothing under a filter was skipped by the selector, not verified
+    as up to date, and must not be described as cached.
+    """
+    if (
+        num_examples_run is not None
+        and num_examples_passed is not None
+        and examples_included is not None
+    ):
+        return format_run_breakdown(
+            unit_passed=num_passed - num_examples_passed,
+            unit_run=num_run - num_examples_run,
+            examples_passed=num_examples_passed,
+            examples_run=num_examples_run,
+            examples_included=examples_included,
+            filtered=filtered,
+        )
+    if examples_included is not None:
+        # The populations are known but not their sizes -- ``meson test``
+        # reports one suite-wide number. Name the coverage, claim no split.
+        if examples_included:
+            return RunBreakdown(f"{num_passed}/{num_run} unit + examples", "")
+        return RunBreakdown(f"{num_passed}/{num_run} unit", "examples not requested")
+    return RunBreakdown(f"{num_passed}/{num_run}", "unit/example split unrecorded")
+
+
+def format_run_breakdown(
+    *,
+    unit_passed: int,
+    unit_run: int,
+    examples_passed: int,
+    examples_run: int,
+    examples_included: bool,
+    filtered: bool = False,
+) -> RunBreakdown:
+    """Render pass counts with the unit/example split spelled out.
+
+    ``bash test --cpp`` covers two populations -- unit tests and example
+    compile targets -- and either can be skipped because its artifacts were
+    already up to date. Summing them into one anonymous denominator makes
+    "274 unit tests, examples cached" indistinguishable from "274 of the 357
+    things I expected", which is the ambiguity #3779 was filed over. So name
+    each population that ran, and say plainly which one did not.
+
+    ``examples_included`` is False when examples were never requested (the
+    unit-only mode passes ``--no-suite fastled:examples``); that is a
+    different statement from "requested but already cached".
+
+    Prefer :func:`describe_test_counts` unless the full split is already known
+    -- it handles the partially-attributed cases this function cannot express.
+    """
+    parts: list[str] = []
+    if unit_run:
+        parts.append(f"{unit_passed}/{unit_run} unit")
+    if examples_run:
+        parts.append(f"{examples_passed}/{examples_run} examples")
+
+    # Why a population contributed nothing decides what may be claimed about
+    # it. Under a filter it was never selected; otherwise its binaries were
+    # already up to date. Only the latter is evidence of anything.
+    missing = "not matched by filter" if filtered else "cached, not re-run"
+    notes: list[str] = []
+    if not unit_run:
+        notes.append(f"unit tests {missing}")
+    if not examples_included:
+        notes.append("examples not requested")
+    elif not examples_run:
+        notes.append(f"examples {missing}")
+
+    # Keep the totals visible even when nothing ran: the notes explain the
+    # zero, but a reader still needs to tell an empty run from a corrupt entry.
+    counts = (
+        ", ".join(parts)
+        if parts
+        else f"{unit_passed + examples_passed}/{unit_run + examples_run}"
+    )
+    return RunBreakdown(counts, "; ".join(notes))
 
 
 @typechecked
@@ -169,14 +286,62 @@ class FingerprintResult:
     num_tests_passed: Optional[int] = None
     duration_seconds: Optional[float] = None
     test_name: Optional[str] = None  # Human-readable test category name
+    # Max source-file mtime observed when this fingerprint's run STARTED.
+    # The mtime fast-path gates on this, never on the fingerprint file's own
+    # mtime: that file is written when the run ENDS, so a source file created
+    # while the run was in flight looks older than the cache and gets skipped
+    # on every later run while the suite still reports green.
+    source_max_mtime: Optional[float] = None
+    # Content signature of the small build/config inputs outside source dirs.
+    aux_hash: Optional[str] = None
+    # Provenance of the counts above: "full" when the run covered the whole
+    # suite, "partial" when a filter/selection narrowed it. Cached counts are
+    # replayed verbatim on later runs, so without this a subset result reads as
+    # an authoritative full-suite pass and there is no way to tell the two
+    # apart after the fact (#3763).
+    scope: Optional[str] = None
+    # Split of the counts above into the two populations a C++ run covers.
+    # None means this fingerprint predates the breakdown (#3779) -- the totals
+    # are still replayed, but without claiming which populations they cover.
+    num_examples_run: Optional[int] = None
+    num_examples_passed: Optional[int] = None
+    examples_included: Optional[bool] = None
+    native_linker_signature: Optional[str] = None
 
     def get_cache_summary(self) -> str:
         """Get a human-readable summary of cached test results"""
         if self.num_tests_run is not None and self.num_tests_passed is not None:
+            # `is not None`, not truthiness: 0.0s is a real duration for an
+            # instantly-replayed run, and dropping it loses information.
             duration_str = (
-                f" in {self.duration_seconds:.2f}s" if self.duration_seconds else ""
+                f" in {self.duration_seconds:.2f}s"
+                if self.duration_seconds is not None
+                else ""
             )
-            return f"{self.num_tests_passed}/{self.num_tests_run} passed{duration_str}"
+            # Say where the number came from. "partial" is called out; a missing
+            # scope is from a fingerprint written before this field existed, so
+            # it is reported as unverified rather than silently as a full pass.
+            if self.scope == "partial":
+                scope_str = ", filtered run - NOT the full suite"
+            elif self.scope == "full":
+                scope_str = ""
+            else:
+                scope_str = ", scope unrecorded"
+            # Name the populations the counts cover. Without the split a
+            # unit-only total is indistinguishable from a unit+examples one
+            # under identical wording (#3779).
+            breakdown = describe_test_counts(
+                num_passed=self.num_tests_passed,
+                num_run=self.num_tests_run,
+                num_examples_passed=self.num_examples_passed,
+                num_examples_run=self.num_examples_run,
+                examples_included=self.examples_included,
+                # #3778 already records a narrowed run as "partial"; that is
+                # the same fact `filtered` needs, so a replayed filtered run
+                # cannot claim its untouched populations were merely cached.
+                filtered=self.scope == "partial",
+            )
+            return breakdown.describe(f" passed{duration_str}{scope_str}")
         return ""
 
     def should_skip(self, current: "FingerprintResult") -> bool:
@@ -213,7 +378,6 @@ def process_test_flags(args: TestArgs) -> TestArgs:
         args.examples is not None,
         args.py,
         args.full,
-        args.qemu is not None,
     ]
     specific_count = sum(bool(flag) for flag in specific_flags)
 
@@ -246,7 +410,6 @@ def determine_test_categories(args: TestArgs) -> TestCategories:
     py_enabled = args.py
     # Integration tests only run when --full is used alone (not with --examples)
     integration_enabled = args.full and args.examples is None
-    qemu_esp32s3_enabled = args.qemu is not None
 
     # WASM compilation runs in default mode (when no specific test flags were provided)
     # When user explicitly specifies test categories (--cpp, --unit, --examples, --py), WASM is disabled
@@ -258,43 +421,31 @@ def determine_test_categories(args: TestArgs) -> TestCategories:
         py=py_enabled,
         integration=integration_enabled,
         wasm=wasm_enabled,
-        qemu_esp32s3=qemu_esp32s3_enabled,
         unit_only=unit_enabled
         and not examples_enabled
         and not py_enabled
         and not integration_enabled
-        and not wasm_enabled
-        and not qemu_esp32s3_enabled,
+        and not wasm_enabled,
         examples_only=examples_enabled
         and not unit_enabled
         and not py_enabled
         and not integration_enabled
-        and not wasm_enabled
-        and not qemu_esp32s3_enabled,
+        and not wasm_enabled,
         py_only=py_enabled
         and not unit_enabled
         and not examples_enabled
         and not integration_enabled
-        and not wasm_enabled
-        and not qemu_esp32s3_enabled,
+        and not wasm_enabled,
         integration_only=integration_enabled
         and not unit_enabled
         and not examples_enabled
         and not py_enabled
-        and not wasm_enabled
-        and not qemu_esp32s3_enabled,
+        and not wasm_enabled,
         wasm_only=wasm_enabled
         and not unit_enabled
         and not examples_enabled
         and not py_enabled
-        and not integration_enabled
-        and not qemu_esp32s3_enabled,
-        qemu_esp32s3_only=qemu_esp32s3_enabled
-        and not unit_enabled
-        and not examples_enabled
-        and not py_enabled
-        and not integration_enabled
-        and not wasm_enabled,
+        and not integration_enabled,
     )
 
 
@@ -383,7 +534,7 @@ def _hash_directory(start_directory: Path, glob: str) -> str:
 
 
 def fingerprint_code_base(
-    start_directory: Path, glob: str = "**/*.h,**/*.cpp,**/*.hpp"
+    start_directory: Path, glob: str = "**/*.h,**/*.cpp,**/*.hpp,**/*.c"
 ) -> FingerprintResult:
     """
     Create a fingerprint of the code base by hashing file contents.
@@ -429,6 +580,26 @@ def calculate_fingerprint(root_dir: Optional[Path] = None) -> FingerprintResult:
     return result
 
 
+def native_linker_signature() -> str:
+    """Identify the selected native linker by path and bytes, when overridden."""
+    selected = os.environ.get("FASTLED_NATIVE_LINKER")
+    if selected is None:
+        return ""
+    import hashlib  # noqa: PLC0415 - only needed for an explicit override
+
+    path = Path(selected).resolve()
+    hasher = hashlib.sha256()
+    hasher.update(str(path).encode("utf-8"))
+    try:
+        with path.open("rb") as linker:
+            for chunk in iter(lambda: linker.read(1024 * 1024), b""):
+                hasher.update(chunk)
+    except OSError:
+        # A missing or unreadable override must never reuse a passing cache.
+        hasher.update(b"unreadable")
+    return hasher.hexdigest()
+
+
 def calculate_cpp_test_fingerprint(
     args: Optional[TestArgs] = None,
 ) -> FingerprintResult:
@@ -448,17 +619,22 @@ def calculate_cpp_test_fingerprint(
 
     # Combine fingerprints from both src/ and tests/ directories
     hasher = hashlib.sha256()
+    linker_signature = native_linker_signature()
+    if linker_signature:
+        hasher.update(f"native_linker:{linker_signature}".encode("utf-8"))
 
     # Process src/ directory (C++ source files)
     src_dir = cwd / "src"
     if src_dir.exists():
-        src_result = fingerprint_code_base(src_dir, "**/*.h,**/*.cpp,**/*.hpp")
+        src_result = fingerprint_code_base(src_dir, "**/*.h,**/*.cpp,**/*.hpp,**/*.c")
         hasher.update(f"src:{src_result.hash}".encode("utf-8"))
 
     # Process tests/ directory (test files)
     tests_dir = cwd / "tests"
     if tests_dir.exists():
-        tests_result = fingerprint_code_base(tests_dir, "**/*.h,**/*.cpp,**/*.hpp")
+        tests_result = fingerprint_code_base(
+            tests_dir, "**/*.h,**/*.cpp,**/*.hpp,**/*.c"
+        )
         hasher.update(f"tests:{tests_result.hash}".encode("utf-8"))
 
     # Include meson.build files that affect build configuration
@@ -489,7 +665,10 @@ def calculate_cpp_test_fingerprint(
     elapsed_time = time.time() - start_time
 
     return FingerprintResult(
-        hash=hasher.hexdigest(), elapsed_seconds=f"{elapsed_time:.2f}", status="success"
+        hash=hasher.hexdigest(),
+        elapsed_seconds=f"{elapsed_time:.2f}",
+        status="success",
+        native_linker_signature=linker_signature,
     )
 
 
@@ -512,18 +691,21 @@ def calculate_examples_fingerprint(
 
     # Combine fingerprints from relevant directories
     hasher = hashlib.sha256()
+    linker_signature = native_linker_signature()
+    if linker_signature:
+        hasher.update(f"native_linker:{linker_signature}".encode("utf-8"))
 
     # Process src/ directory (affects example compilation)
     src_dir = cwd / "src"
     if src_dir.exists():
-        src_result = fingerprint_code_base(src_dir, "**/*.h,**/*.cpp,**/*.hpp")
+        src_result = fingerprint_code_base(src_dir, "**/*.h,**/*.cpp,**/*.hpp,**/*.c")
         hasher.update(f"src:{src_result.hash}".encode("utf-8"))
 
     # Process examples/ directory
     examples_dir = cwd / "examples"
     if examples_dir.exists():
         examples_result = fingerprint_code_base(
-            examples_dir, "**/*.ino,**/*.h,**/*.cpp,**/*.hpp"
+            examples_dir, "**/*.ino,**/*.h,**/*.cpp,**/*.hpp,**/*.c"
         )
         hasher.update(f"examples:{examples_result.hash}".encode("utf-8"))
 
@@ -571,7 +753,10 @@ def calculate_examples_fingerprint(
     elapsed_time = time.time() - start_time
 
     return FingerprintResult(
-        hash=hasher.hexdigest(), elapsed_seconds=f"{elapsed_time:.2f}", status="success"
+        hash=hasher.hexdigest(),
+        elapsed_seconds=f"{elapsed_time:.2f}",
+        status="success",
+        native_linker_signature=linker_signature,
     )
 
 
@@ -644,14 +829,15 @@ def calculate_wasm_fingerprint() -> FingerprintResult:
     # Process src/ directory (affects WASM compilation)
     src_dir = cwd / "src"
     if src_dir.exists():
-        src_result = fingerprint_code_base(src_dir, "**/*.h,**/*.cpp,**/*.hpp")
+        src_result = fingerprint_code_base(src_dir, "**/*.h,**/*.cpp,**/*.hpp,**/*.c")
         hasher.update(f"src:{src_result.hash}".encode("utf-8"))
 
     # Process examples/wasm directory (the default WASM test example)
     wasm_example_dir = cwd / "examples" / "wasm"
     if wasm_example_dir.exists():
         wasm_result = fingerprint_code_base(
-            wasm_example_dir, "**/*.ino,**/*.h,**/*.cpp,**/*.hpp,**/*.js,**/*.html"
+            wasm_example_dir,
+            "**/*.ino,**/*.h,**/*.cpp,**/*.hpp,**/*.c,**/*.js,**/*.html",
         )
         hasher.update(f"wasm_example:{wasm_result.hash}".encode("utf-8"))
 

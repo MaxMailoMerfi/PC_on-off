@@ -29,8 +29,8 @@ enum memory_order { // ok plain enum
 template <typename T>
 class AtomicReal {
 public:
-    AtomicReal() : mValue{} {}
-    explicit AtomicReal(T value) : mValue(value) {}
+    AtomicReal() FL_NO_EXCEPT : mValue{} {}
+    explicit AtomicReal(T value) FL_NO_EXCEPT : mValue(value) {}
 
     // Non-copyable and non-movable (matches std::atomic behavior)
     AtomicReal(const AtomicReal&) = delete;
@@ -40,61 +40,61 @@ public:
 
     // Load operation with configurable memory ordering
     // Default to acquire semantics for backward compatibility
-    T load(int order = memory_order_acquire) const FL_NOEXCEPT {
+    T load(int order = memory_order_acquire) const FL_NO_EXCEPT {
         return __atomic_load_n(&mValue, order);
     }
 
     // Store operation with configurable memory ordering
     // Default to release semantics for backward compatibility
-    void store(T value, int order = memory_order_release) FL_NOEXCEPT {
+    void store(T value, int order = memory_order_release) FL_NO_EXCEPT {
         __atomic_store_n(&mValue, value, order);
     }
 
     // Exchange operation - atomically replaces the value and returns the old value
-    T exchange(T value, int order = memory_order_acq_rel) FL_NOEXCEPT {
+    T exchange(T value, int order = memory_order_acq_rel) FL_NO_EXCEPT {
         return __atomic_exchange_n(&mValue, value, order);
     }
 
     // Pre-increment: ++atomic
     // Returns the NEW value after increment
-    T operator++() {
+    T operator++() FL_NO_EXCEPT {
         return __atomic_add_fetch(&mValue, 1, __ATOMIC_ACQ_REL);
     }
 
     // Pre-decrement: --atomic
     // Returns the NEW value after decrement
-    T operator--() {
+    T operator--() FL_NO_EXCEPT {
         return __atomic_sub_fetch(&mValue, 1, __ATOMIC_ACQ_REL);
     }
 
     // Assignment operator
-    T operator=(T value) {
+    T operator=(T value) FL_NO_EXCEPT {
         store(value);
         return value;
     }
 
     // Conversion operator - returns current value
-    operator T() const {
+    operator T() const FL_NO_EXCEPT {
         return load();
     }
 
     // Fetch operations (used by various FastLED code)
-    T fetch_add(T value) FL_NOEXCEPT {
+    T fetch_add(T value) FL_NO_EXCEPT {
         return __atomic_fetch_add(&mValue, value, __ATOMIC_ACQ_REL);
     }
 
-    T fetch_sub(T value) FL_NOEXCEPT {
+    T fetch_sub(T value) FL_NO_EXCEPT {
         return __atomic_fetch_sub(&mValue, value, __ATOMIC_ACQ_REL);
     }
 
     // Compare-and-swap operations
-    bool compare_exchange_weak(T& expected, T desired, int order = memory_order_acq_rel) FL_NOEXCEPT {
+    bool compare_exchange_weak(T& expected, T desired, int order = memory_order_acq_rel) FL_NO_EXCEPT {
         return __atomic_compare_exchange_n(&mValue, &expected, desired,
                                           true, // weak
                                           order, order);
     }
 
-    bool compare_exchange_strong(T& expected, T desired, int order = memory_order_acq_rel) FL_NOEXCEPT {
+    bool compare_exchange_strong(T& expected, T desired, int order = memory_order_acq_rel) FL_NO_EXCEPT {
         return __atomic_compare_exchange_n(&mValue, &expected, desired,
                                           false, // strong
                                           order, order);

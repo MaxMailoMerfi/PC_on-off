@@ -214,18 +214,33 @@ This section outlines comprehensive test criteria for validating RMT interrupt s
 ### Test Infrastructure Requirements
 
 #### QEMU Setup Commands
+
+fbuild's `test-emu --emulator qemu` owns the build and runs the sketch in Espressif QEMU. Invocation mirrors `.github/workflows/qemu_template.yml`:
+
 ```bash
-# Install QEMU for ESP32 emulation
-uv run ci/install-qemu.py
+# Stage source/config without compiling
+uv run ci/stage_fbuild_project.py \
+    --board esp32s3 --example BlinkParallel \
+    --define FASTLED_ESP32_IS_QEMU \
+    --build-dir .build/fbuild/esp32s3
 
-# Run QEMU tests with ESP32-S3 (Xtensa)
-uv run test.py --qemu esp32s3
+# Emulate on ESP32-S3 (Xtensa)
+uv run fbuild test-emu --emulator qemu \
+    --environment esp32s3 --timeout 120 \
+    --halt-on-success "Initialized 4 LED strips with 256 LEDs each" \
+    --halt-on-error "Guru Meditation|abort\\(\\)|Backtrace:|TEST_SUITE_COMPLETE: FAIL|QEMU_LCD_CLOCKLESS_REGISTRATION: FAIL" \
+    .build/fbuild/esp32s3
 
-# Run QEMU tests with ESP32-C3 (RISC-V)
-uv run test.py --qemu esp32c3
-
-# Skip QEMU installation if already present
-FASTLED_QEMU_SKIP_INSTALL=true uv run test.py --qemu esp32s3
+# Emulate on ESP32-C3 (RISC-V) — same shape, swap env
+uv run ci/stage_fbuild_project.py \
+    --board esp32c3 --example BlinkParallel \
+    --define FASTLED_ESP32_IS_QEMU \
+    --build-dir .build/fbuild/esp32c3
+uv run fbuild test-emu --emulator qemu \
+    --environment esp32c3 --timeout 120 \
+    --halt-on-success "Initialized 4 LED strips with 256 LEDs each" \
+    --halt-on-error "Guru Meditation|abort\\(\\)|Backtrace:|TEST_SUITE_COMPLETE: FAIL|QEMU_LCD_CLOCKLESS_REGISTRATION: FAIL" \
+    .build/fbuild/esp32c3
 ```
 
 #### Platform Coverage Matrix

@@ -29,7 +29,7 @@ public:
     typedef u32 port_t;
 
     #if 0
-    inline static void setOutput() FL_NOEXCEPT {
+    inline static void setOutput() FL_NO_EXCEPT {
         if(_BIT<8) {
             _CRL::r() = (_CRL::r() & (0xF << (_BIT*4)) | (0x1 << (_BIT*4));
         } else {
@@ -223,10 +223,14 @@ _FL_DEFPIN( 3, 7, 0); _FL_DEFPIN( 4, 6, 0); _FL_DEFPIN( 7, 0, 0); _FL_DEFPIN( 8,
 
 #elif defined(ADAFRUIT_QTPY_M0)
 
-#define MAX_PIN 10
+#define MAX_PIN 11
+#ifndef FL_PIN_CLOCKLESS_1
+#define FL_PIN_CLOCKLESS_1 11
+#endif
 _FL_DEFPIN( 0, 2, 0); _FL_DEFPIN( 1, 3, 0); _FL_DEFPIN( 2, 4, 0); _FL_DEFPIN( 3, 5, 0);
 _FL_DEFPIN( 4, 16, 0); _FL_DEFPIN( 5, 17, 0); _FL_DEFPIN( 6, 6, 0); _FL_DEFPIN( 7, 7, 0);
 _FL_DEFPIN( 8, 11, 0); _FL_DEFPIN( 9, 9, 0); _FL_DEFPIN( 10, 10, 0);
+_FL_DEFPIN(11, 18, 0); // PIN_NEOPIXEL
 
 #define SPI_DATA  10
 #define SPI_CLOCK 8
@@ -237,6 +241,13 @@ _FL_DEFPIN( 8, 11, 0); _FL_DEFPIN( 9, 9, 0); _FL_DEFPIN( 10, 10, 0);
 #elif defined(ADAFRUIT_ITSYBITSY_M0)
 
 #define MAX_PIN 16
+
+// Default example pins: this board's table starts at pin 2, so the
+// FL_PIN_SPI_DATA_1 fallback of 1 would fail FastPin<>::validpin().
+// FL_PIN_CLOCKLESS_1 (3) is present and needs no override.
+// See platforms/default_pins.h.
+#define FL_PIN_SPI_DATA_1 2
+#define FL_PIN_SPI_CLOCK_1 4
 _FL_DEFPIN( 2, 14, 0); _FL_DEFPIN( 3, 9, 0); _FL_DEFPIN( 4, 8, 0);
 _FL_DEFPIN( 5, 15, 0); _FL_DEFPIN( 6, 20, 0); _FL_DEFPIN( 7, 21, 0);
 _FL_DEFPIN( 8, 6, 0); _FL_DEFPIN( 9, 7, 0); _FL_DEFPIN( 10, 18, 0);

@@ -1,8 +1,9 @@
 /// @file channel_driver_rmt4.h
 /// @brief RMT4 interface for ChannelEngine (ESP32 IDF 4.x)
 ///
-/// This header defines both the public interface and implementation for RMT4 ChannelEngine.
-/// IRAM_ATTR functions are inlined here to avoid duplicate attribute warnings.
+/// This header defines both the public interface and implementation for RMT4
+/// ChannelEngine. IRAM_ATTR functions are inlined here to avoid duplicate
+/// attribute warnings.
 
 #pragma once
 
@@ -21,24 +22,25 @@
 
 // Detect misconfiguration: RMT5-only chip with FASTLED_RMT5=0
 #if FASTLED_RMT5 == 0
-#error "ESP32-C6/C5/P4/H2 only support RMT5 (new driver). These chips do not have RMT4 hardware. Remove -DFASTLED_RMT5=0 from build flags or set FASTLED_RMT5=1."
+#error                                                                         \
+    "ESP32-C6/C5/P4/H2 only support RMT5 (new driver). These chips do not have RMT4 hardware. Remove -DFASTLED_RMT5=0 from build flags or set FASTLED_RMT5=1."
 #endif
 
 // Skip RMT4 implementation for RMT5-only chips
-#elif !FASTLED_RMT5  // Only compile for RMT4 (IDF 4.x)
+#elif !FASTLED_RMT5 // Only compile for RMT4 (IDF 4.x)
 
-#include "fl/channels/driver.h"
 #include "fl/channels/data.h"
-#include "fl/stl/span.h"
+#include "fl/channels/driver.h"
+#include "fl/stl/atomic.h"
 #include "fl/stl/compiler_control.h"
-#include "platforms/esp/32/core/clock_cycles.h"
-#include "fl/stl/vector.h"
 #include "fl/stl/noexcept.h"
+#include "fl/stl/shared_ptr.h"
+#include "fl/stl/span.h"
+#include "fl/stl/vector.h"
+#include "platforms/esp/32/core/clock_cycles.h"
+#include "platforms/esp/32/drivers/rmt/rmt_4/irmt4_peripheral.h"
 
 FL_EXTERN_C_BEGIN
-// IWYU pragma: begin_keep
-#include <esp32-hal.h>
-// IWYU pragma: end_keep
 #if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR > 3
 #include "esp_intr_alloc.h"
 #else
@@ -107,7 +109,8 @@ FL_EXTERN_C_END
 #define FASTLED_RMT_MEM_BLOCKS 2
 #endif
 
-#define MAX_PULSES_RMT4 (FASTLED_RMT_MEM_WORDS_PER_CHANNEL * FASTLED_RMT_MEM_BLOCKS)
+#define MAX_PULSES_RMT4                                                        \
+    (FASTLED_RMT_MEM_WORDS_PER_CHANNEL * FASTLED_RMT_MEM_BLOCKS)
 #define PULSES_PER_FILL_RMT4 (MAX_PULSES_RMT4 / 2)
 
 // Clock divider
@@ -179,25 +182,35 @@ FASTLED_SHARED_PTR(ChannelEngineRMT4);
 /// - Double-buffer ISR-driven refill (WiFi interference resistant)
 /// - Time-multiplexing support (>8 strips via channel sharing)
 /// - Direct hardware memory access for performance
-/// - Zero global state (everything encapsulated in driver)
+/// - Lifecycle calls routed through `IRMT4Peripheral` (#3458) — the
+///   ISR hot path stays inline IRAM and is not virtualised.
 class ChannelEngineRMT4 : public IChannelDriver {
-public:
-    /// @brief Create RMT4 driver instance
+  public:
+    /// @brief Create RMT4 driver instance with the default real-hardware
+    ///        peripheral.
     /// @return Shared pointer to driver implementation
-    static ChannelEngineRMT4Ptr create() FL_NOEXCEPT;
+    static ChannelEngineRMT4Ptr create() FL_NO_EXCEPT;
+
+    /// @brief Create RMT4 driver instance with an injected peripheral
+    ///        (test seam — pass a mock to drive the engine without
+    ///        touching real ESP-IDF APIs).
+    static ChannelEngineRMT4Ptr
+    create(fl::shared_ptr<detail::IRMT4Peripheral> peripheral) FL_NO_EXCEPT;
 
     virtual ~ChannelEngineRMT4() = default;
 
     /// @brief Check if driver can handle channel data (clockless only)
     /// @param data Channel data to check
     /// @return true if clockless channel (rejects SPI), false otherwise
-    virtual bool canHandle(const ChannelDataPtr& data) const FL_NOEXCEPT = 0;
+    virtual bool canHandle(const ChannelDataPtr &data) const FL_NO_EXCEPT = 0;
 
     /// @brief Get the driver name for affinity binding
     /// @return "RMT"
-    fl::string getName() const FL_NOEXCEPT override { return fl::string::from_literal("RMT"); }
+    fl::string getName() const FL_NO_EXCEPT override {
+        return fl::string::from_literal("RMT");
+    }
 
-protected:
+  protected:
     ChannelEngineRMT4() = default;
 };
 
@@ -213,24 +226,95 @@ protected:
 /// - Double-buffer management
 /// - Time-multiplexing queue
 class ChannelEngineRMT4Impl final : public ChannelEngineRMT4 {
-public:
-    ChannelEngineRMT4Impl() FL_NOEXCEPT;
+  public:
+    /// @brief Default constructor uses the real-hardware peripheral.
+    ///        Kept for the legacy `idf4_clockless_rmt_esp32.h` path that
+    ///        instantiates this class through `fl::make_shared` without
+    ///        threading a peripheral through.
+    ChannelEngineRMT4Impl() FL_NO_EXCEPT;
+
+    /// @brief Inject a peripheral (real or mock). Production use is via
+    ///        the factory; tests construct directly with a mock.
+    explicit ChannelEngineRMT4Impl(
+        fl::shared_ptr<detail::IRMT4Peripheral> peripheral) FL_NO_EXCEPT;
+
     ~ChannelEngineRMT4Impl() override;
 
     /// @brief Enqueue channel data for transmission
-    void enqueue(ChannelDataPtr channelData) FL_NOEXCEPT override;
+    void enqueue(ChannelDataPtr channelData) FL_NO_EXCEPT override;
 
     /// @brief Trigger transmission of enqueued data
-    void show() FL_NOEXCEPT override;
+    void show() FL_NO_EXCEPT override;
 
     /// @brief Query driver state (hardware polling implementation)
-    DriverState poll() FL_NOEXCEPT override;
+    DriverState poll() FL_NO_EXCEPT override;
 
-private:
+  private:
     // ═══════════════════════════════════════════════════════════════════════════
     // Channel State Structure
     // ═══════════════════════════════════════════════════════════════════════════
     struct ChannelState {
+        ChannelState() FL_NO_EXCEPT
+            : channel(static_cast<rmt_channel_t>(0)),
+              pin(static_cast<gpio_num_t>(0)), inUse(false), zero{}, one{},
+              transmissionComplete(false), resetWaitStarted(false),
+              resetStartTimeUs(0), resetDurationUs(0), whichHalf(0),
+              memPtr(nullptr), memStart(nullptr), pixelData(nullptr),
+              pixelDataSize(0), pixelDataPos(0), cyclesPerFill(0),
+              maxCyclesPerFill(0), lastFill(0), transmissionStartTime(0),
+              sourceData() {}
+
+        ChannelState(const ChannelState& other) FL_NO_EXCEPT
+            : channel(other.channel), pin(other.pin), inUse(other.inUse),
+              zero(other.zero), one(other.one),
+              transmissionComplete(other.transmissionComplete.load(
+                  fl::memory_order_acquire)),
+              resetWaitStarted(other.resetWaitStarted),
+              resetStartTimeUs(other.resetStartTimeUs),
+              resetDurationUs(other.resetDurationUs), whichHalf(other.whichHalf),
+              memPtr(other.memPtr), memStart(other.memStart),
+              pixelData(other.pixelData), pixelDataSize(other.pixelDataSize),
+              pixelDataPos(other.pixelDataPos),
+              cyclesPerFill(other.cyclesPerFill),
+              maxCyclesPerFill(other.maxCyclesPerFill), lastFill(other.lastFill),
+              transmissionStartTime(other.transmissionStartTime),
+              sourceData(other.sourceData) {}
+
+        ChannelState& operator=(const ChannelState& other) FL_NO_EXCEPT {
+            if (this != &other) {
+                channel = other.channel;
+                pin = other.pin;
+                inUse = other.inUse;
+                zero = other.zero;
+                one = other.one;
+                transmissionComplete.store(
+                    other.transmissionComplete.load(fl::memory_order_acquire),
+                    fl::memory_order_release);
+                resetWaitStarted = other.resetWaitStarted;
+                resetStartTimeUs = other.resetStartTimeUs;
+                resetDurationUs = other.resetDurationUs;
+                whichHalf = other.whichHalf;
+                memPtr = other.memPtr;
+                memStart = other.memStart;
+                pixelData = other.pixelData;
+                pixelDataSize = other.pixelDataSize;
+                pixelDataPos = other.pixelDataPos;
+                cyclesPerFill = other.cyclesPerFill;
+                maxCyclesPerFill = other.maxCyclesPerFill;
+                lastFill = other.lastFill;
+                transmissionStartTime = other.transmissionStartTime;
+                sourceData = other.sourceData;
+            }
+            return *this;
+        }
+
+        ChannelState(ChannelState&& other) FL_NO_EXCEPT
+            : ChannelState(static_cast<const ChannelState&>(other)) {}
+
+        ChannelState& operator=(ChannelState&& other) FL_NO_EXCEPT {
+            return operator=(static_cast<const ChannelState&>(other));
+        }
+
         // Hardware Configuration
         rmt_channel_t channel;
         gpio_num_t pin;
@@ -241,15 +325,18 @@ private:
         rmt_item32_t one;
 
         // Transmission State
-        volatile bool transmissionComplete;
+        fl::atomic_bool transmissionComplete;
+        bool resetWaitStarted;
+        u32 resetStartTimeUs;
+        u32 resetDurationUs;
 
         // Double-Buffer State
         int whichHalf;
-        volatile rmt_item32_t* memPtr;
-        volatile rmt_item32_t* memStart;
+        volatile rmt_item32_t *memPtr;
+        volatile rmt_item32_t *memStart;
 
         // Pixel Data Buffer
-        const u8* pixelData;
+        const u8 *pixelData;
         size_t pixelDataSize;
         volatile size_t pixelDataPos;
 
@@ -259,7 +346,7 @@ private:
         volatile u32 lastFill;
 
         // Timeout Detection
-        u32 transmissionStartTime;  // millis() when transmission started
+        u32 transmissionStartTime; // millis() when transmission started
 
         // Source reference
         ChannelDataPtr sourceData;
@@ -270,9 +357,14 @@ private:
     // ═══════════════════════════════════════════════════════════════════════════
 
     fl::vector_inlined<ChannelState, FASTLED_RMT_MAX_CHANNELS> mChannels;
-    fl::vector_inlined<ChannelDataPtr, 16> mEnqueuedChannels;  // Batched between enqueue() and show()
-    fl::vector_inlined<ChannelDataPtr, 16> mPendingChannels;    // Awaiting HW channels
-    intr_handle_t mRMT_intr_handle;
+    fl::vector_inlined<ChannelDataPtr, 16>
+        mEnqueuedChannels; // Batched between enqueue() and show()
+    fl::vector_inlined<ChannelDataPtr, 16>
+        mPendingChannels; // Awaiting HW channels
+    fl::shared_ptr<detail::IRMT4Peripheral>
+        mPeripheral; // Hardware lifecycle wrapper (#3458)
+    void
+        *mRMT_intr_handle; // intr_handle_t, opaque via the peripheral interface
     portMUX_TYPE mRmtSpinlock;
     bool mInitialized;
 
@@ -281,9 +373,9 @@ private:
     // reordering on Xtensa (l32r: literal placed after use)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    static FL_NO_INLINE IRAM_ATTR void handleInterrupt(void* arg) FL_NOEXCEPT {
+    static FL_NO_INLINE IRAM_ATTR void handleInterrupt(void *arg) FL_NO_EXCEPT {
         // Main ISR dispatcher
-        auto* driver = static_cast<ChannelEngineRMT4Impl*>(arg);
+        auto *driver = static_cast<ChannelEngineRMT4Impl *>(arg);
 
         // Enter critical section and read interrupt status
         portENTER_CRITICAL_ISR(&driver->mRmtSpinlock);
@@ -312,7 +404,7 @@ private:
 #endif
 
             // Check if this channel is active
-            ChannelState* state = driver->findChannelByNumber(channel);
+            ChannelState *state = driver->findChannelByNumber(channel);
             if (state != nullptr && state->inUse) {
                 // Handle threshold interrupt (half-buffer empty, needs refill)
                 if (intr_st & BIT(tx_next_bit)) {
@@ -329,9 +421,10 @@ private:
         }
     }
 
-    FL_NO_INLINE IRAM_ATTR void onThresholdInterrupt(int channelNum) FL_NOEXCEPT {
+    FL_NO_INLINE IRAM_ATTR void
+    onThresholdInterrupt(int channelNum) FL_NO_EXCEPT {
         // Threshold interrupt: Half of the RMT buffer has been transmitted
-        ChannelState* state = findChannelByNumber(channelNum);
+        ChannelState *state = findChannelByNumber(channelNum);
         if (state == nullptr || !state->inUse) {
             return;
         }
@@ -340,15 +433,12 @@ private:
         fillNextBuffer(state, true);
     }
 
-    FL_NO_INLINE IRAM_ATTR void onTxDoneInterrupt(int channelNum) FL_NOEXCEPT {
+    FL_NO_INLINE IRAM_ATTR void onTxDoneInterrupt(int channelNum) FL_NO_EXCEPT {
         // TX done interrupt: Transmission is complete on this channel
-        ChannelState* state = findChannelByNumber(channelNum);
+        ChannelState *state = findChannelByNumber(channelNum);
         if (state == nullptr || !state->inUse) {
             return;
         }
-
-        // Disconnect the GPIO from the RMT controller
-        gpio_matrix_out(state->pin, SIG_GPIO_OUT_IDX, 0, 0);
 
         // Disable TX interrupts for this channel (platform-specific)
 #if defined(FL_IS_ESP_32C3)
@@ -367,11 +457,14 @@ private:
 #error "Unknown ESP32 target for RMT interrupt disable"
 #endif
 
-        // Mark transmission as complete (checked by pollDerived())
-        state->transmissionComplete = true;
+        // Keep the RMT signal connected after TX-done. The channel is
+        // configured idle-low, so poll() can enforce the chipset reset time
+        // before disconnecting and releasing this hardware channel.
+        state->transmissionComplete.store(true, fl::memory_order_release);
     }
 
-    FL_NO_INLINE IRAM_ATTR void fillNextBuffer(ChannelState* state, bool checkTime) FL_NOEXCEPT {
+    FL_NO_INLINE IRAM_ATTR void fillNextBuffer(ChannelState *state,
+                                               bool checkTime) FL_NO_EXCEPT {
         // Fill the next half of the RMT double-buffer with pixel data
         if (!state) {
             return;
@@ -393,7 +486,7 @@ private:
         FASTLED_REGISTER u32 zero_val = state->zero.val;
 
         // Calculate pointer to current buffer half
-        volatile FASTLED_REGISTER rmt_item32_t* pItem = state->memPtr;
+        volatile FASTLED_REGISTER rmt_item32_t *pItem = state->memPtr;
 
         // Fill one half of the buffer
         for (FASTLED_REGISTER int i = 0; i < PULSES_PER_FILL_RMT4 / 8; i++) {
@@ -421,15 +514,13 @@ private:
         state->memPtr = pItem;
     }
 
-    static FL_NO_INLINE IRAM_ATTR void convertByteToRMT(
-        u8 byteval,
-        const rmt_item32_t& zero,
-        const rmt_item32_t& one,
-        volatile rmt_item32_t* pItem
-    ) FL_NOEXCEPT {
+    static FL_NO_INLINE IRAM_ATTR void
+    convertByteToRMT(u8 byteval, const rmt_item32_t &zero,
+                     const rmt_item32_t &one,
+                     volatile rmt_item32_t *pItem) FL_NO_EXCEPT {
         // Convert 1 byte → 8 RMT symbols (MSB first)
         u32 pixel_u32 = byteval;
-        pixel_u32 <<= 24;  // Shift to MSB position for bit extraction
+        pixel_u32 <<= 24; // Shift to MSB position for bit extraction
 
         u32 tmp[8];
         for (u32 j = 0; j < 8; j++) {
@@ -452,7 +543,8 @@ private:
         pItem[7].val = tmp[7];
     }
 
-    static FL_NO_INLINE IRAM_ATTR void tx_start(ChannelState* state) FL_NOEXCEPT {
+    static FL_NO_INLINE IRAM_ATTR void
+    tx_start(ChannelState *state) FL_NO_EXCEPT {
         // Start RMT transmission by setting hardware flag
         if (!state) {
             return;
@@ -533,9 +625,10 @@ private:
 #endif
     }
 
-    FL_NO_INLINE IRAM_ATTR ChannelState* findChannelByNumber(int channelNum) FL_NOEXCEPT {
+    FL_NO_INLINE IRAM_ATTR ChannelState *
+    findChannelByNumber(int channelNum) FL_NO_EXCEPT {
         // Linear search through active channels
-        for (auto& state : mChannels) {
+        for (auto &state : mChannels) {
             if (state.inUse && state.channel == channelNum) {
                 return &state;
             }
@@ -548,20 +641,27 @@ private:
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// @brief Begin LED data transmission for all channels (internal helper)
-    void beginTransmission(fl::span<const ChannelDataPtr> channelData) FL_NOEXCEPT;
+    void
+    beginTransmission(fl::span<const ChannelDataPtr> channelData) FL_NO_EXCEPT;
 
-    ChannelState* acquireChannel(gpio_num_t pin, const ChipsetTimingConfig& timing) FL_NOEXCEPT;
-    void releaseChannel(ChannelState* state) FL_NOEXCEPT;
-    bool configureChannel(ChannelState* state, gpio_num_t pin, const ChipsetTimingConfig& timing) FL_NOEXCEPT;
-    void processPendingChannels() FL_NOEXCEPT;
-    void startTransmission(ChannelState* state, const ChannelDataPtr& data) FL_NOEXCEPT;
+    ChannelState *
+    acquireChannel(gpio_num_t pin,
+                   const ChipsetTimingConfig &timing) FL_NO_EXCEPT;
+    void releaseChannel(ChannelState *state) FL_NO_EXCEPT;
+    bool configureChannel(ChannelState *state, gpio_num_t pin,
+                          const ChipsetTimingConfig &timing) FL_NO_EXCEPT;
+    void processPendingChannels() FL_NO_EXCEPT;
+    void startTransmission(ChannelState *state,
+                           const ChannelDataPtr &data) FL_NO_EXCEPT;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Helpers
     // ═══════════════════════════════════════════════════════════════════════════
 
-    static rmt_item32_t makeZeroSymbol(const ChipsetTimingConfig& timing) FL_NOEXCEPT;
-    static rmt_item32_t makeOneSymbol(const ChipsetTimingConfig& timing) FL_NOEXCEPT;
+    static rmt_item32_t
+    makeZeroSymbol(const ChipsetTimingConfig &timing) FL_NO_EXCEPT;
+    static rmt_item32_t
+    makeOneSymbol(const ChipsetTimingConfig &timing) FL_NO_EXCEPT;
 };
 
 } // namespace fl

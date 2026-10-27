@@ -10,11 +10,11 @@ class Null_Audio : public audio::IInput {
 public:
     ~Null_Audio() = default;
     // Starts the audio source.
-    void start() override {}
+    void start() FL_NO_EXCEPT override {}
     // Stops the audio source, call this before light sleep.
-    void stop() override {}
+    void stop() FL_NO_EXCEPT override {}
 
-    bool error(fl::string* msg = nullptr) FL_NOEXCEPT override {
+    bool error(fl::string* msg = nullptr) FL_NO_EXCEPT override {
         if (msg) {
             *msg = "No audio device available: this is a null device.";
         }
@@ -22,7 +22,7 @@ public:
     }
     // Read audio data and return as audio::Sample with calculated timestamp.
     // Returns invalid audio::Sample on error or when no data is available.
-    audio::Sample read() FL_NOEXCEPT override {
+    audio::Sample read() FL_NO_EXCEPT override {
         return audio::Sample();  // Always return invalid sample
     }
 

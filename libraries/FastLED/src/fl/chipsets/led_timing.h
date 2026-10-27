@@ -130,7 +130,7 @@ struct TIMING_WS2812_800KHZ {
         T3 = FASTLED_WS2812_T3,
         RESET = 280
     };
-    static constexpr const char* name() FL_NOEXCEPT { return "WS2812_800KHZ"; }
+    static constexpr const char* name() FL_NO_EXCEPT { return "WS2812_800KHZ"; }
 };
 
 /// Convenience alias for WS2812 timing (commonly used name)
@@ -164,7 +164,7 @@ struct TIMING_WS2812B_MINI_V3 {
         T1 = FASTLED_WS2812B_V5_T1,
         T2 = FASTLED_WS2812B_V5_T2,
         T3 = FASTLED_WS2812B_V5_T3,
-        RESET = 280
+        RESET = 280   // WS2812B-V5 reset/latch time per datasheet
     };
 };
 
@@ -193,9 +193,49 @@ struct TIMING_WS2813 {
     };
 };
 
+/// WS2814 RGBW controller @ 800 kHz
+/// Four-phase: TH0=320ns, TH1=640ns, TL0=960ns, TL1=640ns
+/// @note The 1280ns bit period and 300us reset satisfy the WS2814 V1.4
+///       datasheet requirements.
+struct TIMING_WS2814 {
+    enum : u32 {
+        T1 = 320,
+        T2 = 320,
+        T3 = 640,
+        RESET = 300
+    };
+};
+
+/// WS2818 RGB controller @ approximately 833 kHz
+/// Four-phase: TH0=300ns, TH1=600ns, TL0=900ns, TL1=600ns
+/// @note The 1200ns bit period and 300us reset satisfy the WS2818B
+///       datasheet pulse envelope and >280us reset requirement.
+/// @see https://www.tme.eu/Document/ddc250a349c0084fadc3ded4c327f335/WS2818B.pdf
+struct TIMING_WS2818 {
+    enum : u32 {
+        T1 = 300,
+        T2 = 300,
+        T3 = 600,
+        RESET = 300
+    };
+};
+
 /// SK6812 RGBW controller @ 800 kHz
 /// Four-phase: TH0=300ns, TH1=900ns, TL0=900ns, TL1=300ns
 struct TIMING_SK6812 {
+    enum : u32 {
+        T1 = 300,
+        T2 = 600,
+        T3 = 300,
+        RESET = 80
+    };
+};
+
+/// LC8816E RGBW controller @ 800 kHz
+/// Four-phase: TH0=300ns, TH1=900ns, TL0=900ns, TL1=300ns
+/// @note The native wire order is GRBW and each pixel consumes 32 bits.
+/// @see https://addressable-led.com/UploadFile/upi/file/20250703/LC8816E-RGBW.pdf
+struct TIMING_LC8816E {
     enum : u32 {
         T1 = 300,
         T2 = 600,
@@ -259,6 +299,39 @@ struct TIMING_TM1809_800KHZ {
     };
 };
 
+/// TM1908 RGB controller @ 1.2 MHz.
+///
+/// Titan Micro Electronics TM1908 V1.2 typical values are T0H=240ns,
+/// T1H=480ns, bit period=830ns, and reset low >=80us.
+/// @see https://github.com/cheemsHe/LEDdatasheet/blob/main/TM1908_V1.2_EN.pdf
+struct TIMING_TM1908 {
+    enum : u32 {
+        T1 = 240,
+        T2 = 240,
+        T3 = 350,
+        RESET = 80
+    };
+    static constexpr ClocklessEncoder ENCODER =
+        ClocklessEncoder::CLOCKLESS_ENCODER_TM1908;
+};
+
+/// TM1812 RGBCCT controller @ 800 kHz (issue #995)
+///
+/// Unlike the legacy RGB alias, this trait selects the TM1812 byte encoder:
+/// two 5-channel RGBWW pixels occupy ten of each IC's twelve output bytes and
+/// the encoder pads the remaining two. Timing values are the TM1812 V1.4
+/// datasheet typicals: T0H=400ns, T1H=850ns, bit period=1.25us.
+struct TIMING_TM1812_RGBWW_800KHZ {
+    enum : u32 {
+        T1 = 400,
+        T2 = 450,
+        T3 = 400,
+        RESET = 24
+    };
+    static constexpr ClocklessEncoder ENCODER =
+        ClocklessEncoder::CLOCKLESS_ENCODER_TM1812_RGBWW;
+};
+
 /// TM1829 RGB controller @ 800 kHz
 /// Four-phase: TH0=340ns, TH1=680ns, TL0=890ns, TL1=550ns
 struct TIMING_TM1829_800KHZ {
@@ -314,13 +387,35 @@ struct TIMING_SM16703 {
     };
 };
 
-/// SM16824E RGB controller (high-speed variant)
-/// Four-phase: TH0=300ns, TH1=1200ns, TL0=1000ns, TL1=100ns
+/// GS1903 RGB controller @ 800 kHz (12 V)
+/// Four-phase: TH0=300ns, TH1=900ns, TL0=900ns, TL1=300ns, TRST>40µs
+/// @note Same bit timing as the SM16703, but the GS1903 datasheet specifies a
+///       ±50ns tolerance -- a third of the WS2812's ±150ns. That is why this
+///       has its own entry rather than reusing WS2812 timing: at TH0=250ns /
+///       TH1=875ns the WS2812 numbers sit outside the GS1903's window, which
+///       produced the intermittent "sometimes works, sometimes doesn't"
+///       behavior reported in issue #739.
+/// @see https://github.com/FastLED/FastLED/issues/739
+struct TIMING_GS1903 {
+    enum : u32 {
+        T1 = 300,
+        T2 = 600,
+        T3 = 300,
+        RESET = 280
+    };
+};
+
+/// SM16824E RGBW controller @ 800 kHz
+/// Four-phase: TH0=300ns, TH1=900ns, TL0=900ns, TL1=300ns, TRST=200µs
+/// Datasheet typicals are identical to the SM16703 / WS2811-800kHz RZ family,
+/// so this timing also lets SM16824E and SM16703 chips share a single data line.
+/// Prior values (T2=900, T3=100) emitted T1H=1200ns / T1L=100ns — out of spec
+/// against both this chip's own datasheet and SM16703. See issue #3203.
 struct TIMING_SM16824E {
     enum : u32 {
         T1 = 300,
-        T2 = 900,
-        T3 = 100,
+        T2 = 600,
+        T3 = 300,
         RESET = 200
     };
 };
@@ -518,35 +613,35 @@ struct TIMING_UCS7604_8BIT_800KHZ {
 /// @tparam TIMING Timing type with enum-based T1, T2, T3, RESET values
 /// @return Runtime ChipsetTiming struct initialized from timing type
 template <typename TIMING>
-constexpr ChipsetTiming to_runtime_timing() FL_NOEXCEPT {
+constexpr ChipsetTiming to_runtime_timing() FL_NO_EXCEPT {
     return {TIMING::T1, TIMING::T2, TIMING::T3, TIMING::RESET, "timing"};
 }
 
 /// @brief Get total bit period (T1 + T2 + T3) in nanoseconds
 /// @param timing Chipset timing structure
 /// @return Total bit period in nanoseconds
-constexpr u32 get_bit_period_ns(const ChipsetTiming& timing) FL_NOEXCEPT {
+constexpr u32 get_bit_period_ns(const ChipsetTiming& timing) FL_NO_EXCEPT {
     return timing.T1 + timing.T2 + timing.T3;
 }
 
 /// @brief Extract T1 (high time for bit 0) from timing constant
 /// @param timing Chipset timing structure
 /// @return T1 value in nanoseconds
-constexpr u32 get_timing_t1(const ChipsetTiming& timing) FL_NOEXCEPT {
+constexpr u32 get_timing_t1(const ChipsetTiming& timing) FL_NO_EXCEPT {
     return timing.T1;
 }
 
 /// @brief Extract T2 (additional high time for bit 1) from timing constant
 /// @param timing Chipset timing structure
 /// @return T2 value in nanoseconds
-constexpr u32 get_timing_t2(const ChipsetTiming& timing) FL_NOEXCEPT {
+constexpr u32 get_timing_t2(const ChipsetTiming& timing) FL_NO_EXCEPT {
     return timing.T2;
 }
 
 /// @brief Extract T3 (low tail duration) from timing constant
 /// @param timing Chipset timing structure
 /// @return T3 value in nanoseconds
-constexpr u32 get_timing_t3(const ChipsetTiming& timing) FL_NOEXCEPT {
+constexpr u32 get_timing_t3(const ChipsetTiming& timing) FL_NO_EXCEPT {
     return timing.T3;
 }
 
@@ -554,6 +649,6 @@ constexpr u32 get_timing_t3(const ChipsetTiming& timing) FL_NOEXCEPT {
 /// @param name Chipset name string
 /// @return Pointer to ChipsetTiming or nullptr if not found
 /// Note: This is a runtime function and should only be used during initialization
-const ChipsetTiming* get_timing_by_name(const char* name) FL_NOEXCEPT;
+const ChipsetTiming* get_timing_by_name(const char* name) FL_NO_EXCEPT;
 
 }  // namespace fl

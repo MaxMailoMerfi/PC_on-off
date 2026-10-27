@@ -10,6 +10,11 @@
 
 namespace fl {
 
+// Non-template fast path for format strings with no arguments. Keeping this
+// out of line avoids instantiating sstream formatting at every literal call.
+void printf(const char* format) FL_NO_EXCEPT;
+int snprintf(char* buffer, fl::size size, const char* format) FL_NO_EXCEPT;
+
 /// @brief Printf-like formatting function that prints directly to the platform output
 /// @param format Format string with placeholders like "%d", "%s", "%f" etc.
 /// @param args Arguments to format
@@ -26,6 +31,23 @@ namespace fl {
 /// - %p: pointers (formatted as 0x... hex)
 /// - %%: literal % character
 ///
+/// Generic placeholder:
+/// - {}: formats the next argument by picking the natural specifier for its
+///   C++ type, so callers do not have to choose between %d / %u / %ld / %s /
+///   %p or call .c_str(). Supported argument types are the same set the %
+///   specifiers support: all integral types (%d), bool (as "true"/"false"),
+///   char (as a character, %c), float/double (%f), const char* and
+///   fl::string / fl::string_view (%s), pointers (%p), and unscoped enums
+///   (as their underlying integer). Scoped enums (enum class) do not compile
+///   through {} or %d; cast at the call site.
+///   Passing any other type to {} is a compile error - {} deliberately does
+///   not fall back to a generic streaming path, to keep code size flat.
+/// - {{: literal { character
+/// - }}: literal } character
+/// - A lone { or } that is not part of the above passes through literally.
+/// - A {} with no remaining argument emits <missing_arg>, matching the
+///   behavior of a % specifier with no remaining argument.
+///
 /// Example usage:
 /// @code
 /// fl::printf("Value: %d, Name: %s", 42, "test");
@@ -34,7 +56,7 @@ namespace fl {
 /// fl::printf("Pointer: %p", ptr);
 /// @endcode
 template<typename... Args>
-void printf(const char* format, const Args&... args) FL_NOEXCEPT;
+void printf(const char* format, const Args&... args) FL_NO_EXCEPT;
 
 /// @brief Snprintf-like formatting function that writes to a buffer
 /// @param buffer Output buffer to write formatted string to
@@ -55,31 +77,30 @@ void printf(const char* format, const Args&... args) FL_NOEXCEPT;
 /// - %p: pointers (formatted as 0x... hex)
 /// - %%: literal % character
 ///
+/// Generic placeholder:
+/// - {}: formats the next argument by picking the natural specifier for its
+///   C++ type, so callers do not have to choose between %d / %u / %ld / %s /
+///   %p or call .c_str(). Supported argument types are the same set the %
+///   specifiers support: all integral types (%d), bool (as "true"/"false"),
+///   char (as a character, %c), float/double (%f), const char* and
+///   fl::string / fl::string_view (%s), pointers (%p), and unscoped enums
+///   (as their underlying integer). Scoped enums (enum class) do not compile
+///   through {} or %d; cast at the call site.
+///   Passing any other type to {} is a compile error - {} deliberately does
+///   not fall back to a generic streaming path, to keep code size flat.
+/// - {{: literal { character
+/// - }}: literal } character
+/// - A lone { or } that is not part of the above passes through literally.
+/// - A {} with no remaining argument emits <missing_arg>, matching the
+///   behavior of a % specifier with no remaining argument.
+///
 /// Example usage:
 /// @code
 /// char buffer[100];
 /// int len = fl::snprintf(buffer, sizeof(buffer), "Value: %d, Name: %s", 42, "test");
 /// @endcode
 template<typename... Args>
-int snprintf(char* buffer, fl::size size, const char* format, const Args&... args) FL_NOEXCEPT;
-
-/// @brief Sprintf-like formatting function that writes to a buffer
-/// @param buffer Output buffer to write formatted string to
-/// @param format Format string with placeholders like "%d", "%s", "%f" etc.
-/// @param args Arguments to format
-/// @return Number of characters written (excluding null terminator)
-/// 
-/// This function writes a formatted string to the provided buffer.
-/// The buffer size is deduced at compile time from the array reference,
-/// providing automatic safety against buffer overflows.
-///
-/// Example usage:
-/// @code
-/// char buffer[100];
-/// int len = fl::sprintf(buffer, "Value: %d, Name: %s", 42, "test");
-/// @endcode
-template<fl::size N, typename... Args>
-int sprintf(char (&buffer)[N], const char* format, const Args&... args) FL_NOEXCEPT;
+int snprintf(char* buffer, fl::size size, const char* format, const Args&... args) FL_NO_EXCEPT;
 
 
 ///////////////////// IMPLEMENTATION /////////////////////
@@ -99,14 +120,14 @@ struct FormatSpec {
     bool alt_form = false;     // '#' flag: alternate form (0x, 0)
 
     FormatSpec() = default;
-    explicit FormatSpec(char t) FL_NOEXCEPT : type(t) {}
-    FormatSpec(char t, int prec) FL_NOEXCEPT : type(t), precision(prec) {}
+    explicit FormatSpec(char t) FL_NO_EXCEPT : type(t) {}
+    FormatSpec(char t, int prec) FL_NO_EXCEPT : type(t), precision(prec) {}
 };
 
 // Parse a format specifier from the format string
 // Returns the format spec and advances the pointer past the specifier
 // Format: %[flags][width][.precision][length]type
-inline FormatSpec parse_format_spec(const char*& format) FL_NOEXCEPT {
+inline FormatSpec parse_format_spec(const char*& format) FL_NO_EXCEPT {
     FormatSpec spec;
 
     if (*format != '%') {
@@ -192,13 +213,19 @@ inline FormatSpec parse_format_spec(const char*& format) FL_NOEXCEPT {
         spec.type = 'x'; // Normalize to lowercase for processing
     }
 
-    ++format;
+    // Only advance past the type character if there actually is one. A format
+    // string ending in a bare '%' leaves spec.type == '\0'; advancing here
+    // would step past the NUL terminator and make the caller's loop read out
+    // of bounds.
+    if (spec.type != '\0') {
+        ++format;
+    }
     return spec;
 }
 
 // Convert unsigned integer to octal string
 template<typename T>
-inline fl::string to_octal(T value) FL_NOEXCEPT {
+inline fl::string to_octal(T value) FL_NO_EXCEPT {
     if (value == 0) {
         return "0";
     }
@@ -217,7 +244,7 @@ inline fl::string to_octal(T value) FL_NOEXCEPT {
 }
 
 // Apply width and padding to a string based on format spec
-inline fl::string apply_width(const fl::string& str, const FormatSpec& spec, bool is_numeric = false) FL_NOEXCEPT {
+inline fl::string apply_width(const fl::string& str, const FormatSpec& spec, bool is_numeric = false) FL_NO_EXCEPT {
     int len = static_cast<int>(str.length());
 
     // No width specified or content already wider
@@ -278,51 +305,111 @@ inline fl::string apply_width(const fl::string& str, const FormatSpec& spec, boo
     return result;
 }
 
+// Largest magnitude whose scaled form still fits an i64 with room for the
+// rounding step. Anything past this cannot be rendered digit-by-digit from an
+// integer, so it goes to the scientific path below.
+constexpr float kFloatDecimalLimit = 4.0e18f;
+
+// True for a value that is neither NaN nor an infinity.
+//
+// Written without <cmath> because this header is reachable from every
+// platform: `v != v` is the definition of NaN, and the magnitude bound catches
+// both infinities. 1e38 is inside the float range, so a finite value can
+// exceed it -- which is why the caller must handle large finites separately
+// rather than treating this as "printable".
+bool float_is_finite(float value) FL_NO_EXCEPT;
+
+// `d.ddde+NN` for a magnitude no integer accumulator can hold.
+//
+// The alternative is to print such a value as though it were small, which is
+// what this file used to do: every magnitude at or above 2^31 / 10^precision
+// came out as `-21474836.48`, because `static_cast<int>` of an out-of-range
+// float is undefined behaviour and lands on INT_MIN on the common targets.
+// A number that is wrong without saying so is worse than one in a shape the
+// reader has to decode (FastLED #4156).
+//
+// Precondition: `value` is finite. The normalisation loop divides while the
+// magnitude is at or above ten, which never terminates for an infinity --
+// removing the caller's non-finite check hangs rather than mis-prints, which
+// is how that ordering was confirmed to be load-bearing.
+//
+// Defined in `stdio.cpp.hpp` rather than here: `src/**/*.h` carries
+// declarations, and these two need no template visibility.
+fl::string format_float_scientific(float value, int precision) FL_NO_EXCEPT;
+
 // Format floating point with specified precision
-inline fl::string format_float(float value, int precision) FL_NOEXCEPT {
+inline fl::string format_float(float value, int precision) FL_NO_EXCEPT {
+    // Non-finite first. These used to reach the integer cast below and print
+    // as `-21474836.48` -- a plausible-looking number for a value that is not
+    // a number at all.
+    if (value != value) {
+        return fl::string("nan");
+    }
+    if (!float_is_finite(value)) {
+        return fl::string(value < 0.0f ? "-inf" : "inf");
+    }
+
     if (precision < 0) {
         // Default precision - use sstream's default behavior
         sstream stream;
         stream << value;
         return stream.str();
     }
-    
-    // Simple precision formatting
-    // This is a basic implementation - could be enhanced
+
+    // Past what an integer accumulator can hold, digit-by-digit rendering is
+    // not available at all, so say so in a different shape rather than
+    // printing a wrong number.
+    if (value >= kFloatDecimalLimit || value <= -kFloatDecimalLimit) {
+        return format_float_scientific(value, precision > 0 ? precision : 6);
+    }
+
+    const bool negative = value < 0.0f;
+    const float magnitude = negative ? -value : value;
+
+    // Split before scaling, not after. Multiplying the whole value by the
+    // multiplier in float loses the low digits of a large integer part -- 1e9
+    // at precision 2 came out as 999999979.52, because 1e11 is not
+    // representable in a float. Only the fractional residue is scaled; the
+    // integer part goes through as an integer.
+    //
+    // Above 2^24 a float has no fractional part, so the residue is exactly
+    // zero there and the clamp below is for the rounding of the cast back,
+    // not for a value that genuinely has digits to lose.
+    fl::i64 int_part = static_cast<fl::i64>(magnitude);
+    float residue = magnitude - static_cast<float>(int_part);
+    if (residue < 0.0f) {
+        residue = 0.0f;
+    }
+
     if (precision == 0) {
-        int int_part = static_cast<int>(value + 0.5f); // Round
+        if (residue >= 0.5f) {
+            ++int_part;
+        }
         sstream stream;
+        if (negative && int_part != 0) {
+            stream << "-";
+        }
         stream << int_part;
         return stream.str();
     }
-    
-    // For non-zero precision, use basic rounding
-    int multiplier = 1;
+
+    fl::i64 multiplier = 1;
     for (int i = 0; i < precision; ++i) {
         multiplier *= 10;
     }
 
-    // Handle rounding correctly for both positive and negative numbers
-    float scaled_float = value * multiplier;
-    int scaled;
-    if (scaled_float >= 0) {
-        scaled = static_cast<int>(scaled_float + 0.5f);
-    } else {
-        scaled = static_cast<int>(scaled_float - 0.5f);
-    }
-
-    int int_part = scaled / multiplier;
-    int frac_part = scaled % multiplier;
-
-    // For negative numbers, frac_part will be negative, so take absolute value
-    if (frac_part < 0) {
-        frac_part = -frac_part;
+    fl::i64 frac_part =
+        static_cast<fl::i64>(residue * static_cast<float>(multiplier) + 0.5f);
+    if (frac_part >= multiplier) {
+        // Rounded up through the next whole unit.
+        frac_part -= multiplier;
+        ++int_part;
     }
 
     sstream stream;
-    // Preserve sign for values like -0.5 that round to int_part=0 (printed
-    // without sign by the integer write below).
-    if (value < 0 && int_part == 0) {
+    // The sign is printed from the sign of the input, not recovered from the
+    // integer part, so -0.5 keeps its sign at precision 1.
+    if (negative && (int_part != 0 || frac_part != 0)) {
         stream << "-";
     }
     stream << int_part;
@@ -333,10 +420,10 @@ inline fl::string format_float(float value, int precision) FL_NOEXCEPT {
     // to 1, which produced "0.0"/"1.0" instead of "0.00"/"1.00" for any
     // integer-valued input. It also omitted the digits entirely when
     // frac_part == 0.
-    int temp_multiplier = multiplier / 10;
+    fl::i64 temp_multiplier = multiplier / 10;
     while (temp_multiplier > 0) {
-        int digit = (frac_part / temp_multiplier) % 10;
-        stream << static_cast<char>('0' + digit);
+        const fl::i64 digit = (frac_part / temp_multiplier) % 10;
+        stream << static_cast<char>('0' + static_cast<int>(digit));
         temp_multiplier /= 10;
     }
 
@@ -346,7 +433,7 @@ inline fl::string format_float(float value, int precision) FL_NOEXCEPT {
 // Helper to convert pointer to fl::uptr (only instantiated for pointer types)
 template<typename T>
 typename fl::enable_if<fl::is_pointer<T>::value, fl::uptr>::type
-pointer_to_uptr(const T& ptr) FL_NOEXCEPT {
+pointer_to_uptr(const T& ptr) FL_NO_EXCEPT {
     const void* vptr = static_cast<const void*>(ptr);
     return reinterpret_cast<fl::uptr>(vptr); // ok reinterpret cast
 }
@@ -354,14 +441,83 @@ pointer_to_uptr(const T& ptr) FL_NOEXCEPT {
 // Overload for non-pointer types (never called at runtime, but needed for compilation)
 template<typename T>
 typename fl::enable_if<!fl::is_pointer<T>::value, fl::uptr>::type
-pointer_to_uptr(const T&) FL_NOEXCEPT {
+pointer_to_uptr(const T&) FL_NO_EXCEPT {
     return 0; // Never executed - runtime check prevents this
 }
 
-// Format non-pointer types (d, i, u, o, x, X, f, c, s)
+// Normalized form of a built-in scalar argument. Every arithmetic type that
+// printf commonly sees is squeezed into this struct so the specifier switch
+// exists once, out of line, instead of once per argument type (#4565).
+struct ScalarArg {
+    enum Kind : fl::u8 { kSigned, kUnsigned, kBool, kChar, kFloat, kDouble };
+    Kind kind;
+    fl::u8 size;   // sizeof the original type (selects the hex width)
+    fl::i64 s;     // integral kinds: value as i64
+    fl::u64 u;     // integral kinds: value as u64 (same bits as the original cast)
+    float f;       // kFloat
+    double d;      // kDouble
+};
+
+// The shared specifier switches, defined in `stdio.cpp.hpp`. Integral and
+// floating kinds get separate functions, chosen at compile time by
+// format_arg<T>, so a program that only formats integers never references
+// float formatting or the soft-float double routines it pulls in. With a
+// single switch, any `%d`/`%s` log linked ~10 KB of float code on FPU-less
+// parts (FastLED#4671).
+void format_integral(sstream& stream, const FormatSpec& spec, const ScalarArg& a) FL_NO_EXCEPT;
+void format_floating(sstream& stream, const FormatSpec& spec, const ScalarArg& a) FL_NO_EXCEPT;
+
+// Maps a built-in type to its ScalarArg::Kind; -1 keeps the generic template.
+template<typename T> struct scalar_kind { enum : int { value = -1 }; };
+template<> struct scalar_kind<bool> { enum : int { value = ScalarArg::kBool }; };
+template<> struct scalar_kind<char> { enum : int { value = ScalarArg::kChar }; };
+template<> struct scalar_kind<signed char> { enum : int { value = ScalarArg::kSigned }; };
+template<> struct scalar_kind<unsigned char> { enum : int { value = ScalarArg::kUnsigned }; };
+template<> struct scalar_kind<short> { enum : int { value = ScalarArg::kSigned }; };
+template<> struct scalar_kind<unsigned short> { enum : int { value = ScalarArg::kUnsigned }; };
+template<> struct scalar_kind<int> { enum : int { value = ScalarArg::kSigned }; };
+template<> struct scalar_kind<unsigned int> { enum : int { value = ScalarArg::kUnsigned }; };
+template<> struct scalar_kind<long> { enum : int { value = ScalarArg::kSigned }; };
+template<> struct scalar_kind<unsigned long> { enum : int { value = ScalarArg::kUnsigned }; };
+template<> struct scalar_kind<long long> { enum : int { value = ScalarArg::kSigned }; };
+template<> struct scalar_kind<unsigned long long> { enum : int { value = ScalarArg::kUnsigned }; };
+template<> struct scalar_kind<float> { enum : int { value = ScalarArg::kFloat }; };
+template<> struct scalar_kind<double> { enum : int { value = ScalarArg::kDouble }; };
+
+// Fill the arg and hand it to the switch for its family. Only the floating
+// overload names format_floating, so only floating instantiations link it.
 template<typename T>
-typename fl::enable_if<!fl::is_pointer<T>::value>::type
-format_arg(sstream& stream, const FormatSpec& spec, const T& arg) FL_NOEXCEPT {
+typename fl::enable_if<fl::is_integral<T>::value>::type
+format_scalar_arg(sstream& stream, const FormatSpec& spec, ScalarArg& a,
+                  const T& arg) FL_NO_EXCEPT {
+    a.s = static_cast<fl::i64>(arg);
+    a.u = static_cast<fl::u64>(arg);
+    format_integral(stream, spec, a);
+}
+
+template<typename T>
+typename fl::enable_if<fl::is_floating_point<T>::value>::type
+format_scalar_arg(sstream& stream, const FormatSpec& spec, ScalarArg& a,
+                  const T& arg) FL_NO_EXCEPT {
+    a.f = static_cast<float>(arg);
+    a.d = static_cast<double>(arg);
+    format_floating(stream, spec, a);
+}
+
+// Format built-in scalar types: thin adapter onto the shared switches.
+template<typename T>
+typename fl::enable_if<(scalar_kind<T>::value >= 0)>::type
+format_arg(sstream& stream, const FormatSpec& spec, const T& arg) FL_NO_EXCEPT {
+    ScalarArg a = {};
+    a.kind = static_cast<ScalarArg::Kind>(scalar_kind<T>::value);
+    a.size = static_cast<fl::u8>(sizeof(T));
+    format_scalar_arg(stream, spec, a, arg);
+}
+
+// Format other non-pointer types (enums, user types) (d, i, u, o, x, X, f, c, s)
+template<typename T>
+typename fl::enable_if<!fl::is_pointer<T>::value && (scalar_kind<T>::value < 0)>::type
+format_arg(sstream& stream, const FormatSpec& spec, const T& arg) FL_NO_EXCEPT {
     fl::string result;
     bool is_numeric = false;
 
@@ -486,7 +642,7 @@ format_arg(sstream& stream, const FormatSpec& spec, const T& arg) FL_NOEXCEPT {
 // Format pointer types (only handles 'p' format)
 template<typename T>
 typename fl::enable_if<fl::is_pointer<T>::value>::type
-format_arg(sstream& stream, const FormatSpec& spec, const T& arg) FL_NOEXCEPT {
+format_arg(sstream& stream, const FormatSpec& spec, const T& arg) FL_NO_EXCEPT {
     fl::string result;
     bool is_numeric = false;
 
@@ -511,7 +667,7 @@ format_arg(sstream& stream, const FormatSpec& spec, const T& arg) FL_NOEXCEPT {
 }
 
 // Specialized format_arg for const char* (string literals)
-inline void format_arg(sstream& stream, const FormatSpec& spec, const char* arg) FL_NOEXCEPT {
+inline void format_arg(sstream& stream, const FormatSpec& spec, const char* arg) FL_NO_EXCEPT {
     fl::string result;
 
     bool is_numeric = false;
@@ -553,14 +709,150 @@ inline void format_arg(sstream& stream, const FormatSpec& spec, const char* arg)
     stream << result;
 }
 
+void format_arg(sstream& stream, const FormatSpec& spec, const fl::string& arg) FL_NO_EXCEPT;
+void format_arg(sstream& stream, const FormatSpec& spec, const fl::string_view& arg) FL_NO_EXCEPT;
+
+///////////////// GENERIC "{}" PLACEHOLDER SUPPORT /////////////////
+
+// The generic "{}" placeholder saves the caller from hand-picking between
+// %d / %u / %ld / %s / %p and from writing .c_str(): the natural specifier for
+// the argument's C++ type is selected automatically and then handed to the
+// SAME format_arg machinery the '%' path uses. That reuse is deliberate - it
+// shares instantiations with the '%' path: a TU compiled with '{}' emits an
+// identical symbol table to the same TU written with the hand-picked '%'
+// specifier (verified with nm over 10 argument types).
+//
+// Caveat, so nobody is surprised: format_impl's '{}' branch is compiled even
+// for call sites that only use '%', because the format string is a runtime
+// pointer and the branch cannot be discarded. Those call sites therefore emit
+// small format_arg_generic<T> forwarders they did not previously have. Each is
+// a one-line tail call into an already-existing format_arg<T> and inlines at
+// -Os, but the cost is paid tree-wide, not only by '{}' users.
+//
+// "{}" is intentionally constrained to the type set '%' already supports
+// (integral, bool, char, float/double, const char*, fl::string,
+// fl::string_view, pointers). It does NOT fall back to sstream::operator<<
+// for arbitrary types: that would re-introduce the per-call-site operator<<
+// chain instantiations that issue #3158 removed (measured at ~5-10 KB on
+// ESP32-S3, with sstream::operator<<(char) alone at 1.25 KB per #3078).
+// Passing an unsupported type to "{}" is therefore a compile error, not a
+// silent code-size regression.
+
+// Integral types (including bool) format like "%d". The 'd' path stringifies
+// through the same code as %d/%u, so signed and unsigned both render exactly
+// as they do today; bool keeps its "true"/"false" rendering.
+template<typename T>
+typename fl::enable_if<fl::is_integral<T>::value>::type
+format_arg_generic(sstream& stream, const T& arg) FL_NO_EXCEPT {
+    format_arg(stream, FormatSpec('d'), arg);
+}
+
+// Enums format as their underlying integer, like "%d" and like sstream's own
+// is_enum overload. This overload is REQUIRED for correctness, not just
+// convenience: an unscoped enum fails is_integral, but implicitly converts to
+// char, so without it overload resolution silently selects the char overload
+// below and `fl::printf("{}", GREEN)` with `enum Color { GREEN = 66 }` prints
+// "B" instead of "66". Same trap applies to any type with an implicit
+// conversion to char.
+template<typename T>
+typename fl::enable_if<fl::is_enum<T>::value>::type
+format_arg_generic(sstream& stream, const T& arg) FL_NO_EXCEPT {
+    using underlying_t = typename fl::underlying_type<T>::type;
+    format_arg(stream, FormatSpec('d'), static_cast<underlying_t>(arg));
+}
+
+// Floating point types format like "%f" (default precision).
+template<typename T>
+typename fl::enable_if<fl::is_floating_point<T>::value>::type
+format_arg_generic(sstream& stream, const T& arg) FL_NO_EXCEPT {
+    format_arg(stream, FormatSpec('f'), arg);
+}
+
+// Pointers format like "%p" ("0x" + lowercase hex address).
+// Character pointers are handled by the more specialized overloads below.
+template<typename T>
+typename fl::enable_if<fl::is_pointer<T>::value>::type
+format_arg_generic(sstream& stream, const T& arg) FL_NO_EXCEPT {
+    format_arg(stream, FormatSpec('p'), arg);
+}
+
+// char renders as a character, like "%c" (not as its numeric value).
+inline void format_arg_generic(sstream& stream, char arg) FL_NO_EXCEPT {
+    format_arg(stream, FormatSpec('c'), arg);
+}
+
+// C strings render their contents, like "%s" (including the "(null)"
+// sentinel for a null pointer).
+inline void format_arg_generic(sstream& stream, const char* arg) FL_NO_EXCEPT {
+    format_arg(stream, FormatSpec('s'), arg);
+}
+
+inline void format_arg_generic(sstream& stream, char* arg) FL_NO_EXCEPT {
+    format_arg(stream, FormatSpec('s'), static_cast<const char*>(arg));
+}
+
+// NOTE: no const char(&)[N] overload here on purpose. Array-to-pointer is an
+// lvalue transformation excluded from ICS ranking, so a string literal is an
+// Exact Match for BOTH an array template and the non-template const char*
+// overload above -- and the non-template wins the tiebreak. An array overload
+// would be dead code, and adding one would only risk a per-N instantiation.
+
+// fl::string / fl::string_view render like "%s" - no .c_str() needed.
+inline void format_arg_generic(sstream& stream, const fl::string& arg) FL_NO_EXCEPT {
+    format_arg(stream, FormatSpec('s'), arg);
+}
+
+inline void format_arg_generic(sstream& stream, const fl::string_view& arg) FL_NO_EXCEPT {
+    format_arg(stream, FormatSpec('s'), arg);
+}
+
+
+// Handle a '{' or '}' found in the format string.
+// Returns true if a generic "{}" placeholder was consumed, in which case the
+// caller is responsible for emitting an argument. Otherwise the brace text was
+// written to `stream` literally. Either way `format` is advanced past the
+// characters that were consumed, so callers must `continue` (never fall through
+// to an extra ++format) after calling this.
+//
+// Rules:
+// - "{}" is a generic placeholder
+// - "{{" is a literal '{' and "}}" is a literal '}'
+// - a lone '{' or '}' passes through literally rather than being an error
+inline bool parse_brace(sstream& stream, const char*& format) FL_NO_EXCEPT {
+    if (*format == '{') {
+        if (format[1] == '}') {
+            format += 2;
+            return true;
+        }
+        if (format[1] == '{') {
+            stream << "{";
+            format += 2;
+            return false;
+        }
+        stream << "{";
+        ++format;
+        return false;
+    }
+
+    // *format == '}'
+    if (format[1] == '}') {
+        stream << "}";
+        format += 2;
+        return false;
+    }
+    stream << "}";
+    ++format;
+    return false;
+}
+
 // Specialized format_arg for char arrays (string literals like "hello")
 template<fl::size N>
-void format_arg(sstream& stream, const FormatSpec& spec, const char (&arg)[N]) FL_NOEXCEPT {
+void format_arg(sstream& stream, const FormatSpec& spec, const char (&arg)[N]) FL_NO_EXCEPT {
     format_arg(stream, spec, static_cast<const char*>(arg));
 }
 
 // Base case: no more arguments
-inline void format_impl(sstream& stream, const char* format) FL_NOEXCEPT {
+inline void format_impl(sstream& stream, const char* format) FL_NO_EXCEPT {
     while (*format) {
         if (*format == '%') {
             FormatSpec spec = parse_format_spec(format);
@@ -572,6 +864,12 @@ inline void format_impl(sstream& stream, const char* format) FL_NOEXCEPT {
                 stream << "<missing_arg>";
                 continue;
             }
+        } else if (*format == '{' || *format == '}') {
+            if (parse_brace(stream, format)) {
+                // Generic placeholder with no argument left to consume.
+                stream << "<missing_arg>";
+            }
+            continue;
         } else {
             // Create a single-character string since sstream treats char as number
             char temp_str[2] = {*format, '\0'};
@@ -583,7 +881,7 @@ inline void format_impl(sstream& stream, const char* format) FL_NOEXCEPT {
 
 // Recursive case: process one argument and continue
 template<typename T, typename... Args>
-void format_impl(sstream& stream, const char* format, const T& first, const Args&... rest) FL_NOEXCEPT {
+void format_impl(sstream& stream, const char* format, const T& first, const Args&... rest) FL_NO_EXCEPT {
     while (*format) {
         if (*format == '%') {
             FormatSpec spec = parse_format_spec(format);
@@ -596,6 +894,17 @@ void format_impl(sstream& stream, const char* format, const T& first, const Args
                 format_impl(stream, format, rest...);
                 return;
             }
+        } else if (*format == '{' || *format == '}') {
+            if (parse_brace(stream, format)) {
+                // Generic placeholder: format the first argument by
+                // picking the natural specifier for its type (NOT through
+                // sstream::operator<<, which is what this design avoids) and
+                // continue with the rest.
+                format_arg_generic(stream, first);
+                format_impl(stream, format, rest...);
+                return;
+            }
+            continue;
         } else {
             // Create a single-character string since sstream treats char as number
             char temp_str[2] = {*format, '\0'};
@@ -626,13 +935,30 @@ void format_impl(sstream& stream, const char* format, const T& first, const Args
 /// - %p: pointers (formatted as 0x... hex)
 /// - %%: literal % character
 ///
+/// Generic placeholder:
+/// - {}: formats the next argument by picking the natural specifier for its
+///   C++ type, so callers do not have to choose between %d / %u / %ld / %s /
+///   %p or call .c_str(). Supported argument types are the same set the %
+///   specifiers support: all integral types (%d), bool (as "true"/"false"),
+///   char (as a character, %c), float/double (%f), const char* and
+///   fl::string / fl::string_view (%s), pointers (%p), and unscoped enums
+///   (as their underlying integer). Scoped enums (enum class) do not compile
+///   through {} or %d; cast at the call site.
+///   Passing any other type to {} is a compile error - {} deliberately does
+///   not fall back to a generic streaming path, to keep code size flat.
+/// - {{: literal { character
+/// - }}: literal } character
+/// - A lone { or } that is not part of the above passes through literally.
+/// - A {} with no remaining argument emits <missing_arg>, matching the
+///   behavior of a % specifier with no remaining argument.
+///
 /// Example usage:
 /// @code
 /// fl::printf("Value: %d, Name: %s", 42, "test");
 /// fl::printf("Float: %.2f", 3.14159);
 /// @endcode
 template<typename... Args>
-void printf(const char* format, const Args&... args) FL_NOEXCEPT {
+void printf(const char* format, const Args&... args) FL_NO_EXCEPT {
     sstream stream;
     printf_detail::format_impl(stream, format, args...);
     fl::print(stream.str().c_str());
@@ -657,13 +983,30 @@ void printf(const char* format, const Args&... args) FL_NOEXCEPT {
 /// - %p: pointers (formatted as 0x... hex)
 /// - %%: literal % character
 ///
+/// Generic placeholder:
+/// - {}: formats the next argument by picking the natural specifier for its
+///   C++ type, so callers do not have to choose between %d / %u / %ld / %s /
+///   %p or call .c_str(). Supported argument types are the same set the %
+///   specifiers support: all integral types (%d), bool (as "true"/"false"),
+///   char (as a character, %c), float/double (%f), const char* and
+///   fl::string / fl::string_view (%s), pointers (%p), and unscoped enums
+///   (as their underlying integer). Scoped enums (enum class) do not compile
+///   through {} or %d; cast at the call site.
+///   Passing any other type to {} is a compile error - {} deliberately does
+///   not fall back to a generic streaming path, to keep code size flat.
+/// - {{: literal { character
+/// - }}: literal } character
+/// - A lone { or } that is not part of the above passes through literally.
+/// - A {} with no remaining argument emits <missing_arg>, matching the
+///   behavior of a % specifier with no remaining argument.
+///
 /// Example usage:
 /// @code
 /// char buffer[100];
 /// int len = fl::snprintf(buffer, sizeof(buffer), "Value: %d, Name: %s", 42, "test");
 /// @endcode
 template<typename... Args>
-int snprintf(char* buffer, fl::size size, const char* format, const Args&... args) FL_NOEXCEPT {
+int snprintf(char* buffer, fl::size size, const char* format, const Args&... args) FL_NO_EXCEPT {
     // Handle null buffer or zero size
     if (!buffer || size == 0) {
         return 0;
@@ -691,27 +1034,6 @@ int snprintf(char* buffer, fl::size size, const char* format, const Args&... arg
     // Return the number of characters actually written (excluding null terminator)
     // This respects the buffer size limit instead of returning the full formatted length
     return static_cast<int>(copy_len);
-}
-
-/// @brief Sprintf-like formatting function that writes to a buffer
-/// @param buffer Output buffer to write formatted string to
-/// @param format Format string with placeholders like "%d", "%s", "%f" etc.
-/// @param args Arguments to format
-/// @return Number of characters written (excluding null terminator)
-/// 
-/// This function writes a formatted string to the provided buffer.
-/// The buffer size is deduced at compile time from the array reference,
-/// providing automatic safety against buffer overflows.
-///
-/// Example usage:
-/// @code
-/// char buffer[100];
-/// int len = fl::sprintf(buffer, "Value: %d, Name: %s", 42, "test");
-/// @endcode
-template<fl::size N, typename... Args>
-int sprintf(char (&buffer)[N], const char* format, const Args&... args) FL_NOEXCEPT {
-    // Use the compile-time known buffer size for safety
-    return snprintf(buffer, N, format, args...);
 }
 
 } // namespace fl

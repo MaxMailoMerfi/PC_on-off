@@ -19,7 +19,21 @@ typedef volatile fl::u32 RwReg;
 typedef fl::u32 prog_uint32_t;
 
 
-// Default to NOT using PROGMEM here
+// Vestigial on ESP8266 -- this value does NOT control data placement here.
+//
+// fastled_progmem.h dispatches on platform before it ever tests this flag:
+// its `#elif defined(ESP8266)` arm pulls in progmem_esp8266.h, which maps
+// FL_PROGMEM to real PROGMEM and FL_PGM_READ_* to real pgm_read_*. The
+// `#if (FASTLED_USE_PROGMEM == 1)` branch sits further down, inside an
+// `#else` that ESP8266 never reaches. FastLED tables are therefore
+// flash-resident on this platform regardless of the 0 below -- verified by
+// symbol placement: a DEFINE_GRADIENT_PALETTE lands in .irom0.text
+// (0x402xxxxx), not DRAM.
+//
+// Kept at 0 because platforms/esp/compile_test.hpp asserts it and user code
+// may branch on it. Do not read it as "ESP8266 keeps constants in RAM" --
+// that was true before the platform dispatch was added, and is exactly what
+// issue #743 reported.
 #ifndef FASTLED_USE_PROGMEM
 # define FASTLED_USE_PROGMEM 0
 #endif
@@ -31,13 +45,13 @@ typedef fl::u32 prog_uint32_t;
 
 #define NEED_CXX_BITS
 
-// These can be overridden
+// Arduino ESP8266 board variants expose Dn constants as raw GPIO numbers (for
+// example, NodeMCU D5 is GPIO 14). Default to raw numbering so those constants
+// reach the intended GPIO instead of being remapped a second time. The legacy
+// board-label mappings remain available as explicit opt-ins.
 #if !defined(FASTLED_ESP8266_RAW_PIN_ORDER) && !defined(FASTLED_ESP8266_NODEMCU_PIN_ORDER) && !defined(FASTLED_ESP8266_D1_PIN_ORDER)
-# ifdef ARDUINO_ESP8266_NODEMCU
-#   define FASTLED_ESP8266_NODEMCU_PIN_ORDER
-# else
-#   define FASTLED_ESP8266_RAW_PIN_ORDER
-# endif
+# define FL_ESP8266_PIN_ORDER_DEFAULTED 1
+# define FASTLED_ESP8266_RAW_PIN_ORDER
 #endif
 
 // Platform-specific IRAM attribute for ISR handlers and interrupt-sensitive functions

@@ -29,7 +29,7 @@ public:
     typedef u32 port_t;
 
     #if 0
-    inline static void setOutput() FL_NOEXCEPT {
+    inline static void setOutput() FL_NO_EXCEPT {
         if(_BIT<8) {
             _CRL::r() = (_CRL::r() & (0xF << (_BIT*4)) | (0x1 << (_BIT*4));
         } else {
@@ -93,8 +93,10 @@ _FL_DEFPIN(23, 23, 1); _FL_DEFPIN(24,  1, 0); _FL_DEFPIN(25,  0, 0);
 #define HAS_HARDWARE_PIN_SUPPORT 1
 
 // Actual pin definitions
-#elif defined(ADAFRUIT_METRO_M4_AIRLIFT_LITE)
+#elif defined(ADAFRUIT_METRO_M4_AIRLIFT_LITE) || defined(ADAFRUIT_METRO_M4_EXPRESS) || defined(ARDUINO_METRO_M4)
 
+// The Metro M4 Express and the Metro M4 AirLift Lite share a pinout apart from
+// A3 (pin 17), so both boards use this table.
 #define MAX_PIN 20
 // D0-D13, including D6+D8 (DotStar CLK + DATA)
 _FL_DEFPIN( 0, 23, 0); _FL_DEFPIN( 1, 22, 0); _FL_DEFPIN( 2,  17, 1); _FL_DEFPIN( 3, 16, 1);
@@ -102,7 +104,13 @@ _FL_DEFPIN( 4, 13, 1); _FL_DEFPIN( 5, 14, 1); _FL_DEFPIN( 6,  15, 1); _FL_DEFPIN
 _FL_DEFPIN( 8,  21, 0); _FL_DEFPIN( 9, 20, 0); _FL_DEFPIN(10, 18, 0); _FL_DEFPIN(11, 19, 0);
 _FL_DEFPIN(12, 17, 0); _FL_DEFPIN(13, 16, 0);
 // A0-A5
-_FL_DEFPIN(14,  2, 0); _FL_DEFPIN(15,  5, 0); _FL_DEFPIN(16,  6, 0); _FL_DEFPIN(17,  0, 1);
+_FL_DEFPIN(14,  2, 0); _FL_DEFPIN(15,  5, 0); _FL_DEFPIN(16,  6, 0);
+// A3 is the one pin that differs between the two Metro M4 variants
+#if defined(ADAFRUIT_METRO_M4_AIRLIFT_LITE)
+_FL_DEFPIN(17,  0, 1);  // PB00
+#else
+_FL_DEFPIN(17,  4, 0);  // PA04
+#endif
 _FL_DEFPIN(18,  8, 1); _FL_DEFPIN(19,  9, 1);
 // SDA/SCL
 _FL_DEFPIN(22, 2, 1); _FL_DEFPIN(23, 3, 1);
@@ -118,6 +126,13 @@ _FL_DEFPIN(24, 14, 0); _FL_DEFPIN(25,  13, 0); _FL_DEFPIN(26,  12, 0);
 #elif defined(ADAFRUIT_FEATHER_M4_CAN)
 
 #define MAX_PIN 19
+
+// Default example pins: this board has no pin 2 or 3 (see the pin table
+// below), so the FL_PIN_CLOCKLESS_1 / FL_PIN_SPI_CLOCK_1 fallbacks of 3 and 2
+// would fail FastPin<>::validpin(). Pin 1 is present, so only the clock
+// needs moving. See platforms/default_pins.h.
+#define FL_PIN_CLOCKLESS_1 5
+#define FL_PIN_SPI_CLOCK_1 4
 // D0-D13, including D8 (neopixel)  no pins 2 3
 _FL_DEFPIN( 0, 17, 1); _FL_DEFPIN( 1, 16, 1);
 _FL_DEFPIN( 4, 14, 0); _FL_DEFPIN( 5, 16, 0); _FL_DEFPIN( 6,  18, 0);
@@ -139,6 +154,13 @@ _FL_DEFPIN(23, 22, 1); _FL_DEFPIN(24,  23, 1); _FL_DEFPIN(25,  17, 0);
 #elif defined(ADAFRUIT_FEATHER_M4_EXPRESS)
 
 #define MAX_PIN 19
+
+// Default example pins: this board has no pin 2 or 3 (see the pin table
+// below), so the FL_PIN_CLOCKLESS_1 / FL_PIN_SPI_CLOCK_1 fallbacks of 3 and 2
+// would fail FastPin<>::validpin(). Pin 1 is present, so only the clock
+// needs moving. See platforms/default_pins.h.
+#define FL_PIN_CLOCKLESS_1 5
+#define FL_PIN_SPI_CLOCK_1 4
 // D0-D13, including D8 (neopixel)  no pins 2 3
 _FL_DEFPIN( 0, 17, 1); _FL_DEFPIN( 1, 16, 1);
 _FL_DEFPIN( 4, 14, 0); _FL_DEFPIN( 5, 16, 0); _FL_DEFPIN( 6,  18, 0);

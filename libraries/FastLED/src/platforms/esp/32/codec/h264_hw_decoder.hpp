@@ -14,11 +14,21 @@
 // Check if the esp_h264 component is available.
 // Install via: idf.py add-dependency "espressif/esp_h264^1.2.0"
 // Or add to idf_component.yml: espressif/esp_h264: "^1.2.0"
-#if FL_HAS_INCLUDE("esp_h264_dec.h")
+//
+// Probe the *software* decoder header specifically. `esp_h264_dec_sw_new`
+// and `esp_h264_dec_cfg_sw_t` — the two symbols this file actually uses —
+// live in `sw/include/esp_h264_dec_sw.h`, not in the interface-level
+// `esp_h264_dec.h`. Probing the latter reported the component as available
+// while leaving those two undeclared, which is why the esp32p4 build failed
+// with "'esp_h264_dec_sw_new' was not declared in this scope". The sw header
+// includes `esp_h264_dec.h` itself, so the interface types still come along.
+#if FL_HAS_INCLUDE("esp_h264_dec_sw.h")
 #define FL_H264_HW_AVAILABLE 1
 #include "esp_h264_dec.h"
+#include "esp_h264_dec_sw.h"
 #include "esp_h264_types.h"
 #include "fl/stl/noexcept.h"
+#include "fl/stl/unique_ptr.h"
 #else
 #define FL_H264_HW_AVAILABLE 0
 #endif
@@ -30,7 +40,7 @@ namespace fl {
 namespace {
 
 // Clamp integer to [0, 255] range.
-inline fl::u8 clampU8(int v) FL_NOEXCEPT {
+inline fl::u8 clampU8(int v) FL_NO_EXCEPT {
     if (v < 0) return 0;
     if (v > 255) return 255;
     return static_cast<fl::u8>(v);
@@ -43,7 +53,7 @@ struct NalUnit {
     fl::size len;
 };
 
-fl::vector<NalUnit> splitAnnexB(const fl::vector<fl::u8>& annexB) FL_NOEXCEPT {
+fl::vector<NalUnit> splitAnnexB(const fl::vector<fl::u8>& annexB) FL_NO_EXCEPT {
     fl::vector<NalUnit> units;
     const fl::size sz = annexB.size();
     if (sz < 4) return units;
@@ -88,7 +98,11 @@ struct H264HwDecoder::Impl {
     bool ready = false;
     bool error = false;
     fl::string errorMsg;
-    Frame currentFrame{0};
+    // Held by pointer because Frame has a const member and therefore a
+    // deleted copy-assignment (and no move-assignment), so a decoded frame
+    // cannot be assigned over a Frame value. Replacing the pointer is the
+    // only way to swap in a newly decoded frame.
+    fl::unique_ptr<Frame> currentFrame;
 
     fl::vector<fl::u8> mp4Data;
     fl::vector<fl::u8> annexB;
@@ -105,7 +119,7 @@ H264HwDecoder::~H264HwDecoder() {
     end();
 }
 
-bool H264HwDecoder::begin(fl::filebuf_ptr stream) FL_NOEXCEPT {
+bool H264HwDecoder::begin(fl::filebuf_ptr stream) FL_NO_EXCEPT {
     if (!stream) {
         mImpl->error = true;
         mImpl->errorMsg = "Null stream";
@@ -187,7 +201,7 @@ bool H264HwDecoder::begin(fl::filebuf_ptr stream) FL_NOEXCEPT {
     return true;
 }
 
-void H264HwDecoder::end() FL_NOEXCEPT {
+void H264HwDecoder::end() FL_NO_EXCEPT {
     if (mImpl->decoder) {
         esp_h264_dec_close(mImpl->decoder);
         esp_h264_dec_del(mImpl->decoder);
@@ -200,16 +214,16 @@ void H264HwDecoder::end() FL_NOEXCEPT {
     mImpl->frameDecoded = false;
 }
 
-bool H264HwDecoder::isReady() const FL_NOEXCEPT {
+bool H264HwDecoder::isReady() const FL_NO_EXCEPT {
     return mImpl->ready;
 }
 
-bool H264HwDecoder::hasError(fl::string* msg) const FL_NOEXCEPT {
+bool H264HwDecoder::hasError(fl::string* msg) const FL_NO_EXCEPT {
     if (msg && mImpl->error) *msg = mImpl->errorMsg;
     return mImpl->error;
 }
 
-DecodeResult H264HwDecoder::decode() FL_NOEXCEPT {
+DecodeResult H264HwDecoder::decode() FL_NO_EXCEPT {
     if (!mImpl->ready || !mImpl->decoder) return DecodeResult::Error;
     if (mImpl->frameDecoded) return DecodeResult::EndOfStream;
 
@@ -244,7 +258,7 @@ DecodeResult H264HwDecoder::decode() FL_NOEXCEPT {
             const fl::u8* uPlane = out_frame.outbuf + pixelCount;
             const fl::u8* vPlane = uPlane + pixelCount / 4;
 
-            fl::vector<fl::u8> rgbBuf(pixelCount * 3) FL_NOEXCEPT;
+            fl::vector<fl::u8> rgbBuf(pixelCount * 3) FL_NO_EXCEPT;
             fl::u8* dst = rgbBuf.data();
 
             for (fl::u16 row = 0; row < h; row++) {
@@ -262,7 +276,8 @@ DecodeResult H264HwDecoder::decode() FL_NOEXCEPT {
                 }
             }
 
-            mImpl->currentFrame = Frame(rgbBuf.data(), w, h, PixelFormat::RGB888, 0);
+            mImpl->currentFrame = fl::make_unique<Frame>(
+                rgbBuf.data(), w, h, PixelFormat::RGB888, 0);
             mImpl->frameDecoded = true;
             return DecodeResult::Success;
         }
@@ -273,11 +288,16 @@ DecodeResult H264HwDecoder::decode() FL_NOEXCEPT {
     return DecodeResult::Error;
 }
 
-Frame H264HwDecoder::getCurrentFrame() FL_NOEXCEPT {
-    return mImpl->currentFrame;
+Frame H264HwDecoder::getCurrentFrame() FL_NO_EXCEPT {
+    // Matches the previous value-member behaviour: before any successful
+    // decode, hand back an empty frame rather than dereferencing null.
+    if (!mImpl->currentFrame) {
+        return Frame(0);
+    }
+    return *mImpl->currentFrame;
 }
 
-bool H264HwDecoder::hasMoreFrames() const FL_NOEXCEPT {
+bool H264HwDecoder::hasMoreFrames() const FL_NO_EXCEPT {
     return mImpl->ready && !mImpl->frameDecoded;
 }
 
@@ -298,7 +318,7 @@ H264HwDecoder::~H264HwDecoder() { end(); }
 bool H264HwDecoder::begin(fl::filebuf_ptr) { return false; }
 void H264HwDecoder::end() { mImpl->ready = false; mImpl->stream = nullptr; }
 bool H264HwDecoder::isReady() const { return false; }
-bool H264HwDecoder::hasError(fl::string* msg) const FL_NOEXCEPT {
+bool H264HwDecoder::hasError(fl::string* msg) const FL_NO_EXCEPT {
     if (msg) *msg = "esp_h264 component not installed. "
                      "Add espressif/esp_h264 to idf_component.yml";
     return true;
@@ -311,7 +331,7 @@ bool H264HwDecoder::hasMoreFrames() const { return false; }
 
 // Factory: on ESP32-P4 we return the hardware decoder.
 IDecoderPtr H264::createDecoder(const H264Config& config,
-                                fl::string* error_message) FL_NOEXCEPT {
+                                fl::string* error_message) FL_NO_EXCEPT {
     FL_UNUSED(config);
 #if !FL_H264_HW_AVAILABLE
     if (error_message) {
@@ -323,7 +343,7 @@ IDecoderPtr H264::createDecoder(const H264Config& config,
     return fl::make_shared<H264HwDecoder>();
 }
 
-bool H264::isSupported() FL_NOEXCEPT {
+bool H264::isSupported() FL_NO_EXCEPT {
 #if FL_H264_HW_AVAILABLE
     return true;
 #else

@@ -18,7 +18,7 @@ namespace {
 
 struct GuardedFFT {
     void run(fl::span<const fl::i16> sample, fft::Bins *out,
-             const fft::Args &args) {
+             const fft::Args &args) FL_NO_EXCEPT {
         fl::unique_lock<fl::mutex> lock(mtx);
         fft.run(sample, out, args);
     }
@@ -31,7 +31,7 @@ struct GuardedFFT {
 // Object pool implementation
 
 struct AudioSamplePool {
-    void put(SampleImplPtr&& impl) {
+    void put(SampleImplPtr&& impl) FL_NO_EXCEPT {
         if (impl.unique()) {
             // There is no more shared_ptr to this object, so we can recycle it.
             fl::unique_lock<fl::mutex> lock(mutex);
@@ -45,7 +45,7 @@ struct AudioSamplePool {
         // Pool is full, discard the impl
         impl.reset();
     }
-    SampleImplPtr getOrCreate() {
+    SampleImplPtr getOrCreate() FL_NO_EXCEPT {
         {
             fl::unique_lock<fl::mutex> lock(mutex);
             if (!pool.empty()) {
@@ -64,13 +64,18 @@ struct AudioSamplePool {
 
 } // namespace
 
-Sample::~Sample() FL_NOEXCEPT {
+void SampleImpl::pcmDidChange() FL_NO_EXCEPT {
+    initZeroCrossings();
+    mRmsComputed = false;
+}
+
+Sample::~Sample() FL_NO_EXCEPT {
     if (mImpl) {
         fl::Singleton<AudioSamplePool>::instance().put(fl::move(mImpl));
     }
 }
 
-const Sample::VectorPCM &Sample::pcm() const {
+const Sample::VectorPCM &Sample::pcm() const FL_NO_EXCEPT {
     if (isValid()) {
         return mImpl->pcm();
     }
@@ -78,28 +83,28 @@ const Sample::VectorPCM &Sample::pcm() const {
     return empty;
 }
 
-Sample &Sample::operator=(const Sample &other) FL_NOEXCEPT {
+Sample &Sample::operator=(const Sample &other) FL_NO_EXCEPT {
     mImpl = other.mImpl;
     return *this;
 }
 
-fl::size Sample::size() const {
+fl::size Sample::size() const FL_NO_EXCEPT {
     if (isValid()) {
         return mImpl->pcm().size();
     }
     return 0;
 }
 
-const fl::i16 &Sample::at(fl::size i) const {
+const fl::i16 &Sample::at(fl::size i) const FL_NO_EXCEPT {
     if (i < size()) {
         return pcm()[i];
     }
     return empty()[0];
 }
 
-const fl::i16 &Sample::operator[](fl::size i) const { return at(i); }
+const fl::i16 &Sample::operator[](fl::size i) const FL_NO_EXCEPT { return at(i); }
 
-bool Sample::operator==(const Sample &other) const {
+bool Sample::operator==(const Sample &other) const FL_NO_EXCEPT {
     if (mImpl == other.mImpl) {
         return true;
     }
@@ -117,19 +122,19 @@ bool Sample::operator==(const Sample &other) const {
     return true;
 }
 
-bool Sample::operator!=(const Sample &other) const {
+bool Sample::operator!=(const Sample &other) const FL_NO_EXCEPT {
     return !(*this == other);
 }
 
-const Sample::VectorPCM &Sample::empty() {
+const Sample::VectorPCM &Sample::empty() FL_NO_EXCEPT {
     static fl::i16 empty_data[1] = {0}; // okay static in header
     static VectorPCM empty(empty_data); // okay static in header
     return empty;
 }
 
-float Sample::zcf() const { return mImpl->zcf(); }
+float Sample::zcf() const FL_NO_EXCEPT { return mImpl->zcf(); }
 
-fl::u32 Sample::timestamp() const {
+fl::u32 Sample::timestamp() const FL_NO_EXCEPT {
     if (isValid()) {
         return mImpl->timestamp();
     }
@@ -137,7 +142,7 @@ fl::u32 Sample::timestamp() const {
 }
 
 // O(1) - returns pre-computed cached value
-float Sample::rms() const {
+float Sample::rms() const FL_NO_EXCEPT {
     if (!isValid()) {
         return 0.0f;
     }
@@ -145,11 +150,15 @@ float Sample::rms() const {
 }
 
 SoundLevelMeter::SoundLevelMeter(double spl_floor, double smoothing_alpha)
-    : mSplFloor(spl_floor), mSmoothingAlpha(smoothing_alpha),
+    FL_NO_EXCEPT : mSplFloor(spl_floor), mSmoothingAlpha(smoothing_alpha),
       mDbfsFloorGlobal(FL_INFINITY_DOUBLE), mOffset(0.0), mCurrentDbfs(0.0),
       mCurrentSpl(spl_floor) {}
 
-void SoundLevelMeter::processBlock(const fl::i16 *samples, fl::size count) {
+void SoundLevelMeter::processBlock(const fl::i16 *samples, fl::size count) FL_NO_EXCEPT {
+    if (count == 0) {
+        return;
+    }
+
     // 1) compute block power → dBFS
     double sum_sq = 0.0;
     for (fl::size i = 0; i < count; ++i) {
@@ -162,7 +171,7 @@ void SoundLevelMeter::processBlock(const fl::i16 *samples, fl::size count) {
 
     // 2) update global floor (with optional smoothing)
     if (dbfs < mDbfsFloorGlobal) {
-        if (mSmoothingAlpha <= 0.0) {
+        if (mDbfsFloorGlobal == FL_INFINITY_DOUBLE || mSmoothingAlpha <= 0.0) {
             mDbfsFloorGlobal = dbfs;
         } else {
             mDbfsFloorGlobal = mSmoothingAlpha * dbfs +
@@ -175,7 +184,7 @@ void SoundLevelMeter::processBlock(const fl::i16 *samples, fl::size count) {
     mCurrentSpl = dbfs + mOffset;
 }
 
-void Sample::fft(fft::Bins *out) const {
+void Sample::fft(fft::Bins *out) const FL_NO_EXCEPT {
     fl::span<const fl::i16> sample = pcm();
     fft::Args args;
     args.samples = sample.size();
@@ -188,7 +197,7 @@ void Sample::fft(fft::Bins *out) const {
 }
 
 
-void Sample::applyGain(float gain) {
+void Sample::applyGain(float gain) FL_NO_EXCEPT {
     if (!isValid() || gain == 1.0f) return;
     auto& samples = mImpl->pcm_mutable();
     for (fl::size i = 0; i < samples.size(); ++i) {
@@ -197,9 +206,10 @@ void Sample::applyGain(float gain) {
         if (val < -32768) val = -32768;
         samples[i] = static_cast<fl::i16>(val);
     }
+    mImpl->pcmDidChange();
 }
 
-Sample::Sample(fl::span<const fl::i16> span, fl::u32 timestamp) {
+Sample::Sample(fl::span<const fl::i16> span, fl::u32 timestamp) FL_NO_EXCEPT {
     mImpl = fl::Singleton<AudioSamplePool>::instance().getOrCreate();
     auto begin = span.data();
     auto end = begin + span.size();

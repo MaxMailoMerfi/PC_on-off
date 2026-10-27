@@ -93,7 +93,12 @@ FL_EXTERN_C_END
 
 // RMT driver availability - use SoC capability macro
 #if !defined(FASTLED_ESP32_HAS_RMT)
+#if defined(FL_IS_ESP_32C2)
+// ESP32-C2's IDF package does not expose the direct RMT register header used by FastLED's RMT backends.
+#define FASTLED_ESP32_HAS_RMT 0
+#else
 #define FASTLED_ESP32_HAS_RMT SOC_RMT_SUPPORTED
+#endif
 #endif
 
 // Helper macro: Platforms that ONLY support RMT5 (no RMT4 fallback)
@@ -108,7 +113,11 @@ FL_EXTERN_C_END
 // Note that FASTLED_RMT5 is a legacy name,
 // so we keep it because "RMT" is specific to ESP32
 // Auto-detect RMT5 based on ESP-IDF version if not explicitly defined
-#if !defined(FASTLED_RMT5)
+#if defined(FL_IS_ESP_32C2)
+// The esp32c2 board env currently passes -DFASTLED_RMT5=1; force the unsupported backend off.
+#undef FASTLED_RMT5
+#define FASTLED_RMT5 0
+#elif !defined(FASTLED_RMT5)
 #if FASTLED_ESP32_RMT5_ONLY_PLATFORM
 #define FASTLED_RMT5 1  // RMT5-only chips must use new driver
 #elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0) && FASTLED_ESP32_HAS_RMT
@@ -178,10 +187,13 @@ FL_EXTERN_C_END
 // I2S parallel mode is only available on original ESP32 (ESP32dev).
 // ESP32-S2 has an I2S peripheral but with different register layout (no clka_en).
 // Other variants (S3, C2, C3, C5, C6, H2, P4) have completely different I2S architecture.
-// Also disabled on ESP-IDF 6.0+ (PERIPH_I2S1_MODULE removed, needs LL API port).
+// On ESP-IDF 6.0+ the driver routes through `i2s_periph_compat.h`'s LL-API
+// path (`i2s_ll_enable_bus_clock` + `i2s_ll_reset_register`) because
+// `periph_module_enable` was removed. Bench validation on real IDF 6 silicon
+// is tracked in FastLED#3509 Phase 7.
 // Users can override with -D FASTLED_ESP32_HAS_I2S=0 to disable.
 #if !defined(FASTLED_ESP32_HAS_I2S)
-#if defined(FL_IS_ESP32) && !defined(FL_IS_ESP_32S2) && !defined(FL_IS_ESP_32S3) && !defined(FL_IS_ESP_32C2) && !defined(FL_IS_ESP_32C3) && !defined(FL_IS_ESP_32C5) && !defined(FL_IS_ESP_32C6) && !defined(FL_IS_ESP_32H2) && !defined(FL_IS_ESP_32P4) && !ESP_IDF_VERSION_6_OR_HIGHER
+#if defined(FL_IS_ESP32) && !defined(FL_IS_ESP_32S2) && !defined(FL_IS_ESP_32S3) && !defined(FL_IS_ESP_32C2) && !defined(FL_IS_ESP_32C3) && !defined(FL_IS_ESP_32C5) && !defined(FL_IS_ESP_32C6) && !defined(FL_IS_ESP_32H2) && !defined(FL_IS_ESP_32P4)
 #define FASTLED_ESP32_HAS_I2S 1
 #else
 #define FASTLED_ESP32_HAS_I2S 0

@@ -5,14 +5,20 @@ This test executes a trivial Python command via `uv run python -c` and verifies:
 - The streamed output contains the expected line
 """
 
-import subprocess
 import time
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
-from running_process import EndOfStream, RunningProcess
+from running_process import PIPE, EndOfStream, RunningProcess
+
+from ci.util.running_process_group import (
+    ProcessExecutionConfig,
+    RunningProcessGroup,
+)
 
 
 @pytest.mark.serial
@@ -224,6 +230,8 @@ class TestRunningProcessAdditional(unittest.TestCase):
             timeout=30,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
 
         self.assertEqual(result.returncode, 0)
@@ -251,12 +259,36 @@ class TestRunningProcessAdditional(unittest.TestCase):
             timeout=30,
             capture_output=True,
             text=True,
-            stderr=subprocess.PIPE,
+            stderr=PIPE,
+            encoding="utf-8",
+            errors="replace",
         )
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "out")
         self.assertEqual(result.stderr, "err")
+
+
+class TestRunningProcessGroup(unittest.TestCase):
+    def test_verbose_poll_tolerates_quiet_process(self) -> None:
+        """No line in one poll interval is not a process failure."""
+
+        def quiet_lines() -> Any:
+            raise TimeoutError("No combined output available before timeout")
+            yield  # pragma: no cover - makes this an iterator
+
+        process = MagicMock()
+        process.line_iter.return_value = nullcontext(quiet_lines())
+        process.finished = False
+        group = RunningProcessGroup(
+            config=ProcessExecutionConfig(verbose=True, enable_stuck_detection=False)
+        )
+
+        activity = group._process_active_tests(
+            [process], [], [], [], stuck_monitor=None
+        )
+
+        self.assertFalse(activity)
 
 
 if __name__ == "__main__":

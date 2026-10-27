@@ -3,13 +3,16 @@
 FastLED Build Script
 
 Builds the Blink example across multiple platforms to verify compilation.
-Uses local compilation by default for speed, with optional Docker support.
+Always uses native fbuild — the `--docker`/`--build` flags that used to wrap
+`bash compile --docker` were removed in #2812 (compilation-Docker decommission)
+and are no longer accepted by `bash compile`.
 """
 
 import argparse
-import os
 import sys
 from typing import List
+
+from running_process import RunningProcess
 
 
 def main() -> int:
@@ -21,16 +24,6 @@ def main() -> int:
         "--platforms",
         type=str,
         help="Comma-separated list of platforms to build (default: all supported)",
-    )
-    parser.add_argument(
-        "--docker",
-        action="store_true",
-        help="Use Docker for compilation (slower but more reliable)",
-    )
-    parser.add_argument(
-        "--build",
-        action="store_true",
-        help="Build Docker images if they don't exist (use with --docker)",
     )
     parser.add_argument(
         "--example",
@@ -52,32 +45,22 @@ def main() -> int:
     else:
         platforms = default_platforms
 
-    # Build the base command
-    docker_flags = ""
-    if args.docker:
-        docker_flags = " --docker"
-        if args.build:
-            docker_flags += " --build"
-    else:
-        docker_flags = " --local"
-
     verbose_flag = " --verbose" if args.verbose else ""
 
-    failed_platforms: List[str] = []
-    succeeded_platforms: List[str] = []
+    failed_platforms: list[str] = []
+    succeeded_platforms: list[str] = []
 
     print(f"Building {args.example} for {len(platforms)} platform(s)")
-    print(f"Compilation mode: {'Docker' if args.docker else 'Local'}")
     print()
 
     for platform in platforms:
-        command = f"bash compile {platform} {args.example}{docker_flags}{verbose_flag}"
+        command = f"bash compile {platform} {args.example}{verbose_flag}"
         print(f"\n=== Building {platform} ===")
         if args.verbose:
             print(f"Command: {command}")
         print()
 
-        result = os.system(command)
+        result = RunningProcess.run(command, shell=True).returncode
 
         if result != 0:
             print(f"❌ Failed: {platform} (exit code {result})")

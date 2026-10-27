@@ -24,57 +24,8 @@
 
 /* global postMessage, self, performance, requestAnimationFrame, cancelAnimationFrame */
 
-// CRITICAL FIX: Workers don't support import maps, but Three.js jsm files use bare "three" imports.
-// Solution: Use local vendor files with patched relative imports to three.module.js
-
 // VideoRecorder import removed - recording now happens on main thread with mirror canvas
 // Worker only captures and transfers frames as ImageBitmap for main thread MediaRecorder
-
-/**
- * Loads ThreeJS modules for 3D rendering in worker context
- * @returns {Promise<Object>} ThreeJS modules object
- */
-async function loadThreeJSModules() {
-  workerLog('LOG', 'BACKGROUND_WORKER', 'Loading ThreeJS modules in worker context...');
-
-  try {
-    // WORKER FIX: Use local vendor files with relative paths
-    // Workers don't support import maps, so we need to use full relative paths
-    const [
-      THREE,
-      { EffectComposer },
-      { RenderPass },
-      { UnrealBloomPass },
-      { OutputPass },
-      BufferGeometryUtils
-    ] = await Promise.all([
-      import('../../vendor/three/three.module.js'),
-      import('../../vendor/three/examples/jsm/postprocessing/EffectComposer.js'),
-      import('../../vendor/three/examples/jsm/postprocessing/RenderPass.js'),
-      import('../../vendor/three/examples/jsm/postprocessing/UnrealBloomPass.js'),
-      import('../../vendor/three/examples/jsm/postprocessing/OutputPass.js'),
-      import('../../vendor/three/examples/jsm/utils/BufferGeometryUtils.js')
-    ]);
-
-    const modules = {
-      THREE,
-      EffectComposer,
-      RenderPass,
-      UnrealBloomPass,
-      OutputPass,
-      BufferGeometryUtils
-    };
-
-    workerLog('LOG', 'BACKGROUND_WORKER', 'ThreeJS modules loaded successfully', {
-      moduleNames: Object.keys(modules)
-    });
-
-    return modules;
-  } catch (error) {
-    workerLog('ERROR', 'BACKGROUND_WORKER', 'Failed to load ThreeJS modules', error);
-    throw error;
-  }
-}
 
 /**
  * @typedef {Object} WorkerState
@@ -139,6 +90,15 @@ const workerState = {
   // Zero polling overhead - completely event-driven
   // Dictionary format: { "0": {strips: {...}, absMin: [...], absMax: [...]}, "1": {...} }
   screenMaps: {},
+  screenMapsDirty: false, // screenMaps changed and the main thread has not been told yet (main-thread rendering)
+  // Rate counters, reset every stats report. loopCount: extern_loop() iterations
+  // (the sketch frame rate). renderCount: frames handed to the renderer here;
+  // in main-thread rendering mode the main thread counts renders instead.
+  loopCount: 0,
+  renderCount: 0,
+  loopFps: 0,
+  renderFps: 0,
+  renderOnMainThread: false, // frames are posted to the main thread instead of drawn on an OffscreenCanvas
 
   // Audio sample queue - samples buffered here from onmessage, flushed to WASM at frame start
   audioSampleQueue: [],
@@ -325,11 +285,18 @@ async function handleInitialize(payload) {
     workerState.capabilities = payload.capabilities;
     workerState.frameRate = payload.frameRate || 60;
     workerState.urlParams = payload.urlParams || {}; // Store URL parameters from main thread
+    // When the browser cannot create WebGL2 on an OffscreenCanvas (WebKitGTK
+    // behind the Tauri viewer on Linux), the sketch still runs here — blocking
+    // calls must stay off the main thread — and each frame is posted back to
+    // the main thread, which draws it on the real canvas.
+    workerState.renderOnMainThread = !!payload.renderOnMainThread;
 
     workerLog('LOG', 'BACKGROUND_WORKER', 'URL parameters received from main thread', workerState.urlParams);
 
     // Validate OffscreenCanvas
-    if (!workerState.canvas || !(workerState.canvas instanceof OffscreenCanvas)) {
+    if (workerState.renderOnMainThread) {
+      workerLog('LOG', 'BACKGROUND_WORKER', 'Main-thread rendering: no OffscreenCanvas, frames will be posted to the main thread');
+    } else if (!workerState.canvas || !(workerState.canvas instanceof OffscreenCanvas)) {
       throw new Error('Invalid OffscreenCanvas provided to worker');
     }
 
@@ -339,18 +306,20 @@ async function handleInitialize(payload) {
     await initializeFastLEDModule();
 
     // Set up graphics manager for OffscreenCanvas
-    await initializeGraphicsManager();
+    if (!workerState.renderOnMainThread) {
+      await initializeGraphicsManager();
+    }
 
     workerState.initialized = true;
 
     const result = {
       success: true,
       capabilities: workerState.capabilities,
-      canvas: {
+      canvas: workerState.canvas ? {
         width: workerState.canvas.width,
         height: workerState.canvas.height
-      },
-      contextType: 'webgl2'
+      } : null,
+      contextType: workerState.renderOnMainThread ? 'main_thread' : 'webgl2'
     };
 
     workerLog('LOG', 'BACKGROUND_WORKER', 'Worker initialized successfully', result);
@@ -508,20 +477,15 @@ async function initializeGraphicsManager() {
         usePixelatedRendering: true
       });
     } else {
-      // Default to ThreeJS renderer (gfx=1) if no parameter specified
+      // Default to the shared @fastled/gfx renderer (gfx=1) if no parameter specified
       const explicitlyRequested = FORCE_THREEJS_RENDERER ? 'gfx=1' : 'default (gfx=1)';
-      workerLog('LOG', 'BACKGROUND_WORKER', `ThreeJS renderer (${explicitlyRequested}) - loading ThreeJS modules...`);
+      workerLog('LOG', 'BACKGROUND_WORKER', `Shared gfx renderer (${explicitlyRequested}) - loading package adapter...`);
 
-      const threeJsModules = await loadThreeJSModules();
-      workerLog('LOG', 'BACKGROUND_WORKER', 'ThreeJS modules loaded, creating GraphicsManagerThreeJS...');
-
-      const graphicsManagerModule = await import('../graphics/graphics_manager_threejs.js');
-      workerState.graphicsManager = new graphicsManagerModule.GraphicsManagerThreeJS({
+      const graphicsManagerModule = await import('../graphics/graphics_manager_gfx.js');
+      workerState.graphicsManager = new graphicsManagerModule.GraphicsManagerGfx({
         canvas: workerState.canvas, // Pass OffscreenCanvas directly
-        threeJsModules: threeJsModules
       });
-
-      workerLog('LOG', 'BACKGROUND_WORKER', 'Beautiful 3D GraphicsManager (ThreeJS) initialized in worker mode');
+      workerLog('LOG', 'BACKGROUND_WORKER', 'Shared @fastled/gfx GraphicsManager initialized in worker mode');
     }
 
     // The graphics manager will handle WebGL setup internally
@@ -602,6 +566,7 @@ async function handleStart(_payload) {
 
         // Update worker state and notify graphics manager
         workerState.screenMaps = screenMapData;
+        workerState.screenMapsDirty = true;
         if (workerState.graphicsManager && workerState.graphicsManager.updateScreenMap) {
           workerState.graphicsManager.updateScreenMap(screenMapData);
           workerLog('LOG', 'BACKGROUND_WORKER', 'ScreenMaps fetched and sent to graphics manager', {
@@ -625,6 +590,10 @@ async function handleStart(_payload) {
     workerState.running = true;
     workerState.startTime = performance.now();
     workerState.frameCount = 0;
+    // Rate counters measure from here, not from page load
+    workerState.loopCount = 0;
+    workerState.renderCount = 0;
+    performanceMonitor.lastStatsReport = workerState.startTime;
 
     startAnimationLoop();
 
@@ -814,6 +783,9 @@ async function handleStartRecording(payload) {
 
   try {
     // Check if canvas is available
+    if (workerState.renderOnMainThread) {
+      throw new Error('Frame capture is unavailable in main-thread rendering mode (no OffscreenCanvas WebGL2)');
+    }
     if (!workerState.canvas) {
       throw new Error('Canvas not available for frame capture');
     }
@@ -884,6 +856,7 @@ function handleScreenMapUpdate(payload) {
     // Cache the screenmap data (dictionary format)
     // This is sent from C++ only when screenmaps change (strip added, layout updated)
     workerState.screenMaps = payload.screenMapData;
+    workerState.screenMapsDirty = true;
 
     workerLog('LOG', 'BACKGROUND_WORKER', 'Screenmap cache updated', {
       screenMapCount: Object.keys(workerState.screenMaps || {}).length
@@ -1015,6 +988,28 @@ function startAnimationLoop() {
 }
 
 /**
+ * Posts one frame to the main thread for rendering (no OffscreenCanvas mode).
+ * Pixel buffers are transferred, not copied; the screenmap dictionary rides
+ * along only when it changed since the last post.
+ * @param {Array} frameData - Strip data with pixel_data copies from extractFrameData()
+ */
+function postFrameToMainThread(frameData) {
+  const transfer = [];
+  for (const strip of frameData) {
+    if (strip.pixel_data && strip.pixel_data.buffer) {
+      transfer.push(strip.pixel_data.buffer);
+    }
+  }
+  const payload = {
+    frameData,
+    frameNumber: workerState.frameCount,
+    screenMaps: workerState.screenMapsDirty ? workerState.screenMaps : undefined
+  };
+  workerState.screenMapsDirty = false;
+  postMessage({ type: 'frame_data', payload }, /** @type {*} */ (transfer));
+}
+
+/**
  * Executes a single frame of the animation loop
  * @param {number} currentTime - Current timestamp
  */
@@ -1023,6 +1018,7 @@ async function executeFrameLoop(currentTime) {
 
   try {
     workerState.frameCount++;
+    workerState.loopCount++;
 
     // Flush buffered audio samples to WASM BEFORE running C++ loop.
     // This ensures Module.ccall('pushAudioSamples') happens in the same
@@ -1043,14 +1039,20 @@ async function executeFrameLoop(currentTime) {
     const frameData = extractFrameData();
 
     if (frameData) {
-      // Render frame to OffscreenCanvas (automatically syncs to main thread canvas)
-      workerState.graphicsManager.updateCanvas(frameData);
+      if (workerState.renderOnMainThread) {
+        // No OffscreenCanvas here: hand the frame to the main thread to draw
+        postFrameToMainThread(frameData);
+      } else {
+        // Render frame to OffscreenCanvas (automatically syncs to main thread canvas)
+        workerState.graphicsManager.updateCanvas(frameData);
+        workerState.renderCount++;
 
-      // Capture frame for main-thread recording if enabled
-      if (workerState.isCapturingFrames) {
-        captureAndTransferFrame().catch((err) => {
-          workerLog('ERROR', 'BACKGROUND_WORKER', 'Frame capture error', err);
-        });
+        // Capture frame for main-thread recording if enabled
+        if (workerState.isCapturingFrames) {
+          captureAndTransferFrame().catch((err) => {
+            workerLog('ERROR', 'BACKGROUND_WORKER', 'Frame capture error', err);
+          });
+        }
       }
 
       // Send lightweight performance telemetry to main thread
@@ -1185,6 +1187,13 @@ function updatePerformanceMetrics(frameTime) {
  * Reports performance statistics to main thread
  */
 function reportPerformanceStats() {
+  // Wall-clock rates over the interval since the last report
+  const now = performance.now();
+  const intervalSec = Math.max((now - performanceMonitor.lastStatsReport) / 1000, 0.001);
+  workerState.loopFps = workerState.loopCount / intervalSec;
+  workerState.renderFps = workerState.renderCount / intervalSec;
+  workerState.loopCount = 0;
+  workerState.renderCount = 0;
   const stats = getPerformanceStats();
 
   postMessage({
@@ -1203,8 +1212,11 @@ function getPerformanceStats() {
   const fps = workerState.frameCount / (runTime / 1000);
 
   return {
-    fps: fps || 0,
-    averageFrameTime: workerState.averageFrameTime,
+    fps: fps || 0, // cumulative loop iterations per second since start
+    loopFps: workerState.loopFps, // sketch frame rate over the last stats interval
+    renderFps: workerState.renderFps, // frames rendered here over the last interval (0 in main-thread rendering mode)
+    renderOnMainThread: workerState.renderOnMainThread,
+    averageFrameTime: workerState.averageFrameTime, // CPU cost of one loop iteration, ms
     frameCount: workerState.frameCount,
     runTime: runTime,
     memoryUsage: 'self' in globalThis && 'performance' in self && self.performance.memory ? {

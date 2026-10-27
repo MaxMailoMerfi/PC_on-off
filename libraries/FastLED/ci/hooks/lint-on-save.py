@@ -14,9 +14,10 @@ Exit codes:
 
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
+
+from running_process import PIPE, RunningProcess
 
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -39,7 +40,7 @@ def _get_submodule_paths() -> list[str]:
         return _submodule_cache
     _submodule_cache = []
     try:
-        result = subprocess.run(
+        result = RunningProcess.run(
             [
                 "git",
                 "config",
@@ -49,7 +50,8 @@ def _get_submodule_paths() -> list[str]:
                 r"^submodule\..*\.path$",
             ],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(PROJECT_ROOT),
         )
         if result.returncode == 0:
@@ -111,19 +113,21 @@ def main() -> int:
         if rel_norm == sub_path or rel_norm.startswith(sub_path + "/"):
             return 0
 
-    # Skip C++ files in examples directory (IWYU checks not applicable)
-    if Path(file_path).suffix.lower() in CPP_EXTENSIONS:
-        if rel_path.startswith("examples" + os.sep) or rel_path.startswith("examples/"):
-            return 0
+    # Note: previously C++ files under examples/ were short-circuited here
+    # because IWYU checks aren't applicable. After PR #3293 the Rust lint
+    # path needs to run on save for examples-scope checkers
+    # (UsingNamespaceFlInExamplesChecker, ExampleSerialChecker, the
+    # examples-scope BannedHeadersChecker). The fingerprint cache keeps
+    # the per-save cost low, so the short-circuit was removed.
 
     # Delegate to lint.py in single-file mode
     # Always use --strict for Python files (pyright on single file is fast)
     cmd = ["uv", "run", "ci/lint.py", "--strict", file_path]
 
-    result = subprocess.run(
+    result = RunningProcess.run(
         cmd,
-        capture_output=True,
-        text=True,
+        stdout=PIPE,
+        stderr=PIPE,
         encoding="utf-8",
         errors="replace",
         cwd=str(PROJECT_ROOT),

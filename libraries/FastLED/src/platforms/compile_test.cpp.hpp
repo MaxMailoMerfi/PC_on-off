@@ -30,10 +30,12 @@ FL_DISABLE_WARNING(unused-parameter)
 #include "platforms/avr/compile_test.hpp"
 #elif defined(ESP32) || defined(ESP8266)
 #include "platforms/esp/compile_test.hpp"
+#elif defined(ARDUINO_ARCH_CI13XX)
+#include "platforms/ci13xx/compile_test.hpp"
+#elif defined(FL_IS_APOLLO3)
+#include "platforms/apollo3/compile_test.hpp"
 #elif defined(FL_IS_ARM)
 #include "platforms/arm/compile_test.hpp"
-#elif defined(APOLLO3) || defined(ARDUINO_ARCH_APOLLO3)
-#include "platforms/apollo3/compile_test.hpp"
 #elif defined(FASTLED_STUB_IMPL)
 #include "platforms/stub/compile_test.hpp"
 #include "fl/stl/noexcept.h"
@@ -43,7 +45,7 @@ namespace fl {
 
 // Test that sstream and sstream_noop can accept all fundamental integer types
 // This ensures SFINAE collision prevention works across all platforms
-FL_MAYBE_UNUSED static void test_strstream_integer_operators() FL_NOEXCEPT {
+FL_MAYBE_UNUSED static void test_strstream_integer_operators() FL_NO_EXCEPT {
     fl::sstream ss;
     fl::sstream_noop fss;
 
@@ -89,7 +91,7 @@ FL_MAYBE_UNUSED static void test_strstream_integer_operators() FL_NOEXCEPT {
 // This file contains only compile-time tests.
 // The platform-specific test functions are called to trigger
 // any compile-time errors if the platform is not configured correctly.
-FL_MAYBE_UNUSED static void compile_tests() FL_NOEXCEPT {
+FL_MAYBE_UNUSED static void compile_tests() FL_NO_EXCEPT {
 
     FL_STATIC_ASSERT(fl::is_same<u32, u32>::value, "u32 must be the same type as u32");
     FL_STATIC_ASSERT(fl::is_same<u16, u16>::value, "u16 must be the same type as u16");
@@ -121,10 +123,12 @@ FL_MAYBE_UNUSED static void compile_tests() FL_NOEXCEPT {
     esp32_compile_tests();
 #elif defined(ESP8266)
     esp8266_compile_tests();
+#elif defined(ARDUINO_ARCH_CI13XX)
+    ci13xx_compile_tests();
+#elif defined(FL_IS_APOLLO3)
+    apollo3_compile_tests();
 #elif defined(FL_IS_ARM)
     arm_compile_tests();
-#elif defined(APOLLO3) || defined(ARDUINO_ARCH_APOLLO3)
-    apollo3_compile_tests();
 #elif defined(FASTLED_STUB_IMPL)
     stub_compile_tests();
 #else

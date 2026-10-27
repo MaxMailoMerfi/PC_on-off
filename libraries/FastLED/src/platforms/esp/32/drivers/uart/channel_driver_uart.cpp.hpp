@@ -25,10 +25,13 @@ namespace fl {
 // Constructor / Destructor
 //=============================================================================
 
-ChannelEngineUART::ChannelEngineUART(fl::shared_ptr<IUartPeripheral> peripheral) FL_NOEXCEPT
+ChannelEngineUART::ChannelEngineUART(fl::shared_ptr<IUartPeripheral> peripheral,
+                                     int uart_num) FL_NO_EXCEPT
     : mPeripheral(fl::move(peripheral)),
       mInitialized(false),
       mCurrentBaudRate(0),
+      mCurrentDataBits(0),
+      mUartNum(uart_num),
       mCurrentGroupIndex(0) {
     if (!mPeripheral) {
         FL_WARN("UART: Null peripheral pointer in constructor");
@@ -38,7 +41,7 @@ ChannelEngineUART::ChannelEngineUART(fl::shared_ptr<IUartPeripheral> peripheral)
 ChannelEngineUART::~ChannelEngineUART() {
     // Wait for any active transmissions to complete
     while (poll() == DriverState::BUSY || poll() == DriverState::DRAINING) {
-        task::run(250, task::ExecFlags::SYSTEM);
+        task::yield_system(250);
     }
 
     // Deinitialize peripheral
@@ -56,7 +59,7 @@ ChannelEngineUART::~ChannelEngineUART() {
     mCurrentGroupIndex = 0;
 }
 
-bool ChannelEngineUART::canHandle(const ChannelDataPtr& data) const FL_NOEXCEPT {
+bool ChannelEngineUART::canHandle(const ChannelDataPtr& data) const FL_NO_EXCEPT {
     if (!data) {
         return false;
     }
@@ -73,13 +76,13 @@ bool ChannelEngineUART::canHandle(const ChannelDataPtr& data) const FL_NOEXCEPT 
 // Public Interface - IChannelDriver Implementation
 //=============================================================================
 
-void ChannelEngineUART::enqueue(ChannelDataPtr channelData) FL_NOEXCEPT {
+void ChannelEngineUART::enqueue(ChannelDataPtr channelData) FL_NO_EXCEPT {
     if (channelData) {
         mEnqueuedChannels.push_back(channelData);
     }
 }
 
-void ChannelEngineUART::show() FL_NOEXCEPT {
+void ChannelEngineUART::show() FL_NO_EXCEPT {
     FL_SCOPED_TRACE;
 
     if (!mEnqueuedChannels.empty()) {
@@ -115,7 +118,7 @@ void ChannelEngineUART::show() FL_NOEXCEPT {
 
         // Sort groups by transmission time (fastest first)
         fl::sort(mChipsetGroups.begin(), mChipsetGroups.end(),
-                 [](const ChipsetGroup& a, const ChipsetGroup& b) FL_NOEXCEPT {
+                 [](const ChipsetGroup& a, const ChipsetGroup& b) FL_NO_EXCEPT {
                      size_t maxSizeA = 0;
                      for (const auto& channel : a.mChannels) {
                          size_t size = channel->getSize();
@@ -167,7 +170,7 @@ void ChannelEngineUART::show() FL_NOEXCEPT {
     }
 }
 
-IChannelDriver::DriverState ChannelEngineUART::poll() FL_NOEXCEPT {
+IChannelDriver::DriverState ChannelEngineUART::poll() FL_NO_EXCEPT {
     // If not initialized, we're ready (no hardware to poll)
     if (!mInitialized) {
         return DriverState::READY;
@@ -208,7 +211,7 @@ IChannelDriver::DriverState ChannelEngineUART::poll() FL_NOEXCEPT {
 // Private Methods - LUT Cache
 //=============================================================================
 
-const Wave10Lut& ChannelEngineUART::getOrBuildLut(const ChipsetTimingConfig& timing) FL_NOEXCEPT {
+const Wave10Lut& ChannelEngineUART::getOrBuildLut(const ChipsetTimingConfig& timing) FL_NO_EXCEPT {
     // Search cache
     for (const auto& entry : mLutCache) {
         if (entry.mTiming == timing) {
@@ -220,7 +223,7 @@ const Wave10Lut& ChannelEngineUART::getOrBuildLut(const ChipsetTimingConfig& tim
     LutCacheEntry newEntry;
     newEntry.mTiming = timing;
     newEntry.mLut = buildWave10Lut(timing);
-    newEntry.mBaudRate = Wave10Lut::computeBaudRate(timing);
+    newEntry.mBaudRate = newEntry.mLut.baudRate(timing);
     mLutCache.push_back(newEntry);
     return mLutCache.back().mLut;
 }
@@ -230,7 +233,7 @@ const Wave10Lut& ChannelEngineUART::getOrBuildLut(const ChipsetTimingConfig& tim
 //=============================================================================
 
 void ChannelEngineUART::beginTransmission(
-    fl::span<const ChannelDataPtr> channelData) FL_NOEXCEPT {
+    fl::span<const ChannelDataPtr> channelData) FL_NO_EXCEPT {
 
     FL_DBG("UART: beginTransmission() called with " << channelData.size() << " channel(s)");
 
@@ -256,13 +259,23 @@ void ChannelEngineUART::beginTransmission(
         return;
     }
 
-    // Compute required baud rate from timing
-    u32 required_baud = Wave10Lut::computeBaudRate(timing);
+    // Get or build the wave LUT for this timing FIRST — the selected
+    // frame geometry (wave10 = 8 data bits @ 5 pulses/bit, wave8-frame
+    // = 6 data bits @ 4 pulses/bit) determines both the baud rate and
+    // the UART word length.
+    const Wave10Lut& lut = getOrBuildLut(timing);
+    if (lut.pulses_per_bit == 0) {
+        FL_WARN("UART: timing not representable by any wave geometry");
+        return;
+    }
+    const u32 required_baud = lut.baudRate(timing);
+    const u8 required_data_bits = lut.dataBits();
 
     // Initialize or reinitialize UART peripheral if needed
-    if (!mInitialized || mCurrentBaudRate != required_baud) {
+    if (!mInitialized || mCurrentBaudRate != required_baud ||
+        mCurrentDataBits != required_data_bits) {
         if (mInitialized) {
-            // Reinitialize with new baud rate
+            // Reinitialize with new baud rate / word length
             FL_DBG("UART: Reinitializing peripheral (baud change: " << mCurrentBaudRate << " -> " << required_baud << ")");
             mPeripheral->deinitialize();
             mInitialized = false;
@@ -271,13 +284,14 @@ void ChannelEngineUART::beginTransmission(
         FL_DBG("UART: Initializing peripheral with baud=" << required_baud << ", pin=" << pin);
 
         UartPeripheralConfig config(
-            required_baud,     // mBaudRate (derived from timing)
-            pin,               // mTxPin
-            -1,                // mRxPin (not used)
-            4096,              // mTxBufferSize (4 KB for DMA)
-            256,               // mRxBufferSize (minimum required by ESP-IDF)
-            1,                 // mStopBits (8N1)
-            1                  // mUartNum (UART1)
+            required_baud,      // mBaudRate (derived from timing + geometry)
+            pin,                // mTxPin
+            -1,                 // mRxPin (not used)
+            4096,               // mTxBufferSize (4 KB for DMA)
+            256,                // mRxBufferSize (minimum required by ESP-IDF)
+            1,                  // mStopBits (N1)
+            mUartNum,           // which UART block (1 or 2 — FastLED#3576 Phase 2)
+            required_data_bits  // mDataBits (8 = wave10, 6 = wave8-frame)
         );
 
         if (!mPeripheral->initialize(config)) {
@@ -288,10 +302,8 @@ void ChannelEngineUART::beginTransmission(
         FL_DBG("UART: Peripheral initialized successfully");
         mInitialized = true;
         mCurrentBaudRate = required_baud;
+        mCurrentDataBits = required_data_bits;
     }
-
-    // Get or build the Wave10 LUT for this timing
-    const Wave10Lut& lut = getOrBuildLut(timing);
 
     // Prepare scratch buffer (copy LED RGB data)
     prepareScratchBuffer(channelData, dataSize);
@@ -310,8 +322,7 @@ void ChannelEngineUART::beginTransmission(
     FL_DBG("UART: Encoded " << encoded_bytes << " bytes from " << dataSize << " LED bytes");
 
     if (encoded_bytes == 0) {
-        FL_WARN("UART: Encoding failed (required="
-                << required_encoded_size << " bytes)");
+        FL_WARN("UART: Encoding failed (required=" << required_encoded_size << " bytes)");
         return;
     }
 
@@ -327,7 +338,7 @@ void ChannelEngineUART::beginTransmission(
 
 void ChannelEngineUART::prepareScratchBuffer(
     fl::span<const ChannelDataPtr> channelData,
-    size_t maxChannelSize) FL_NOEXCEPT {
+    size_t maxChannelSize) FL_NO_EXCEPT {
 
     mScratchBuffer.resize(maxChannelSize);
 
@@ -341,7 +352,7 @@ void ChannelEngineUART::prepareScratchBuffer(
 
 fl::shared_ptr<IChannelDriver> createUartEngine(int uart_num,
                                                 int tx_pin,
-                                                u32 baud_rate) FL_NOEXCEPT {
+                                                u32 baud_rate) FL_NO_EXCEPT {
     (void)uart_num;
     (void)tx_pin;
     (void)baud_rate;

@@ -1,4 +1,4 @@
-// IWYU pragma: private
+﻿// IWYU pragma: private
 
 /// @file channel_driver_rmt.cpp
 /// @brief RMT5 ChannelEngine implementation
@@ -97,13 +97,119 @@ using detail::RMTBufferPool;
 /// This factory function hides the platform selection logic behind a single
 /// function call. The #ifdef is isolated here rather than scattered throughout
 /// the codebase.
-static IRMT5Peripheral& getDefaultPeripheral() FL_NOEXCEPT {
+static IRMT5Peripheral& getDefaultPeripheral() FL_NO_EXCEPT {
 #ifdef FASTLED_STUB_IMPL
     return detail::Rmt5PeripheralMock::instance();
 #else
     return detail::Rmt5PeripheralESP::instance();
 #endif
 }
+
+#if FL_HAS_WARN || FL_HAS_RMT_LOG
+namespace {
+
+enum class PendingChannelLog : u8 {
+    MISSING_ENCODER,
+    BUFFER_ACQUIRE_FAILED,
+#if FL_HAS_RMT_LOG
+    ENABLE_FAILED,
+    RESET_FAILED,
+#endif
+    TRANSMIT_FAILED,
+#if FL_HAS_RMT_LOG
+    STARTED,
+#endif
+};
+
+FL_NO_INLINE FL_COLD void emitPendingChannelLog(
+    PendingChannelLog event, int pin, fl::size data_size,
+    bool use_dma) FL_NO_EXCEPT {
+    switch (event) {
+#if FL_HAS_WARN
+    case PendingChannelLog::MISSING_ENCODER:
+        FL_WARN("Channel missing encoder for pin " << pin);
+        break;
+    case PendingChannelLog::BUFFER_ACQUIRE_FAILED:
+        FL_WARN("Failed to acquire pooled buffer for pin " << pin << " (" << data_size << " bytes, DMA=" << use_dma << ")");
+        break;
+    case PendingChannelLog::TRANSMIT_FAILED:
+        FL_WARN("[RMT TX] transmit() FAILED on pin " << pin);
+        break;
+#endif
+#if FL_HAS_RMT_LOG
+    case PendingChannelLog::ENABLE_FAILED:
+        FL_LOG_RMT("Failed to enable channel");
+        break;
+    case PendingChannelLog::RESET_FAILED:
+        FL_LOG_RMT("Failed to reset encoder");
+        break;
+    case PendingChannelLog::STARTED:
+        FL_LOG_RMT("Started transmission for pin " << pin << " (" << data_size << " bytes)");
+        break;
+#endif
+    }
+}
+
+} // namespace
+#endif
+
+#if FL_HAS_WARN
+namespace {
+
+enum class RmtChannelWarning : u8 {
+    RX_DMA_CONFLICT,
+    DMA_TX_ALLOCATION_FAILED,
+    DMA_LEDGER_ALLOCATION_FAILED,
+    DMA_ENCODER_CREATION_FAILED,
+    DMA_CHANNEL_CREATION_FAILED,
+    TX_ALLOCATION_FAILED,
+    ENCODER_CREATION_FAILED,
+    RECONFIGURE_CALLBACK_FAILED,
+    RECONFIGURE_CHANNEL_FAILED,
+};
+
+/// Keep failure formatting out of createChannel() and reconfigureForNetwork().
+/// These branches are exceptional and should not inflate their normal paths.
+FL_NO_INLINE FL_COLD void emitRmtChannelWarning(
+    RmtChannelWarning event, int channel_id = 0,
+    fl::size available_words = 0, fl::size requested_words = 0,
+    fl::size dma_channels_in_use = 0) FL_NO_EXCEPT {
+    switch (event) {
+    case RmtChannelWarning::RX_DMA_CONFLICT:
+        FL_WARN("TX Channel: RX channel detected - disabling DMA to avoid TX/RX conflict");
+        break;
+    case RmtChannelWarning::DMA_TX_ALLOCATION_FAILED:
+        FL_WARN("Memory manager TX allocation failed for DMA channel " << channel_id);
+        break;
+    case RmtChannelWarning::DMA_LEDGER_ALLOCATION_FAILED:
+        FL_WARN("DMA hardware creation succeeded but memory manager allocation failed");
+        break;
+    case RmtChannelWarning::DMA_ENCODER_CREATION_FAILED:
+        FL_WARN("Failed to create encoder for DMA channel");
+        break;
+    case RmtChannelWarning::DMA_CHANNEL_CREATION_FAILED:
+        FL_WARN("DMA channel creation failed - unexpected failure on DMA-capable platform, falling back to non-DMA");
+        break;
+    case RmtChannelWarning::TX_ALLOCATION_FAILED:
+        FL_WARN("Memory manager TX allocation failed for channel " << channel_id << " - insufficient on-chip memory");
+        FL_WARN("  Available: " << available_words << " words");
+        FL_WARN("  Requested: " << requested_words << " words");
+        FL_WARN("  DMA channels in use: " << dma_channels_in_use << "/1");
+        break;
+    case RmtChannelWarning::ENCODER_CREATION_FAILED:
+        FL_WARN("Failed to create encoder for channel");
+        break;
+    case RmtChannelWarning::RECONFIGURE_CALLBACK_FAILED:
+        FL_WARN("Failed to re-register callback for reconfigured channel " << channel_id);
+        break;
+    case RmtChannelWarning::RECONFIGURE_CHANNEL_FAILED:
+        FL_WARN("Failed to recreate channel " << channel_id << " during Network reconfiguration");
+        break;
+    }
+}
+
+} // namespace
+#endif
 
 //=============================================================================
 // ChannelEngineRMTImpl - Implementation class
@@ -123,12 +229,12 @@ static IRMT5Peripheral& getDefaultPeripheral() FL_NOEXCEPT {
 class ChannelEngineRMTImpl : public ChannelEngineRMT {
   public:
     // Production constructor: Use default platform peripheral
-    ChannelEngineRMTImpl() FL_NOEXCEPT
+    ChannelEngineRMTImpl() FL_NO_EXCEPT
         : ChannelEngineRMTImpl(getDefaultPeripheral()) {
     }
 
     // Testing constructor: Inject peripheral
-    explicit ChannelEngineRMTImpl(IRMT5Peripheral& peripheral) FL_NOEXCEPT
+    explicit ChannelEngineRMTImpl(IRMT5Peripheral& peripheral) FL_NO_EXCEPT
         : mPeripheral(peripheral),
           mPollNeededCallback(),
           mDMAChannelsInUse(0), mAllocationFailed(false),
@@ -142,20 +248,20 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
 
     ~ChannelEngineRMTImpl() override {
         // The destructor body (drain-wait + per-channel cleanup loop +
-        // FL_WARN timeout diagnostic + FL_LOG_RMT trailer) is a cold path —
+        // FL_WARN timeout diagnostic + FL_LOG_RMT trailer) is a cold path -
         // only reached at process end. Move it into an FL_NO_INLINE helper
         // so its operator<< instantiations + cleanup loop body don't
         // contribute to icache footprint. #2856 item 3.1.
         destructorCleanup();
     }
 
-    FL_NO_INLINE void destructorCleanup() FL_NOEXCEPT {
+    FL_NO_INLINE void destructorCleanup() FL_NO_EXCEPT {
         // Wait for all active transmissions to complete (with timeout)
         // Must wait for READY (not just !BUSY) since poll() can return DRAINING
         int timeout_iterations = 100000; // 10 seconds at 100us per iteration
         DriverState state = poll();
         while (state.state != DriverState::READY && state.state != DriverState::ERROR && timeout_iterations > 0) {
-            task::run(250, task::ExecFlags::SYSTEM);
+            task::yield_system(250);
             timeout_iterations--;
             state = poll();
         }
@@ -200,7 +306,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
     }
 
     // IChannelDriver interface implementation
-    bool canHandle(const ChannelDataPtr& data) const FL_NOEXCEPT override {
+    bool canHandle(const ChannelDataPtr& data) const FL_NO_EXCEPT override {
         if (!data) {
             return false;
         }
@@ -208,11 +314,11 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         return !data->isSpi();
     }
 
-    void enqueue(ChannelDataPtr channelData) FL_NOEXCEPT override {
+    void enqueue(ChannelDataPtr channelData) FL_NO_EXCEPT override {
         mEnqueuedChannels.push_back(channelData);
     }
 
-    void show() FL_NOEXCEPT override {
+    void show() FL_NO_EXCEPT override {
         FL_SCOPED_TRACE;
         if (mEnqueuedChannels.empty()) {
             return;
@@ -237,11 +343,13 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         mTransmittingChannels = fl::move(mEnqueuedChannels);
     }
 
-    DriverState poll() FL_NOEXCEPT override {
+    DriverState poll() FL_NO_EXCEPT override {
         // Check hardware status
         bool anyActive = false;
         int activeCount = 0;
+#ifdef FASTLED_LOG_RMT_ENABLED
         int completedCount = 0;
+#endif
 
         // Check each channel for completion
         for (auto &ch : mChannels) {
@@ -253,9 +361,10 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
             anyActive = true;
 
             if (ch.transmissionComplete.load(fl::memory_order_acquire)) {
+#ifdef FASTLED_LOG_RMT_ENABLED
                 completedCount++;
-                FL_LOG_RMT("Channel on pin " << ch.pin
-                                             << " completed transmission");
+#endif
+                FL_LOG_RMT("Channel on pin " << ch.pin << " completed transmission");
 
                 // Disable channel to release HW resources
                 if (ch.channel) {
@@ -275,10 +384,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
                 // Try to start pending channels
                 processPendingChannels();
             } else {
-                FL_LOG_RMT(
-                    "Channel on pin "
-                    << ch.pin
-                    << " still transmitting (inUse=true, complete=false)");
+                FL_LOG_RMT("Channel on pin " << ch.pin << " still transmitting (inUse=true, complete=false)");
             }
         }
 
@@ -286,11 +392,11 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         if (!mPendingChannels.empty()) {
             anyActive = true;
             FL_LOG_RMT("Pending channels: " << mPendingChannels.size());
-        } else if (activeCount > 0) {
+        } else if (activeCount > 0 || hasChannelInUse()) {
+            // hasChannelInUse(): a release above may have started a pending
+            // strip on an already-visited channel, which activeCount missed.
             anyActive = true;
-            FL_LOG_RMT("No pending channels, but "
-                       << activeCount << " active channels (" << completedCount
-                       << " completed)");
+            FL_LOG_RMT("No pending channels, but " << activeCount << " active channels (" << completedCount << " completed)");
         } else {
             // No active channels and no pending channels
             anyActive = false;
@@ -309,14 +415,14 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         return state;
     }
 
-    void setPollNeededCallback(PollNeededCallback callback) FL_NOEXCEPT override {
+    void setPollNeededCallback(PollNeededCallback callback) FL_NO_EXCEPT override {
         mPollNeededCallback.set(callback);
     }
 
   private:
     /// @brief RMT channel state (replaces RmtWorkerSimple)
     struct ChannelState {
-        ChannelState() FL_NOEXCEPT
+        ChannelState() FL_NO_EXCEPT
             : owner(nullptr),
               channel(nullptr),
               encoder(nullptr),
@@ -329,7 +435,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
               pooledBuffer(),
               memoryChannelId(0) {}
 
-        ChannelState(const ChannelState& other) FL_NOEXCEPT
+        ChannelState(const ChannelState& other) FL_NO_EXCEPT
             : owner(other.owner),
               channel(other.channel),
               encoder(other.encoder),
@@ -342,7 +448,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
               pooledBuffer(other.pooledBuffer),
               memoryChannelId(other.memoryChannelId) {}
 
-        ChannelState& operator=(const ChannelState& other) FL_NOEXCEPT {
+        ChannelState& operator=(const ChannelState& other) FL_NO_EXCEPT {
             if (this != &other) {
                 owner = other.owner;
                 channel = other.channel;
@@ -361,10 +467,10 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
             return *this;
         }
 
-        ChannelState(ChannelState&& other) FL_NOEXCEPT
+        ChannelState(ChannelState&& other) FL_NO_EXCEPT
             : ChannelState(static_cast<const ChannelState&>(other)) {}
 
-        ChannelState& operator=(ChannelState&& other) FL_NOEXCEPT {
+        ChannelState& operator=(ChannelState&& other) FL_NO_EXCEPT {
             return operator=(static_cast<const ChannelState&>(other));
         }
 
@@ -394,7 +500,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
 
     /// @brief Begin LED data transmission for all channels (internal)
     /// @param channelData Span of channel data to transmit
-    void beginTransmission(fl::span<const ChannelDataPtr> channelData) FL_NOEXCEPT {
+    void beginTransmission(fl::span<const ChannelDataPtr> channelData) FL_NO_EXCEPT {
         if (channelData.size() == 0) {
             FL_LOG_RMT("beginTransmission: No channels to transmit");
             return;
@@ -415,12 +521,12 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         // Sort: smallest strips first (helps async parallelism).
         // Container is bounded at 16 by construction (fl::vector_inlined<T, 16>),
         // so use sort_small to avoid instantiating quicksort_impl in the
-        // ClocklessIdf5 transitive closure — see #2907.
+        // ClocklessIdf5 transitive closure - see #2907.
         fl::vector_inlined<ChannelDataPtr, 16> sorted;
         for (const auto& data : channelData) {
             sorted.push_back(data);
         }
-        fl::sort_small(sorted.begin(), sorted.end(), [](const ChannelDataPtr& a, const ChannelDataPtr& b) FL_NOEXCEPT {
+        fl::sort_small(sorted.begin(), sorted.end(), [](const ChannelDataPtr& a, const ChannelDataPtr& b) FL_NO_EXCEPT {
             return a->getSize() > b->getSize();  // Reverse order for back-to-front processing
         });
 
@@ -446,10 +552,10 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
     /// @param dataSize Size of LED data in bytes (0 = use default buffer size)
     /// @return Pointer to channel state, or nullptr if no HW available
     ChannelState *acquireChannel(int pin, const ChipsetTiming &timing,
-                                 fl::size dataSize = 0) FL_NOEXCEPT;
+                                 fl::size dataSize = 0) FL_NO_EXCEPT;
 
     /// @brief Release a channel (marks as available for reuse)
-    void releaseChannel(ChannelState *channel) FL_NOEXCEPT;
+    void releaseChannel(ChannelState *channel) FL_NO_EXCEPT;
 
     /// @brief Out-of-line diagnostic emitters (#2773 item 2.2).
     /// Both messages are ~15 lines of multi-line literal + integer
@@ -461,18 +567,10 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
     /// them tiny, and createChannel shrinks proportionally.
     FL_NO_INLINE void emitRecoveryWarning(
         size_t original_symbols, size_t reduced_symbols,
-        size_t external_words) FL_NOEXCEPT {
-        // Gate the entire body on FASTLED_LOG_RUNTIME_ENABLED. In release
-        // builds (NDEBUG → FASTLED_LOG_VERBOSITY=0 per Stage 1) the
-        // FL_WARN(msg.str()) call at the bottom is a no-op, but the
-        // `fl::sstream msg;` construction and 15 `operator<<` chain calls
-        // above happen unconditionally — they have observable side effects
-        // on msg's internal buffer that the optimizer can't prove away.
-        // Gating collapses the FL_NO_INLINE helper to an effectively-empty
-        // function in release (~5 B vs ~410 B). See #2917 / #2886.
-#if FASTLED_LOG_RUNTIME_ENABLED
-        fl::sstream msg;
-        msg << "\n========================================\n"
+        size_t external_words) FL_NO_EXCEPT {
+        // Recovery diagnostics are opt-in RMT logging; build the message once.
+#if FL_HAS_RMT_LOG
+        FL_LOG_RMT("\n========================================\n"
             << "RMT ALLOCATION RECOVERY - ACTION REQUIRED\n"
             << "========================================\n"
             << "FastLED detected external RMT memory usage!\n"
@@ -488,8 +586,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
             << "\n"
             << "FastLED will continue with reduced buffer size.\n"
             << "Performance may be degraded during WiFi/network activity.\n"
-            << "========================================";
-        FL_WARN(msg.str());
+            << "========================================");
 #else
         (void)original_symbols;
         (void)reduced_symbols;
@@ -501,19 +598,18 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
     /// Extracted from createChannel so the hot path (initial allocation
     /// succeeds, which is the common case at boot) stays small. The retry
     /// loop pulls FL_LOG_RMT/FL_WARN `fl::sstream` operator<< instantiations
-    /// and a per-iteration Rmt5ChannelConfig constructor — all of which the
+    /// and a per-iteration Rmt5ChannelConfig constructor - all of which the
     /// linker would otherwise have to keep live inside the hot function body.
     /// Returns true on successful recovery (caller continues to encoder
     /// creation), false otherwise (caller returns false). Mutates
     /// mem_block_symbols to the recovered size on success. See #2773 item 2.2.
     FL_NO_INLINE bool attemptAllocationRecovery(
         ChannelState *state, int pin, int intr_priority,
-        fl::size &mem_block_symbols) FL_NOEXCEPT {
+        fl::size &mem_block_symbols) FL_NO_EXCEPT {
         auto &memMgr = RmtMemoryManager::instance();
 
-        FL_WARN("RMT channel allocation failed (initial request: "
-                << mem_block_symbols << " symbols)");
-        FL_WARN("Attempting progressive memory reduction recovery...");
+        FL_LOG_RMT("RMT channel allocation failed (initial request: " << mem_block_symbols << " symbols)");
+        FL_LOG_RMT("Attempting progressive memory reduction recovery...");
 
         mConsecutiveAllocationFailures++;
         size_t original_symbols = mem_block_symbols;
@@ -532,13 +628,12 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
             retry_count++;
 
             // Free previous allocation attempt
-            memMgr.free(state->memoryChannelId, true);
+            memMgr.rollbackAllocation(state->memoryChannelId, true);
 
             Rmt5ChannelConfig retry_config(pin, FASTLED_RMT5_CLOCK_HZ,
                                             reduced_symbols, 1, false, intr_priority);
 
-            FL_LOG_RMT("Retry #" << retry_count << ": Attempting " << reduced_symbols
-                       << " symbols (reduced by " << (original_symbols - reduced_symbols) << ")");
+            FL_LOG_RMT("Retry #" << retry_count << ": Attempting " << reduced_symbols << " symbols (reduced by " << ((original_symbols - reduced_symbols)) << ")");
 
             success = mPeripheral.createTxChannel(retry_config, (void**)&state->channel);
             if (success) {
@@ -553,9 +648,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
                 }
 
                 memMgr.recordRecoveryAllocation(state->memoryChannelId, reduced_symbols, true);
-                FL_LOG_RMT("Recovery: Re-added allocation to ledger: "
-                           << reduced_symbols << " words for channel "
-                           << static_cast<int>(state->memoryChannelId));
+                FL_LOG_RMT("Recovery: Re-added allocation to ledger: " << reduced_symbols << " words for channel " << (static_cast<int>(state->memoryChannelId)));
 
                 mem_block_symbols = reduced_symbols;
                 recovery_succeeded = true;
@@ -568,7 +661,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
                                        min_symbols, static_cast<int>(pin));
 
             state->channel = nullptr;
-            memMgr.free(state->memoryChannelId, true);
+            memMgr.rollbackAllocation(state->memoryChannelId, true);
             return false;
         }
 
@@ -577,11 +670,10 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
 
     FL_NO_INLINE void emitAllocationFailureError(
         size_t retry_count, size_t original_symbols, size_t min_symbols,
-        int pin) FL_NOEXCEPT {
-        // Same gating rationale as emitRecoveryWarning above — see #2917.
+        int pin) FL_NO_EXCEPT {
+        // Keep formatting inside the log gate and build the message once.
 #if FASTLED_LOG_RUNTIME_ENABLED
-        fl::sstream msg;
-        msg << "\n========================================\n"
+        FL_ERROR("\n========================================\n"
             << "RMT CHANNEL ALLOCATION FAILED\n"
             << "========================================\n"
             << "FastLED could not allocate RMT channel after " << retry_count << " retry attempts\n"
@@ -595,8 +687,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
             << "  3. Insufficient RMT memory for platform\n"
             << "\n"
             << "LEDs on pin " << pin << " will NOT work!\n"
-            << "========================================";
-        FL_ERROR(msg.str());
+            << "========================================");
 #else
         (void)retry_count;
         (void)original_symbols;
@@ -609,12 +700,12 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
     /// @param dataSize Size of LED data in bytes (0 = use default buffer size)
     /// @return true if channel created successfully
     bool createChannel(ChannelState *state, int pin,
-                       const ChipsetTiming &timing, fl::size dataSize = 0) FL_NOEXCEPT {
+                       const ChipsetTiming &timing, fl::size dataSize = 0) FL_NO_EXCEPT {
         // ============================================================================
         // RMT5 MEMORY MANAGEMENT - Now using centralized RmtMemoryManager
         // ============================================================================
         // Memory allocation policy:
-        // - TX channels: Always double-buffer (2×
+        // - TX channels: Always double-buffer (2x
         // SOC_RMT_MEM_WORDS_PER_CHANNEL)
         // - DMA channels: Bypass on-chip memory (allocated from DRAM instead)
         // - RX channels: User-specified size (managed separately in
@@ -645,12 +736,12 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         auto &memMgr = RmtMemoryManager::instance();
 
         // Get current Network state for memory allocation.
-        // Under FASTLED_RMT_STATIC_ALLOCATION the user has asserted no
+        // Under FL_RMT_STATIC_ALLOCATION the user has asserted no
         // network during LED transmission, so this resolves to a compile-
-        // time constant — the linker then drops the entire NetworkDetector
+        // time constant - the linker then drops the entire NetworkDetector
         // singleton + WiFi-state-reading chain from the binary. See #2856
         // item 3.3.
-#if FASTLED_RMT_STATIC_ALLOCATION
+#if FL_RMT_STATIC_ALLOCATION
         constexpr bool networkActive = false;
 #else
         bool networkActive = NetworkDetector::isAnyNetworkActive();
@@ -681,21 +772,17 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         // This prevents the observed issue where TX transmissions never complete
         // when both TX (DMA) and RX are using the RMT peripheral simultaneously.
         if (tryDMA && memMgr.hasActiveRxChannels()) {
-            FL_WARN("TX Channel: RX channel detected - disabling DMA to avoid TX/RX conflict");
+#if FL_HAS_WARN
+            emitRmtChannelWarning(RmtChannelWarning::RX_DMA_CONFLICT);
+#endif
             tryDMA = false;
         }
         if (tryDMA) {
             // DMA slot available - first channel across TX/RX
-            FL_LOG_RMT("TX Channel #" << (mChannels.size() + 1)
-                                      << ": DMA slot available for pin "
-                                      << static_cast<int>(pin)
-                                      << " (data size: " << dataSize
-                                      << " bytes)");
+            FL_LOG_RMT("TX Channel #" << ((mChannels.size() + 1)) << ": DMA slot available for pin " << (static_cast<int>(pin)) << " (data size: " << dataSize << " bytes)");
         } else {
             // DMA not available (platform doesn't support it, or slot is taken)
-            FL_LOG_RMT("TX Channel #" << (mChannels.size() + 1)
-                       << ": DMA not available, using non-DMA for pin "
-                       << static_cast<int>(pin));
+            FL_LOG_RMT("TX Channel #" << ((mChannels.size() + 1)) << ": DMA not available, using non-DMA for pin " << (static_cast<int>(pin)));
         }
 
         // STEP 1: Try DMA channel creation (first channel only on ESP32-S3)
@@ -705,8 +792,11 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
             size_t dma_alloc_words = 0;
             if (!memMgr.tryAllocateTx(state->memoryChannelId, true,
                                        networkActive, dma_alloc_words)) {
-                FL_WARN("Memory manager TX allocation failed for DMA channel "
-                        << static_cast<int>(state->memoryChannelId));
+#if FL_HAS_WARN
+                emitRmtChannelWarning(
+                    RmtChannelWarning::DMA_TX_ALLOCATION_FAILED,
+                    static_cast<int>(state->memoryChannelId));
+#endif
                 return false;
             }
 
@@ -723,9 +813,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
             // - https://github.com/espressif/esp-idf/issues/12564
             // - https://github.com/espressif/idf-extra-components/issues/466
             fl::size dma_mem_block_symbols = 1024;  // ESP-IDF recommended DMA buffer size
-            FL_LOG_RMT("DMA allocation: "
-                       << dma_mem_block_symbols << " symbols (DMA chunk size) for " << dataSize
-                       << " bytes (" << (dataSize / 3) << " LEDs)");
+            FL_LOG_RMT("DMA allocation: " << dma_mem_block_symbols << " symbols (DMA chunk size) for " << dataSize << " bytes (" << ((dataSize / 3)) << " LEDs)");
 
             // RMT5 interrupt priority is always set to level 3 (highest
             // supported) RMT5 hardware limitation: Cannot boost priority above
@@ -748,11 +836,13 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
                 // DMA SUCCESS - claim DMA slot in memory manager
                 if (!memMgr.allocateDMA(state->memoryChannelId,
                                         true)) { // true = TX channel
-                    FL_WARN("DMA hardware creation succeeded but memory "
-                            "manager allocation failed");
+#if FL_HAS_WARN
+                    emitRmtChannelWarning(
+                        RmtChannelWarning::DMA_LEDGER_ALLOCATION_FAILED);
+#endif
                     mPeripheral.deleteChannel(state->channel);
                     state->channel = nullptr;
-                    memMgr.free(state->memoryChannelId, true);
+                    memMgr.rollbackAllocation(state->memoryChannelId, true);
                     return false;
                 }
 
@@ -765,26 +855,29 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
                 // Create encoder for this DMA channel
                 state->encoder = mPeripheral.createEncoder(timing, FASTLED_RMT5_CLOCK_HZ);
                 if (!state->encoder) {
-                    FL_WARN("Failed to create encoder for DMA channel");
+#if FL_HAS_WARN
+                    emitRmtChannelWarning(
+                        RmtChannelWarning::DMA_ENCODER_CREATION_FAILED);
+#endif
                     mPeripheral.deleteChannel(state->channel);
                     state->channel = nullptr;
                     mDMAChannelsInUse--;
                     // Free DMA and memory allocation
-                    memMgr.freeDMA(state->memoryChannelId, true);
-                    memMgr.free(state->memoryChannelId, true);
+                    memMgr.rollbackDMA(state->memoryChannelId, true);
+                    memMgr.rollbackAllocation(state->memoryChannelId, true);
                     return false;
                 }
 
-                FL_LOG_RMT("✓ TX Channel #"
-                           << (mChannels.size() + 1) << ": DMA enabled on GPIO "
-                           << static_cast<int>(pin) << " ("
-                           << dma_mem_block_symbols << " symbols)");
+                FL_LOG_RMT("TX Channel #" << ((mChannels.size() + 1)) << ": DMA enabled on GPIO " << (static_cast<int>(pin)) << " (" << dma_mem_block_symbols << " symbols)");
                 return true;
             } else {
                 // DMA FAILED - free memory and fall through to non-DMA
                 // Free memory allocation
-                memMgr.free(state->memoryChannelId, true);
-                FL_WARN("DMA channel creation failed - unexpected failure on DMA-capable platform, falling back to non-DMA");
+                memMgr.rollbackAllocation(state->memoryChannelId, true);
+#if FL_HAS_WARN
+                emitRmtChannelWarning(
+                    RmtChannelWarning::DMA_CHANNEL_CREATION_FAILED);
+#endif
             }
         }
 
@@ -797,40 +890,38 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
             // Memory allocation failed - this can happen when:
             // 1. External RMT users (USB CDC, etc.) consume memory
             // 2. Too many non-DMA channels requested
-            // 3. Network mode requires 3× buffering but insufficient memory
+            // 3. Network mode requires 3x buffering but insufficient memory
             //
             // Note: DMA channels consume 0 on-chip words, but ESP32-S3 only has
             // 1 DMA channel. Subsequent channels must use non-DMA (on-chip memory).
-            FL_WARN("Memory manager TX allocation failed for channel "
-                    << static_cast<int>(state->memoryChannelId)
-                    << " - insufficient on-chip memory");
-            FL_WARN("  Available: " << memMgr.availableTxWords() << " words");
-            FL_WARN("  Requested: " << (RmtMemoryManager::calculateMemoryBlocks(networkActive) * SOC_RMT_MEM_WORDS_PER_CHANNEL) << " words");
-            FL_WARN("  DMA channels in use: " << memMgr.getDMAChannelsInUse() << "/1");
+#if FL_HAS_WARN
+            emitRmtChannelWarning(
+                RmtChannelWarning::TX_ALLOCATION_FAILED,
+                static_cast<int>(state->memoryChannelId),
+                memMgr.availableTxWords(),
+                RmtMemoryManager::calculateMemoryBlocks(networkActive) *
+                    SOC_RMT_MEM_WORDS_PER_CHANNEL,
+                memMgr.getDMAChannelsInUse());
+#endif
             return false;
         }
 
         // Apply previously discovered memory reduction offset (from self-healing)
         // This prevents re-running the progressive retry on every allocation
         if (mMemoryReductionOffset > 0 && mem_block_symbols > mMemoryReductionOffset) {
-            FL_LOG_RMT("Applying memory reduction offset: " << mMemoryReductionOffset
-                       << " symbols (learned from previous recovery)");
+            FL_LOG_RMT("Applying memory reduction offset: " << mMemoryReductionOffset << " symbols (learned from previous recovery)");
             mem_block_symbols -= mMemoryReductionOffset;
         }
 
         // Log channel number and allocation type
+#ifdef FASTLED_LOG_RMT_ENABLED
         size_t channel_num = mChannels.size() + 1;
         if (memMgr.getDMAChannelsInUse() > 0) {
-            FL_LOG_RMT("✓ TX Channel #"
-                       << channel_num
-                       << ": Non-DMA (double-buffer: " << mem_block_symbols
-                       << " words) - DMA slot taken by another channel");
+            FL_LOG_RMT("OK TX Channel #" << channel_num << ": Non-DMA (double-buffer: " << mem_block_symbols << " words) - DMA slot taken by another channel");
         } else {
-            FL_LOG_RMT("✓ TX Channel #"
-                       << channel_num
-                       << ": Non-DMA (double-buffer: " << mem_block_symbols
-                       << " words) - No DMA support on platform");
+            FL_LOG_RMT("OK TX Channel #" << channel_num << ": Non-DMA (double-buffer: " << mem_block_symbols << " words) - No DMA support on platform");
         }
+#endif
 
         // RMT5 interrupt priority is always set to level 3 (highest supported)
         // RMT5 hardware limitation: Cannot boost priority above level 3
@@ -872,10 +963,9 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
 
         if (!success) {
             // Non-recoverable error (already at minimum or other failure)
-            FL_LOG_RMT("Failed to create non-DMA RMT channel on pin "
-                       << static_cast<int>(pin));
+            FL_LOG_RMT("Failed to create non-DMA RMT channel on pin " << (static_cast<int>(pin)));
             state->channel = nullptr;
-            memMgr.free(state->memoryChannelId, true);
+            memMgr.rollbackAllocation(state->memoryChannelId, true);
             return false;
         }
 
@@ -890,28 +980,30 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         // Create encoder for this channel
         state->encoder = mPeripheral.createEncoder(timing, FASTLED_RMT5_CLOCK_HZ);
         if (!state->encoder) {
-            FL_WARN("Failed to create encoder for channel");
+#if FL_HAS_WARN
+            emitRmtChannelWarning(
+                RmtChannelWarning::ENCODER_CREATION_FAILED);
+#endif
             mPeripheral.deleteChannel(state->channel);
             state->channel = nullptr;
             // Free memory allocation
-            memMgr.free(state->memoryChannelId, true);
+            memMgr.rollbackAllocation(state->memoryChannelId, true);
             return false;
         }
 
-        FL_WARN("[RMT TX] Channel created on GPIO " << static_cast<int>(pin)
-                << " (" << mem_block_symbols << " symbols, non-DMA)");
+        FL_LOG_RMT("[RMT TX] Channel created on GPIO " << (static_cast<int>(pin)) << " (" << mem_block_symbols << " symbols, non-DMA)");
         return true;
     }
 
     /// @brief Register ISR callback for channel (must be called AFTER
     /// ChannelState is in final location)
     /// @return true if callback registered successfully
-    bool registerChannelCallback(ChannelState *state) FL_NOEXCEPT;
+    bool registerChannelCallback(ChannelState *state) FL_NO_EXCEPT;
 
     /// @brief Configure existing channel (handle pin/timing changes)
     /// @param dataSize Size of LED data in bytes (0 = use default buffer size)
     void configureChannel(ChannelState *state, int pin,
-                          const ChipsetTiming &timing, fl::size dataSize = 0) FL_NOEXCEPT {
+                          const ChipsetTiming &timing, fl::size dataSize = 0) FL_NO_EXCEPT {
         // Check if timing changed - if so, encoder must be recreated
         bool timingChanged =
             state->channel &&
@@ -921,9 +1013,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
 
         // If pin changed, destroy and recreate channel
         if (state->channel && state->pin != pin) {
-            FL_LOG_RMT("Pin changed from " << static_cast<int>(state->pin)
-                                           << " to " << static_cast<int>(pin)
-                                           << ", recreating channel");
+            FL_LOG_RMT("Pin changed from " << (static_cast<int>(state->pin)) << " to " << (static_cast<int>(pin)) << ", recreating channel");
 
             // Wait for any pending transmission to complete
             mPeripheral.waitAllDone(state->channel, 100);
@@ -942,24 +1032,20 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
             // Free DMA and memory allocation
             auto &memMgr = RmtMemoryManager::instance();
             if (state->useDMA) {
-                memMgr.freeDMA(state->memoryChannelId,
-                               true); // true = TX channel
+                memMgr.rollbackDMA(state->memoryChannelId,
+                                   true); // true = TX channel
                 mDMAChannelsInUse--;
             }
-            memMgr.free(state->memoryChannelId, true);
+            memMgr.rollbackAllocation(state->memoryChannelId, true);
 
             state->useDMA = false;
         }
 
         // If timing changed but channel exists, recreate encoder
         if (timingChanged) {
-            FL_LOG_RMT("Timing changed for pin " << static_cast<int>(pin)
-                                                 << ", recreating encoder");
-            FL_LOG_RMT("  Old: T1=" << state->timing.T1
-                                    << " T2=" << state->timing.T2
-                                    << " T3=" << state->timing.T3);
-            FL_LOG_RMT("  New: T1=" << timing.T1 << " T2=" << timing.T2
-                                    << " T3=" << timing.T3);
+            FL_LOG_RMT("Timing changed for pin " << (static_cast<int>(pin)) << ", recreating encoder");
+            FL_LOG_RMT("  Old: T1=" << state->timing.T1 << " T2=" << state->timing.T2 << " T3=" << state->timing.T3);
+            FL_LOG_RMT("  New: T1=" << timing.T1 << " T2=" << timing.T2 << " T3=" << timing.T3);
 
             // Wait for any pending transmission to complete
             mPeripheral.waitAllDone(state->channel, 100);
@@ -982,10 +1068,10 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
                 // Free DMA and memory allocation
                 auto &memMgr = RmtMemoryManager::instance();
                 if (state->useDMA) {
-                    memMgr.freeDMA(state->memoryChannelId, true);
+                    memMgr.rollbackDMA(state->memoryChannelId, true);
                     mDMAChannelsInUse--;
                 }
-                memMgr.free(state->memoryChannelId, true);
+                memMgr.rollbackAllocation(state->memoryChannelId, true);
 
                 state->useDMA = false;
                 return;
@@ -997,8 +1083,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         // Create channel if needed
         if (!state->channel) {
             if (!createChannel(state, pin, timing, dataSize)) {
-                FL_LOG_RMT("Failed to recreate channel for pin "
-                           << static_cast<int>(pin));
+                FL_LOG_RMT("Failed to recreate channel for pin " << (static_cast<int>(pin)));
                 return;
             }
 
@@ -1019,11 +1104,11 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
                 // Free DMA and memory allocation
                 auto &memMgr = RmtMemoryManager::instance();
                 if (state->useDMA) {
-                    memMgr.freeDMA(state->memoryChannelId,
-                                   true); // true = TX channel
+                    memMgr.rollbackDMA(state->memoryChannelId,
+                                       true); // true = TX channel
                     mDMAChannelsInUse--;
                 }
-                memMgr.free(state->memoryChannelId, true);
+                memMgr.rollbackAllocation(state->memoryChannelId, true);
 
                 state->useDMA = false;
                 return;
@@ -1035,8 +1120,31 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         state->transmissionComplete.store(false, fl::memory_order_release);
     }
 
+    FL_NO_INLINE FL_COLD void releaseFailedPendingChannel(
+        ChannelState* channel, bool disable_channel) FL_NO_EXCEPT {
+        if (disable_channel) {
+            mPeripheral.disableChannel(channel->channel);
+        }
+        if (channel->useDMA) {
+            mBufferPool.releaseDMA();
+        } else {
+            mBufferPool.releaseInternal(channel->pooledBuffer);
+        }
+        channel->pooledBuffer = fl::span<u8>();
+        releaseChannel(channel);
+    }
+
+    bool hasChannelInUse() const FL_NO_EXCEPT {
+        for (const auto &ch : mChannels) {
+            if (ch.inUse) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// @brief Process pending channels that couldn't be started earlier
-    void processPendingChannels() FL_NOEXCEPT {
+    void processPendingChannels() FL_NO_EXCEPT {
         if (mPendingChannels.empty()) {
             return;
         }
@@ -1051,13 +1159,33 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
             // Acquire channel for this transmission
             ChannelState* channel = acquireChannel(pending.pin, pending.timing, dataSize);
             if (!channel) {
-                ++i;  // No HW available, leave in queue
+                if (mAllocationFailed && !hasChannelInUse()) {
+                    // A failed setup with no active transmission cannot make
+                    // progress until the next frame, when acquireChannel() is
+                    // allowed to retry. Drop this pending item so poll() can
+                    // return READY and clear its ChannelData in-use flag
+                    // instead of pinning the driver in BUSY forever. While a
+                    // channel is in use, keep waiting: its release lets this
+                    // strip reuse the channel (more strips than channels).
+                    if (i < mPendingChannels.size() - 1) {
+                        mPendingChannels[i] = mPendingChannels.back();
+                    }
+                    mPendingChannels.pop_back();
+                    // The failure belonged to the dropped strip; give each
+                    // remaining strip its own setup attempt this frame.
+                    mAllocationFailed = false;
+                    continue;
+                }
+                ++i;  // Channels may still become available after active TX completes.
                 continue;
             }
 
             // Verify channel has encoder (should always be true if createChannel succeeded)
             if (!channel->encoder) {
-                FL_WARN("Channel missing encoder for pin " << pending.pin);
+#if FL_HAS_WARN
+                emitPendingChannelLog(PendingChannelLog::MISSING_ENCODER,
+                                      pending.pin, dataSize, channel->useDMA);
+#endif
                 releaseChannel(channel);
                 ++i;
                 continue;
@@ -1074,8 +1202,10 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
                 mBufferPool.acquireInternal(dataSize);
 
             if (pooledBuffer.empty()) {
-                FL_WARN("Failed to acquire pooled buffer for pin " << pending.pin
-                        << " (" << dataSize << " bytes, DMA=" << channel->useDMA << ")");
+#if FL_HAS_WARN
+                emitPendingChannelLog(PendingChannelLog::BUFFER_ACQUIRE_FAILED,
+                                      pending.pin, dataSize, channel->useDMA);
+#endif
                 releaseChannel(channel);
                 ++i;
                 continue;
@@ -1090,31 +1220,22 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
 
             bool enable_success = mPeripheral.enableChannel(channel->channel);
             if (!enable_success) {
-                FL_LOG_RMT("Failed to enable channel");
-                // Release buffer back to pool before releasing channel
-                if (channel->useDMA) {
-                    mBufferPool.releaseDMA();
-                } else {
-                    mBufferPool.releaseInternal(channel->pooledBuffer);
-                }
-                channel->pooledBuffer = fl::span<u8>();
-                releaseChannel(channel);
+#if FL_HAS_RMT_LOG
+                emitPendingChannelLog(PendingChannelLog::ENABLE_FAILED,
+                                      pending.pin, dataSize, channel->useDMA);
+#endif
+                releaseFailedPendingChannel(channel, false);
                 ++i;
                 continue;
             }
 
             // Explicitly reset encoder before each transmission to ensure clean state
             if (!mPeripheral.resetEncoder(channel->encoder)) {
-                FL_LOG_RMT("Failed to reset encoder");
-                mPeripheral.disableChannel(channel->channel);
-                // Release buffer back to pool before releasing channel
-                if (channel->useDMA) {
-                    mBufferPool.releaseDMA();
-                } else {
-                    mBufferPool.releaseInternal(channel->pooledBuffer);
-                }
-                channel->pooledBuffer = fl::span<u8>();
-                releaseChannel(channel);
+#if FL_HAS_RMT_LOG
+                emitPendingChannelLog(PendingChannelLog::RESET_FAILED,
+                                      pending.pin, dataSize, channel->useDMA);
+#endif
+                releaseFailedPendingChannel(channel, true);
                 ++i;
                 continue;
             }
@@ -1134,22 +1255,20 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
                                                     pooledBuffer.data(),
                                                     pooledBuffer.size());
             if (!tx_success) {
-                FL_WARN("[RMT TX] transmit() FAILED on pin " << static_cast<int>(channel->pin));
-                mPeripheral.disableChannel(channel->channel);
-                // Release buffer back to pool before releasing channel
-                if (channel->useDMA) {
-                    mBufferPool.releaseDMA();
-                } else {
-                    mBufferPool.releaseInternal(channel->pooledBuffer);
-                }
-                channel->pooledBuffer = fl::span<u8>();
-                releaseChannel(channel);
+#if FL_HAS_WARN
+                emitPendingChannelLog(PendingChannelLog::TRANSMIT_FAILED,
+                                      static_cast<int>(channel->pin), dataSize,
+                                      channel->useDMA);
+#endif
+                releaseFailedPendingChannel(channel, true);
                 ++i;
                 continue;
             }
 
-            FL_LOG_RMT("Started transmission for pin " << pending.pin
-                       << " (" << pending.data->getSize() << " bytes)");
+#if FL_HAS_RMT_LOG
+            emitPendingChannelLog(PendingChannelLog::STARTED, pending.pin,
+                                  pending.data->getSize(), channel->useDMA);
+#endif
 
             // Remove from pending queue (swap with last and pop)
             if (i < mPendingChannels.size() - 1) {
@@ -1162,27 +1281,27 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
 
     /// @brief Destroy a single channel and free resources
     /// @param state Channel state to destroy (must not be in use)
-    void destroyChannel(ChannelState *state) FL_NOEXCEPT;
+    void destroyChannel(ChannelState *state) FL_NO_EXCEPT;
 
     /// @brief Destroy least-used channels to free resources
     /// @param count Number of channels to destroy (from end of mChannels
     /// vector)
-    void destroyLeastUsedChannels(size_t count) FL_NOEXCEPT;
+    void destroyLeastUsedChannels(size_t count) FL_NO_EXCEPT;
 
     /// @brief Calculate target channel count based on network state and
     /// platform
     /// @param networkActive Whether any network (WiFi, Ethernet, or Bluetooth)
     /// is currently active
     /// @return Target number of channels for current state
-    size_t calculateTargetChannelCount(bool networkActive) FL_NOEXCEPT {
+    size_t calculateTargetChannelCount(bool networkActive) FL_NO_EXCEPT {
         if (!networkActive) {
-            // No network: Use maximum channels for platform (2× memory blocks)
+            // No network: Use maximum channels for platform (2x memory blocks)
             #if defined(FL_IS_ESP_32DEV)
-                return 4;  // 512 words ÷ 128 = 4 channels
+                return 4;  // 512 words / 128 = 4 channels
             #elif defined(FL_IS_ESP_32S2)
-                return 2;  // 256 words ÷ 128 = 2 channels
+                return 2;  // 256 words / 128 = 2 channels
             #elif defined(FL_IS_ESP_32S3)
-                return 3;  // 1 DMA + 2 on-chip (192 ÷ 96 = 2)
+                return 3;  // 1 DMA + 2 on-chip (192 / 96 = 2)
             #elif defined(FL_IS_ESP_32C3) || defined(FL_IS_ESP_32C6) || \
                   defined(CONFIG_IDF_TARGET_ESP32H2) || defined(CONFIG_IDF_TARGET_ESP32C5)
                 return 1;  // C3/C6/H2/C5: Only 96 words
@@ -1190,25 +1309,53 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
                 return 1;  // Unknown platform: conservative default
             #endif
         } else {
-            // Network active: Reduce channels to allow 3× buffering (except C3/C6/H2/C5)
+            // Network active: Reduce channels to allow 3x buffering (except C3/C6/H2/C5)
             #if defined(FL_IS_ESP_32DEV)
-                return 2;  // 512 words ÷ 192 = 2 channels (3× buffering)
+                return 2;  // 512 words / 192 = 2 channels (3x buffering)
             #elif defined(FL_IS_ESP_32S2)
-                return 1;  // 256 words ÷ 192 = 1 channel (3× buffering)
+                return 1;  // 256 words / 192 = 1 channel (3x buffering)
             #elif defined(FL_IS_ESP_32S3)
-                return 2;  // 1 DMA + 1 on-chip (192 words ÷ 144 = 1 on-chip with 3×)
+                return 2;  // 1 DMA + 1 on-chip (192 words / 144 = 1 on-chip with 3x)
             #elif defined(FL_IS_ESP_32C3) || defined(FL_IS_ESP_32C6) || \
                   defined(CONFIG_IDF_TARGET_ESP32H2) || defined(CONFIG_IDF_TARGET_ESP32C5)
-                return 1;  // C3/C6/H2/C5: Cannot use 3× (insufficient memory), keep 1 channel
+                return 1;  // C3/C6/H2/C5: Cannot use 3x (insufficient memory), keep 1 channel
             #else
                 return 1;  // Unknown platform: conservative default
             #endif
         }
     }
 
+    /// Callback registration failure is exceptional. Keep its diagnostic and
+    /// rollback sequence out of the normal network-reconfiguration loop.
+    FL_NO_INLINE FL_COLD void handleReconfigureCallbackFailure(
+        ChannelState &state, RmtMemoryManager &memMgr,
+        fl::size channel_index) FL_NO_EXCEPT {
+#if FL_HAS_WARN
+        emitRmtChannelWarning(
+            RmtChannelWarning::RECONFIGURE_CALLBACK_FAILED,
+            static_cast<int>(channel_index));
+#else
+        (void)channel_index;
+#endif
+        if (state.channel) {
+            mPeripheral.deleteChannel(state.channel);
+            state.channel = nullptr;
+        }
+        if (state.encoder) {
+            mPeripheral.deleteEncoder(state.encoder);
+            state.encoder = nullptr;
+        }
+        if (state.useDMA) {
+            memMgr.rollbackDMA(state.memoryChannelId, true);
+            mDMAChannelsInUse--;
+            state.useDMA = false;
+        }
+        memMgr.rollbackAllocation(state.memoryChannelId, true);
+    }
+
     /// @brief Reconfigure channels for network state change (destroy/recreate
     /// as needed)
-    void reconfigureForNetwork() FL_NOEXCEPT {
+    void reconfigureForNetwork() FL_NO_EXCEPT {
         // Check if Network state changed using singleton tracker
         auto& networkTracker = NetworkStateTracker::instance();
         if (!networkTracker.hasChanged()) {
@@ -1217,8 +1364,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
 
         bool networkActive = networkTracker.isActive();
         bool wasNetworkActive = !networkActive;  // Previous state is opposite of current
-        FL_DBG("Network state changed: " << (networkActive ? "ACTIVE" : "INACTIVE")
-               << " (was: " << (wasNetworkActive ? "ACTIVE" : "INACTIVE") << ")");
+        FL_DBG("Network state changed: " << ((networkActive ? "ACTIVE" : "INACTIVE")) << " (was: " << ((wasNetworkActive ? "ACTIVE" : "INACTIVE")) << ")");
 
         // Check if memory allocation size would actually change
         // On platforms like ESP32-C3/C6/H2 with limited memory, network state doesn't affect memory blocks
@@ -1227,13 +1373,11 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         size_t newMemBlocks = RmtMemoryManager::calculateMemoryBlocks(networkActive);
 
         if (oldMemBlocks == newMemBlocks) {
-            FL_DBG("Network state changed but memory allocation size unchanged ("
-                   << newMemBlocks << "× blocks) - skipping reconfiguration");
+            FL_DBG("Network state changed but memory allocation size unchanged (" << newMemBlocks << "x blocks) - skipping reconfiguration");
             return;  // Memory allocation size doesn't change - no need to reconfigure
         }
 
-        FL_DBG("Memory allocation changing from " << oldMemBlocks << "× to "
-               << newMemBlocks << "× blocks due to network state change");
+        FL_DBG("Memory allocation changing from " << oldMemBlocks << "x to " << newMemBlocks << "x blocks due to network state change");
 
         // Calculate target channel count for new Network state
         size_t targetChannels = calculateTargetChannelCount(networkActive);
@@ -1247,7 +1391,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
         }
 
         // PHASE 2: Reconfigure remaining idle channels with new memory allocation
-        // This ensures existing channels use Network-appropriate memory (2× vs 3× blocks)
+        // This ensures existing channels use Network-appropriate memory (2x vs 3x blocks)
         size_t reconfigured = 0;
 
         for (size_t i = 0; i < mChannels.size(); ++i) {
@@ -1259,7 +1403,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
             }
 
             // Destroy the channel and its encoder
-            FL_DBG("Reconfiguring idle channel " << i << " (pin: " << static_cast<int>(state.pin) << ")");
+            FL_DBG("Reconfiguring idle channel " << i << " (pin: " << (static_cast<int>(state.pin)) << ")");
 
             // Delete encoder first
             if (state.encoder) {
@@ -1276,42 +1420,32 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
 
             // Free DMA if this channel was using it
             if (state.useDMA) {
-                memMgr.freeDMA(state.memoryChannelId, true);  // true = TX channel
+                memMgr.rollbackDMA(state.memoryChannelId,
+                                   true);  // true = TX channel
                 mDMAChannelsInUse--;
                 state.useDMA = false;
             }
 
             // Free memory allocation
-            memMgr.free(state.memoryChannelId, true);  // true = TX channel
+            memMgr.rollbackAllocation(state.memoryChannelId,
+                                      true);  // true = TX channel
 
             // Recreate channel with Network-appropriate memory allocation
             // Note: createChannel() will call memMgr.allocateTx() with current Network state
             if (createChannel(&state, state.pin, state.timing, 0)) {
                 // Re-register callback for the recreated channel
                 if (!registerChannelCallback(&state)) {
-                    FL_WARN("Failed to re-register callback for reconfigured channel " << i);
-                    // Channel creation succeeded but callback failed - destroy it
-                    if (state.channel) {
-                        mPeripheral.deleteChannel(state.channel);
-                        state.channel = nullptr;
-                    }
-                    if (state.encoder) {
-                        mPeripheral.deleteEncoder(state.encoder);
-                        state.encoder = nullptr;
-                    }
-                    // Free memory allocation that createChannel() made
-                    if (state.useDMA) {
-                        memMgr.freeDMA(state.memoryChannelId, true);
-                        mDMAChannelsInUse--;
-                        state.useDMA = false;
-                    }
-                    memMgr.free(state.memoryChannelId, true);
+                    handleReconfigureCallbackFailure(state, memMgr, i);
                 } else {
                     reconfigured++;
                     FL_DBG("Successfully reconfigured channel " << i);
                 }
             } else {
-                FL_WARN("Failed to recreate channel " << i << " during Network reconfiguration");
+#if FL_HAS_WARN
+                emitRmtChannelWarning(
+                    RmtChannelWarning::RECONFIGURE_CHANNEL_FAILED,
+                    static_cast<int>(i));
+#endif
             }
         }
 
@@ -1321,7 +1455,7 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
     /// @brief ISR callback for transmission completion
     static bool IRAM_ATTR transmitDoneCallback(
         void* channel, const void* edata,
-        void* user_data) FL_NOEXCEPT;
+        void* user_data) FL_NO_EXCEPT;
 
     /// @brief Peripheral interface (real or mock)
     IRMT5Peripheral& mPeripheral;
@@ -1379,32 +1513,44 @@ class ChannelEngineRMTImpl : public ChannelEngineRMT {
 //=============================================================================
 
 ChannelEngineRMTImpl::ChannelState *ChannelEngineRMTImpl::acquireChannel(
-    int pin, const ChipsetTiming &timing, fl::size dataSize) FL_NOEXCEPT {
+    int pin, const ChipsetTiming &timing, fl::size dataSize) FL_NO_EXCEPT {
     // Strategy 1: Find channel with matching pin (zero-cost reuse)
     // This applies to both DMA and non-DMA channels
-    FL_LOG_RMT("acquireChannel: Finding channel with matching pin "
-               << static_cast<int>(pin));
+    FL_LOG_RMT("acquireChannel: Finding channel with matching pin " << (static_cast<int>(pin)));
     for (auto &ch : mChannels) {
         if (!ch.inUse && ch.channel && ch.pin == pin) {
             ch.inUse = true;
+#if FL_RMT_STATIC_ALLOCATION
+            // The static-allocation contract keeps the channel's pin and
+            // timing immutable after setup, so reuse it without the dynamic
+            // reconfiguration path.
+#else
             configureChannel(&ch, pin, timing, dataSize);
-            FL_LOG_RMT("Reusing " << (ch.useDMA ? "DMA" : "non-DMA")
-                                  << " channel for pin "
-                                  << static_cast<int>(pin));
+#endif
+            FL_LOG_RMT("Reusing " << ((ch.useDMA ? "DMA" : "non-DMA")) << " channel for pin " << (static_cast<int>(pin)));
             return &ch;
         }
     }
 
     // Strategy 2: Find any idle non-DMA channel (requires reconfiguration)
+#if !FL_RMT_STATIC_ALLOCATION
     for (auto &ch : mChannels) {
         if (!ch.inUse && ch.channel && !ch.useDMA) {
             ch.inUse = true;
             configureChannel(&ch, pin, timing, dataSize);
-            FL_LOG_RMT("Reconfiguring idle non-DMA channel for pin "
-                       << static_cast<int>(pin));
+            if (!ch.channel || !ch.encoder) {
+                // Reconfiguration destroyed the old channel and could not
+                // build a new one (e.g. invalid pin). Report failure instead
+                // of handing out a dead channel.
+                ch.inUse = false;
+                mAllocationFailed = true;
+                return nullptr;
+            }
+            FL_LOG_RMT("Reconfiguring idle non-DMA channel for pin " << (static_cast<int>(pin)));
             return &ch;
         }
     }
+#endif
 
     // Strategy 3: Create new channel if HW available
     // BUT: Skip if allocation previously failed (reset at start of next frame
@@ -1428,19 +1574,17 @@ ChannelEngineRMTImpl::ChannelState *ChannelEngineRMTImpl::acquireChannel(
             // Free memory allocation that createChannel() made
             auto &memMgr = RmtMemoryManager::instance();
             if (stablePtr->useDMA) {
-                memMgr.freeDMA(stablePtr->memoryChannelId, true);
+                memMgr.rollbackDMA(stablePtr->memoryChannelId, true);
                 mDMAChannelsInUse--;
             }
-            memMgr.free(stablePtr->memoryChannelId, true);
+            memMgr.rollbackAllocation(stablePtr->memoryChannelId, true);
             mPeripheral.deleteChannel(stablePtr->channel);
             mChannels.pop_back();
             mAllocationFailed = true; // Mark failure
             return nullptr;
         }
 
-        FL_LOG_RMT("Created new channel for pin "
-                   << static_cast<int>(pin) << " (total: " << mChannels.size()
-                   << ")");
+        FL_LOG_RMT("Created new channel for pin " << (static_cast<int>(pin)) << " (total: " << mChannels.size() << ")");
         return stablePtr;
     }
 
@@ -1450,7 +1594,7 @@ ChannelEngineRMTImpl::ChannelState *ChannelEngineRMTImpl::acquireChannel(
     return nullptr;
 }
 
-void ChannelEngineRMTImpl::releaseChannel(ChannelState *channel) FL_NOEXCEPT {
+void ChannelEngineRMTImpl::releaseChannel(ChannelState *channel) FL_NO_EXCEPT {
     FL_ASSERT(channel != nullptr, "releaseChannel called with nullptr");
 
     // CRITICAL: Wait for RMT hardware to fully complete transmission
@@ -1484,7 +1628,7 @@ void ChannelEngineRMTImpl::releaseChannel(ChannelState *channel) FL_NOEXCEPT {
     // NOTE: Keep channel and encoder alive for reuse
 }
 
-bool ChannelEngineRMTImpl::registerChannelCallback(ChannelState *state) FL_NOEXCEPT {
+bool ChannelEngineRMTImpl::registerChannelCallback(ChannelState *state) FL_NO_EXCEPT {
     FL_ASSERT(state != nullptr, "registerChannelCallback called with nullptr");
     FL_ASSERT(state->channel != nullptr,
               "registerChannelCallback called with null channel");
@@ -1502,8 +1646,7 @@ bool ChannelEngineRMTImpl::registerChannelCallback(ChannelState *state) FL_NOEXC
         return false;
     }
 
-    FL_LOG_RMT("Registered callback for channel on GPIO "
-               << static_cast<int>(state->pin));
+    FL_LOG_RMT("Registered callback for channel on GPIO " << (static_cast<int>(state->pin)));
     return true;
 }
 
@@ -1511,7 +1654,7 @@ bool ChannelEngineRMTImpl::registerChannelCallback(ChannelState *state) FL_NOEXC
 // Network-Aware Channel Destruction Helpers
 //=============================================================================
 
-void ChannelEngineRMTImpl::destroyChannel(ChannelState *state) FL_NOEXCEPT {
+void ChannelEngineRMTImpl::destroyChannel(ChannelState *state) FL_NO_EXCEPT {
     FL_ASSERT(state != nullptr, "destroyChannel called with nullptr");
 
     if (!state->channel) {
@@ -1521,8 +1664,7 @@ void ChannelEngineRMTImpl::destroyChannel(ChannelState *state) FL_NOEXCEPT {
     // Wait for transmission to complete (should already be done if !inUse)
     bool wait_success = mPeripheral.waitAllDone(state->channel, 100);
     if (!wait_success) {
-        FL_WARN("destroyChannel: Wait all done timeout for pin "
-                << static_cast<int>(state->pin));
+        FL_WARN("destroyChannel: Wait all done timeout for pin " << (static_cast<int>(state->pin)));
     }
 
     // Delete encoder
@@ -1548,12 +1690,10 @@ void ChannelEngineRMTImpl::destroyChannel(ChannelState *state) FL_NOEXCEPT {
 
     state->useDMA = false;
 
-    FL_LOG_RMT("Destroyed channel on pin "
-               << static_cast<int>(state->pin) << " (memoryChannelId: "
-               << static_cast<int>(state->memoryChannelId) << ")");
+    FL_LOG_RMT("Destroyed channel on pin " << (static_cast<int>(state->pin)) << " (memoryChannelId: " << (static_cast<int>(state->memoryChannelId)) << ")");
 }
 
-void ChannelEngineRMTImpl::destroyLeastUsedChannels(size_t count) FL_NOEXCEPT {
+void ChannelEngineRMTImpl::destroyLeastUsedChannels(size_t count) FL_NO_EXCEPT {
     if (count == 0) {
         return;
     }
@@ -1575,15 +1715,12 @@ void ChannelEngineRMTImpl::destroyLeastUsedChannels(size_t count) FL_NOEXCEPT {
         } else {
             // Cannot destroy in-use channel - skip for now
             // This could happen if WiFi activates during transmission
-            FL_WARN("destroyLeastUsedChannels: Cannot destroy in-use channel "
-                    "on pin "
-                    << static_cast<int>(state.pin) << ", skipping");
+            FL_WARN("destroyLeastUsedChannels: Cannot destroy in-use channel on pin " << (static_cast<int>(state.pin)) << ", skipping");
             break;
         }
     }
 
-    FL_LOG_RMT("Destroyed " << destroyed << " channels (requested: " << count
-                            << ")");
+    FL_LOG_RMT("Destroyed " << destroyed << " channels (requested: " << count << ")");
 }
 
 //=============================================================================
@@ -1612,9 +1749,9 @@ void ChannelEngineRMTImpl::destroyLeastUsedChannels(size_t count) FL_NOEXCEPT {
 /// Without this hardware wait, the following race condition can occur:
 ///   - Frame N transmission starts (RMT hardware reading buffer A)
 ///   - ISR fires (callback sets transmissionComplete = true)
-///   - Main thread calls releaseChannel() → clears mInUse flag
+///   - Main thread calls releaseChannel() -> clears mInUse flag
 ///   - User calls FastLED.show() for Frame N+1
-///   - ClocklessRMT::showPixels() sees mInUse == false → proceeds to encode
+///   - ClocklessRMT::showPixels() sees mInUse == false -> proceeds to encode
 ///   - NEW pixel data overwrites buffer A while RMT is still shifting it out
 ///   - LEDs display corrupted mix of Frame N and Frame N+1 data
 ///
@@ -1629,7 +1766,7 @@ void ChannelEngineRMTImpl::destroyLeastUsedChannels(size_t count) FL_NOEXCEPT {
 /// fail-fast debugging (assertions catch any timing bugs).
 bool IRAM_ATTR ChannelEngineRMTImpl::transmitDoneCallback(
     void* channel, const void* edata,
-    void* user_data) FL_NOEXCEPT {
+    void* user_data) FL_NO_EXCEPT {
     // Note: edata is rmt_tx_done_event_data_t* on ESP32, but we don't use it
     ChannelState *state = static_cast<ChannelState *>(user_data);
     if (!state) {
@@ -1652,7 +1789,7 @@ bool IRAM_ATTR ChannelEngineRMTImpl::transmitDoneCallback(
 // Factory Method Implementation
 //=============================================================================
 
-fl::shared_ptr<ChannelEngineRMT> ChannelEngineRMT::create() FL_NOEXCEPT {
+fl::shared_ptr<ChannelEngineRMT> ChannelEngineRMT::create() FL_NO_EXCEPT {
     return fl::make_shared<ChannelEngineRMTImpl>();
 }
 

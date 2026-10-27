@@ -1,58 +1,33 @@
 # FastLED Docker Images
 
-This directory contains Docker configurations for various FastLED development workflows.
+Docker is used only for the AVR8JS emulator image and the VS Code development
+container. fbuild owns board compilation and native emulator execution.
 
 ## Available Images
 
-### 1. Unit Tests (`docker/unit-tests/`)
+### 1. AVR8JS Emulator (`ci/docker_utils/`)
 
-Ubuntu-based image for running C++ unit tests with clang and cmake.
+Runs Arduino AVR firmware in a JavaScript AVR simulator. Used by the `uno AVR8JS
+Test` GitHub Actions workflow (`.github/workflows/avr8js_uno_test.yml`) to
+validate Uno / ATtiny sketches without hardware.
 
-**Build:**
-```bash
-cd docker/unit-tests
-./build.sh build
-```
+- `ci/docker_utils/Dockerfile.avr8js` — image definition.
+- `ci/docker_utils/avr8js_docker.py` — Python runner (`DockerAVR8jsRunner`).
 
-**Run tests:**
-```bash
-./build.sh run
-```
+See `ci/docker_utils/README.md` for the runner API.
 
-**Interactive shell:**
-```bash
-./build.sh shell
-```
+### 2. VS Code DevContainer (`.devcontainer/`)
 
-**Direct Docker commands:**
-```bash
-# From project root
-docker build -f docker/unit-tests/Dockerfile -t fastled-unit-tests .
-docker run --rm -v "$(pwd):/fastled" fastled-unit-tests bash -c "uv run test.py --cpp"
-```
-
-### 2. Emulators (`ci/docker_utils/`)
-
-Docker images for hardware emulation:
-
-- `Dockerfile.avr8js` — AVR8JS simulator for Arduino Uno emulation (used by `uno AVR8JS Test` workflow).
-- qemu helpers — ESP32 qemu runner for `qemu_esp32*_test.yml` workflows.
-
-See `ci/docker_utils/README.md` for detail.
-
-> **Note**: The PlatformIO cross-compilation Docker images (`niteris/fastled-compiler-*`) that used to live here were decommissioned in #2812 — fbuild is now the default compile backend and does not have the PlatformIO self-poisoning behavior the compiler images were designed to work around.
-
-### 3. VS Code DevContainer (`.devcontainer/`)
-
-Development container for VS Code with Python, QEMU, and build tools pre-installed.
-
-Open the project in VS Code and select "Reopen in Container" when prompted.
+Development container for VS Code with Python, fbuild, the SDL runtime, and
+build tools. fbuild downloads and manages Espressif QEMU on first use; the
+container does not supply a separate QEMU installation. Open the project in VS
+Code and select "Reopen in Container" when prompted.
 
 ## When to Use Which Image
 
-| Use Case | Image |
+| Use Case | How |
 |----------|-------|
-| Run unit tests in clean environment | `docker/unit-tests/` |
-| Run AVR8JS / ESP32 qemu emulator | `ci/docker_utils/` (driven by CI) |
+| Cross-compile for Arduino / ESP32 / etc | `bash compile <board>` (native fbuild, no Docker) |
+| Run C++ unit tests | `bash test --cpp` (native, no Docker) |
+| Run AVR8JS emulator (Uno / ATtiny) | `ci/docker_utils/` (CI-driven; local via `ci.docker_utils.avr8js_docker.DockerAVR8jsRunner`) |
 | VS Code remote development | `.devcontainer/` |
-| Cross-compile for Arduino/ESP32/etc | Native — `bash compile <board>` (no Docker; fbuild backend). |

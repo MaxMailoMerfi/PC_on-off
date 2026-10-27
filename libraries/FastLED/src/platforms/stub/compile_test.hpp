@@ -6,7 +6,7 @@
 #include "fl/stl/noexcept.h"
 
 namespace fl {
-static void stub_compile_tests() FL_NOEXCEPT {
+static void stub_compile_tests() FL_NO_EXCEPT {
 #if FASTLED_USE_PROGMEM != 0
 #error "FASTLED_USE_PROGMEM should be 0 for stub platforms"
 #endif
@@ -26,6 +26,16 @@ static void stub_compile_tests() FL_NOEXCEPT {
 
 #ifndef F_CPU
 #error "F_CPU should be defined for stub platforms"
+#endif
+
+#if defined(FL_IS_WASM)
+#if F_CPU < 1000000
+#error "WASM F_CPU should be reasonably high"
+#endif
+
+#ifndef FASTLED_STUB_IMPL
+#error "FASTLED_STUB_IMPL should be defined for WASM"
+#endif
 #endif
 
 // Stub platforms should define basic pin functions

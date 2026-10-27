@@ -1,17 +1,20 @@
 """Meson compilation utilities."""
 
+import math
 import os
 import re
 import sys
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, cast
 
-from running_process import RunningProcess
+from running_process import RunningProcess, terminate_process_tree
 
+from ci.compile_pch import is_stale_pch_error, purge_pch_artifacts
+from ci.early_exit_cache import native_source_content_hash
 from ci.meson.cache_utils import (
     check_ninja_skip,
     save_ninja_skip_state,
@@ -21,7 +24,17 @@ from ci.meson.link_retry import (
     is_link_permission_denied_error,
     kill_stale_runner_processes,
 )
+from ci.meson.native_input_guard import (
+    NativeInputState,
+    prepare_native_inputs,
+    save_native_inputs,
+)
 from ci.meson.output import print_banner
+from ci.meson.zccache_retry import (
+    find_zccache_transient_failures,
+    format_zccache_transient_message,
+    is_zccache_transient_failure,
+)
 from ci.util.global_interrupt_handler import handle_keyboard_interrupt
 from ci.util.output_formatter import TimestampFormatter
 from ci.util.tee import StreamTee
@@ -33,6 +46,146 @@ from ci.util.timestamp_print import ts_print as _ts_print
 # Each retry waits ``0.5 * (attempt + 1)`` seconds and is preceded by a
 # best-effort kill of any stale runner process under the build directory.
 _LLD_PERM_DENIED_MAX_RETRIES = 3
+
+# Maximum number of retries when zccache returns exit 113 (daemon overloaded
+# or unhealthy) with no compiler diagnostic. Each retry waits
+# ``2.0 * (attempt + 1)`` seconds to let the daemon drain its queue. See #4132.
+_ZCCACHE_TRANSIENT_MAX_RETRIES = 2
+
+# The cold full-debug/ASan build in #4529 took 1130.84s. Leave headroom for
+# slower hosted runners, but keep an absolute bound inside the 45-minute job.
+_COMPILE_HARD_TIMEOUT_SECONDS = 1800
+_COMPILE_QUIET_WARNING_SECONDS = 300.0
+_COMPILE_QUIET_DUMP_SECONDS = 600.0
+_COMPILE_POLL_SECONDS = 1.0
+
+
+class _CompileDeadlineExceeded(RuntimeError):
+    """A non-retryable build failure, even when fuzzy targets are available."""
+
+
+def _compile_process_tree(pid: int | None) -> str:
+    """Describe Meson and its compiler children while they are still alive."""
+    if pid is None:
+        return "Process tree unavailable: no child PID"
+    import psutil  # noqa: PLC0415 - diagnostic-only import
+
+    try:
+        parent = psutil.Process(pid)
+        lines: list[str] = []
+        for process in [parent, *parent.children(recursive=True)]:
+            try:
+                lines.append(
+                    f"PID {process.pid}: {process.status()} "
+                    f"CPU={process.cpu_times()} CMD={process.cmdline()}"
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                lines.append(f"PID {process.pid}: exited or inaccessible")
+        return "\n".join(lines)
+    except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+        return f"Process tree unavailable for PID {pid}: {exc}"
+
+
+def _monitored_compile_lines(
+    proc: RunningProcess,
+    *,
+    command: list[str],
+    target: str | None,
+    started: float,
+    deadline_seconds: float | None = None,
+) -> Generator[str, None, None]:
+    """Drain output while enforcing a wall deadline and quiet diagnostics."""
+    if deadline_seconds is None:
+        deadline_seconds = _COMPILE_HARD_TIMEOUT_SECONDS
+    last_output = time.monotonic()
+    last_milestone = "starting Meson compile"
+    warned = False
+    dumped = False
+    stream_ended = False
+    with proc.line_iter(timeout=_COMPILE_POLL_SECONDS) as lines:
+        while True:
+            now = time.monotonic()
+            elapsed = now - started
+            quiet = now - last_output
+            context = (
+                f"target={target or 'all'} pid={proc.pid} elapsed={elapsed:.0f}s "
+                f"quiet={quiet:.0f}s last={last_milestone}"
+            )
+            if elapsed >= deadline_seconds:
+                _ts_print(
+                    f"[BUILD] ERROR: Hard compilation deadline exceeded; {context}; "
+                    f"command={command}",
+                    file=sys.stderr,
+                )
+                _ts_print(_compile_process_tree(proc.pid), file=sys.stderr)
+                try:
+                    if proc.pid is not None:
+                        terminate_process_tree(proc.pid, timeout_seconds=3.0)
+                except KeyboardInterrupt as ki:
+                    handle_keyboard_interrupt(ki)
+                    raise
+                except Exception as exc:
+                    _ts_print(
+                        f"[BUILD] Process-tree termination failed: {exc}",
+                        file=sys.stderr,
+                    )
+                finally:
+                    proc.kill()
+                raise _CompileDeadlineExceeded(
+                    f"Hard compilation deadline exceeded after {elapsed:.0f}s; "
+                    f"{context}"
+                )
+            if quiet >= _COMPILE_QUIET_WARNING_SECONDS and not warned:
+                _ts_print(
+                    f"[BUILD] WARNING: Compiler still quiet; {context}; "
+                    f"status={proc.poll()}",
+                    file=sys.stderr,
+                )
+                warned = True
+            dump_after = _COMPILE_QUIET_DUMP_SECONDS
+            if (
+                deadline_seconds >= _COMPILE_QUIET_DUMP_SECONDS
+                and deadline_seconds - 5 > _COMPILE_QUIET_WARNING_SECONDS
+            ):
+                dump_after = min(dump_after, deadline_seconds - 5)
+            if quiet >= dump_after and not dumped:
+                _ts_print(
+                    f"[BUILD] Sustained silence: process/tree diagnostic; {context}",
+                    file=sys.stderr,
+                )
+                _ts_print(_compile_process_tree(proc.pid), file=sys.stderr)
+                from ci.util.test_env import dump_thread_stacks
+
+                try:
+                    dump_thread_stacks()
+                except KeyboardInterrupt as ki:
+                    handle_keyboard_interrupt(ki)
+                    raise
+                except Exception as exc:
+                    _ts_print(
+                        f"[BUILD] Stack diagnostic unavailable: {exc}",
+                        file=sys.stderr,
+                    )
+                dumped = True
+            if stream_ended:
+                if proc.poll() is not None:
+                    return
+                time.sleep(_COMPILE_POLL_SECONDS)
+                continue
+            try:
+                line = next(lines)
+            except TimeoutError:
+                continue
+            except StopIteration:
+                stream_ended = True
+                continue
+            last_output = time.monotonic()
+            warned = False
+            dumped = False
+            stripped = line.strip()
+            if stripped and ("[" in stripped or "Compiling" in stripped):
+                last_milestone = stripped[-180:]
+            yield line
 
 
 @dataclass
@@ -51,27 +204,66 @@ class CompileResult:
     # NEW: Extracted error snippet (key error lines with context)
     error_snippet: Optional[str] = None
 
+    # A hard deadline is not a target-name resolution error and must not be
+    # retried as a different fuzzy candidate.
+    timed_out: bool = False
 
-# Error patterns that indicate stale build state recoverable by reconfiguration
-STALE_BUILD_PATTERNS = [
+
+# Stale-build patterns matched ONLY against lines that begin with
+# `ninja: error:`. The previous loose substring match misfired on routine
+# compiler errors that happen to contain "file not found" / "does not exist",
+# each false positive costing a ~20-30s full artifact wipe + reconfigure on
+# the retry. See #3129 A2.
+_NINJA_STALE_BUILD_PATTERNS = (
     "file not found",
     "no such file or directory",
     "missing and no known rule to make it",
     "does not exist",
-    "has been modified since the precompiled header",
     "target not found",  # e.g., all-with-examples missing after enable_examples config change
+)
+
+# Ninja-graph-level phrases that always indicate stale build state regardless
+# of which line prefix they appear on.
+_NINJA_GRAPH_STALE_PHRASES = (
+    "manifest contains a cycle",
+    "failed: regen",
+)
+
+# Backwards-compat re-export. Tests or external scripts that imported the old
+# name still see the same iterable.
+STALE_BUILD_PATTERNS = list(_NINJA_STALE_BUILD_PATTERNS) + [
+    "has been modified since the precompiled header",
 ]
 
 
 def is_stale_build_error(output: str) -> bool:
     """Check if compilation output indicates a stale build state error.
 
-    These errors typically occur when source/header files are renamed or deleted
-    but the build system still references the old paths. They are recoverable
-    by cleaning stale deps and reconfiguring.
+    A line counts as a stale-build trigger only if EITHER:
+    - it starts with ``ninja: error:`` and contains one of the
+      ``_NINJA_STALE_BUILD_PATTERNS`` keywords, OR
+    - it matches one of ``_NINJA_GRAPH_STALE_PHRASES`` (ninja-graph cycle,
+      regen failure), OR
+    - it contains ``has been modified since the precompiled header`` — a
+      clang PCH-staleness error that survives without ninja's prefix.
+
+    Narrowing to ninja's own error output stops the previous loose substring
+    match from misfiring on legitimate compiler errors that happen to contain
+    routine phrases like "file not found" or "does not exist". See #3129 A2.
     """
-    output_lower = output.lower()
-    return any(pattern in output_lower for pattern in STALE_BUILD_PATTERNS)
+    for raw_line in output.splitlines():
+        line_lower = raw_line.strip().lower()
+        if not line_lower:
+            continue
+        if "has been modified since the precompiled header" in line_lower:
+            return True
+        if any(phrase in line_lower for phrase in _NINJA_GRAPH_STALE_PHRASES):
+            return True
+        if line_lower.startswith("ninja: error:") and any(
+            pattern in line_lower for pattern in _NINJA_STALE_BUILD_PATTERNS
+        ):
+            return True
+    return False
 
 
 def _is_compilation_error(line: str) -> bool:
@@ -104,6 +296,234 @@ def _invalidate_stale_pchs(build_dir: Path) -> None:
         invalidate_stale_pch(pch_file)
 
 
+# Sidecar marker recording the build.ninja mtime as of the last successful
+# pre-compile pass (PCH invalidation + zccache strict-path normalize). When
+# build.ninja hasn't changed since that mtime, the pre-compile work is a
+# guaranteed no-op and can be skipped. See #3129 A5.
+_PRECOMPILE_MTIME_MARKER = ".last-precompile-build-ninja-mtime"
+
+
+def _read_precompile_mtime_marker(build_dir: Path) -> "float | None":
+    """Read the saved build.ninja mtime from the sidecar marker.
+
+    Returns None if the marker is missing or unreadable — caller should
+    treat that as "run the pre-compile passes".
+    """
+    marker = build_dir / _PRECOMPILE_MTIME_MARKER
+    try:
+        return float(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_precompile_mtime_marker(build_dir: Path, mtime: float) -> None:
+    """Persist the current build.ninja mtime to the sidecar marker.
+
+    Best-effort: write failures are non-fatal — worst case is the next
+    compile redoes the (idempotent) pre-compile work.
+    """
+    marker = build_dir / _PRECOMPILE_MTIME_MARKER
+    try:
+        marker.write_text(f"{mtime}", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _precompile_passes_can_be_skipped(build_dir: Path) -> bool:
+    """Return True iff build.ninja mtime matches the marker.
+
+    When True, both ``_invalidate_stale_pchs`` and the strict-path
+    normalize call are no-ops by construction (no meson reconfigure has
+    rewritten build.ninja since they last ran), and the ~5-20 ms cost
+    can be skipped. See #3129 A5.
+    """
+    build_ninja = build_dir / "build.ninja"
+    if not build_ninja.exists():
+        return False
+    saved = _read_precompile_mtime_marker(build_dir)
+    if saved is None:
+        return False
+    try:
+        current = build_ninja.stat().st_mtime
+    except OSError:
+        return False
+    return abs(current - saved) < 1e-6
+
+
+@dataclass(slots=True)
+class _RetryOutcome:
+    """Result of ``_retry_ninja``.
+
+    ``output`` accumulates every attempt so downstream diagnostics keep the
+    full context; ``latest`` is the output of the last attempt alone so a
+    subsequent classifier is not confused by failures that an earlier
+    attempt already recovered from.
+    """
+
+    returncode: int
+    output: str
+    latest: str
+
+
+def _run_precompile_passes(build_dir: Path) -> NativeInputState:
+    """Run the passes that must happen before Ninja is invoked.
+
+    The PCH staleness check runs on **every** compile. A PCH is stale when a
+    header it was built from changes, and editing a header does not touch
+    ``build.ninja`` -- so gating this on build.ninja's mtime (as #3129 A5 did)
+    skipped it in exactly the case it exists for, and a build after a header
+    edit died with "file ... has been modified since the precompiled header
+    was built" until ``--clean``. Ninja does not reliably track the PCH's
+    header deps here, which is why the explicit check exists at all.
+
+    The strict-path normalize is different: it repairs what a meson
+    reconfigure writes into ``build.ninja``, so it is a genuine no-op while
+    build.ninja is unchanged, and keeps the A5 mtime shortcut.
+    """
+    # Check for stale PCH before invoking Ninja.  Compilers on Windows
+    # emit absolute backslash paths in depfiles which Ninja may fail to
+    # track correctly, leaving the PCH stale even though headers changed.
+    _invalidate_stale_pchs(build_dir)
+    native_inputs = prepare_native_inputs(
+        build_dir, Path(__file__).resolve().parents[2]
+    )
+    if native_inputs.invalidated:
+        _ts_print(
+            f"[MESON] Invalidated {native_inputs.invalidated} ordinary objects "
+            "whose changed input content is hidden by timestamps"
+        )
+    if _precompile_passes_can_be_skipped(build_dir):
+        return native_inputs
+
+    # Re-normalize strict-path include flags before every compile (#2378).
+    # Meson setup already normalizes once, but ninja can regenerate
+    # build.ninja silently when meson.build files change — that
+    # regeneration re-introduces the relative + backslash
+    # `-Ici/meson/native\fastled.dll.p` form that zccache's
+    # --strict-paths=absolute rejects. Running the normalizer here costs
+    # ~5-20 ms and is idempotent when nothing changed.
+    from ci.meson.build_config import normalize_meson_private_include_paths
+
+    normalize_succeeded = False
+    try:
+        normalize_meson_private_include_paths(build_dir)
+        normalize_succeeded = True
+    except KeyboardInterrupt as ki:
+        # Ctrl-C during normalization — propagate cleanly so the watchdog
+        # and signal-handler chain runs to completion (KBI001).
+        handle_keyboard_interrupt(ki)
+        raise
+    except Exception as e:
+        # Non-fatal: if the normalizer fails for any reason, fall through
+        # to the compile — the worst case is the original zccache strict-
+        # paths error surfaces, which is still better than silently
+        # breaking the build at the normalize step.
+        _ts_print(
+            f"[MESON] ⚠️  Pre-compile normalize_meson_private_include_paths failed: {e}"
+        )
+
+    # Persist the marker only when the normalize succeeded -- otherwise the
+    # next compile retries it. The marker gates the normalize alone.
+    if normalize_succeeded:
+        build_ninja = build_dir / "build.ninja"
+        try:
+            _write_precompile_mtime_marker(build_dir, build_ninja.stat().st_mtime)
+        except OSError:
+            pass
+    return native_inputs
+
+
+def _retry_ninja(
+    cmd: list[str],
+    output: str,
+    max_retries: int,
+    backoff_seconds: float,
+    still_transient: Callable[[str], bool],
+    describe: Callable[[str, int], str],
+    before_retry: Callable[[], None] | None,
+    label: str,
+    started: float,
+    deadline_seconds: float,
+    env: dict[str, str] | None,
+    output_formatter: TimestampFormatter | None,
+) -> _RetryOutcome:
+    """Re-invoke the same ninja command while a transient failure persists.
+
+    Shared by the ld.lld permission-denied retry (#2268) and the zccache
+    exit-113 retry (#4132). ``still_transient`` is evaluated on the output
+    of the *latest* attempt only, so a real defect that surfaces on a retry
+    stops the loop instead of being replayed. ``describe`` receives that
+    latest output and the 1-based attempt number.
+
+    See ``_RetryOutcome`` for what is returned.
+    """
+    returncode = -1
+    latest = output
+    for _attempt in range(max_retries):
+        if time.monotonic() - started >= deadline_seconds:
+            raise _CompileDeadlineExceeded(
+                f"Hard compilation deadline exceeded before {label} retry; "
+                f"command={cmd}"
+            )
+        _ts_print(f"[MESON] ⚠️  {describe(latest, _attempt + 1)}", file=sys.stderr)
+        if before_retry is not None:
+            before_retry()
+        # Linear backoff: gives the daemon / OS / AV time to settle.
+        time.sleep(backoff_seconds * (_attempt + 1))
+        if time.monotonic() - started >= deadline_seconds:
+            raise _CompileDeadlineExceeded(
+                f"Hard compilation deadline exceeded before {label} retry; "
+                f"command={cmd}"
+            )
+        try:
+            retry_proc = RunningProcess(
+                cmd,
+                timeout=max(
+                    1, math.ceil(deadline_seconds - (time.monotonic() - started))
+                ),
+                auto_run=True,
+                check=False,
+                env=env,
+                output_formatter=output_formatter,
+            )
+            for _line in _monitored_compile_lines(
+                retry_proc,
+                command=cmd,
+                target=label,
+                started=started,
+                deadline_seconds=deadline_seconds,
+            ):
+                pass
+            retry_proc.wait(echo=False, timeout=_COMPILE_POLL_SECONDS)
+            returncode = cast(int, retry_proc.returncode)
+            latest = str(retry_proc.stdout)
+            output = output + "\n" + latest
+        except KeyboardInterrupt as ki:
+            handle_keyboard_interrupt(ki)
+            raise
+        except _CompileDeadlineExceeded:
+            raise
+        except Exception as retry_error:
+            _ts_print(
+                f"[MESON] ⚠️  Retry invocation failed: {retry_error}",
+                file=sys.stderr,
+            )
+            break
+
+        if returncode == 0:
+            _ts_print(
+                f"[MESON] ✅ {label} retry succeeded on attempt {_attempt + 1}",
+                file=sys.stderr,
+            )
+            break
+
+        # A different failure means a real defect surfaced — stop retrying
+        # and fall through to normal error handling.
+        if not still_transient(latest):
+            break
+    return _RetryOutcome(returncode, output, latest)
+
+
 def compile_meson(
     build_dir: Path,
     target: Optional[str] = None,
@@ -131,6 +551,8 @@ def compile_meson(
     if build_mode is None:
         if "meson-quick" in str(build_dir):
             build_mode = "quick"
+        elif "meson-debug-thin" in str(build_dir):
+            build_mode = "debug-thin"
         elif "meson-debug" in str(build_dir):
             build_mode = "debug"
         elif "meson-release" in str(build_dir):
@@ -149,43 +571,17 @@ def compile_meson(
     #
     # Only applied to specific targets (not all-build).
     # Overhead: ~20-50ms (os.scandir over tests/ source files). Savings: ~2-3s.
-    if target and check_ninja_skip(build_dir, target):
+    native_inputs = _run_precompile_passes(build_dir)
+    native_source_hash = native_source_content_hash() if target else None
+    if target and not native_inputs.changed and check_ninja_skip(build_dir, target):
         if not quiet:
             _ts_print(f"[BUILD] ✓ Target up-to-date (ninja skipped)")
+        save_native_inputs(native_inputs)
         return CompileResult(
             success=True,
             error_output="",
             suppressed_errors=[],
             error_log_file=None,
-        )
-
-    # Check for stale PCH before invoking Ninja.  Compilers on Windows emit
-    # absolute backslash paths in depfiles which Ninja may fail to track
-    # correctly, leaving the PCH stale even though headers changed.
-    _invalidate_stale_pchs(build_dir)
-
-    # Re-normalize strict-path include flags before every compile (#2378).
-    # Meson setup already normalizes once, but ninja can regenerate
-    # build.ninja silently when meson.build files change — that regeneration
-    # re-introduces the relative + backslash `-Ici/meson/native\fastled.dll.p`
-    # form that zccache's --strict-paths=absolute rejects. Running the
-    # normalizer here costs ~5-20 ms and is idempotent when nothing changed.
-    from ci.meson.build_config import normalize_meson_private_include_paths
-
-    try:
-        normalize_meson_private_include_paths(build_dir)
-    except KeyboardInterrupt as ki:
-        # Ctrl-C during normalization — propagate cleanly so the watchdog
-        # and signal-handler chain runs to completion (KBI001).
-        handle_keyboard_interrupt(ki)
-        raise
-    except Exception as e:
-        # Non-fatal: if the normalizer fails for any reason, fall through
-        # to the compile — the worst case is the original zccache strict-
-        # paths error surfaces, which is still better than silently breaking
-        # the build at the normalize step.
-        _ts_print(
-            f"[MESON] ⚠️  Pre-compile normalize_meson_private_include_paths failed: {e}"
         )
 
     if target:
@@ -225,13 +621,14 @@ def compile_meson(
 
     # Create tee for error log capture (stdout + stderr merged)
     stderr_tee = StreamTee(error_log_path, echo=False)
+    tee_closed = False
     last_error_lines: list[str] = []
 
     try:
         # Use RunningProcess for streaming output
         proc = RunningProcess(
             cmd,
-            timeout=600,  # 10 minute timeout for compilation
+            timeout=_COMPILE_HARD_TIMEOUT_SECONDS,
             auto_run=True,
             check=False,  # We'll check returncode manually
             output_formatter=TimestampFormatter(),
@@ -267,192 +664,172 @@ def compile_meson(
         # Stream output line by line to rewrite Ninja paths
         # In quiet mode or non-verbose mode, suppress all output (errors shown via error filter)
         # In verbose mode, show full compilation output for detailed debugging
-        import time as _time
+        compile_started = time.monotonic()
+        for line in _monitored_compile_lines(
+            proc, command=cmd, target=target, started=compile_started
+        ):
+            # Write to error log (captures both stdout and stderr)
+            stderr_tee.write_line(line)
 
-        last_line_time = _time.time()
-        with proc.line_iter(timeout=None) as it:
-            for line in it:
-                now = _time.time()
-                silence_duration = now - last_line_time
-                last_line_time = now
+            # Track errors for smart detection
+            if _is_compilation_error(line):
+                last_error_lines.append(line)
+                if len(last_error_lines) > 50:
+                    last_error_lines.pop(0)
 
-                # Dump stacks if compilation produced no output for >60s
-                if silence_duration > 60.0:
-                    try:
-                        from ci.util.test_env import dump_thread_stacks
+            # Filter out noisy Meson/Ninja INFO lines that clutter output
+            # Note: TimestampFormatter may add timestamp prefix, so check contains not startswith
+            stripped = line.strip()
+            if " INFO:" in stripped or stripped.startswith("INFO:"):
+                continue  # Skip Meson INFO lines
+            if "Entering directory" in stripped:
+                continue  # Skip Ninja directory change messages
+            if "calculating backend command" in stripped.lower():
+                continue  # Skip Meson backend calculation message
+            # Note: "Can't invoke target" errors are NOT filtered here.
+            # They are preserved in output for caller diagnostics (e.g., ambiguous target).
+            # The caller controls whether to display them via the quiet parameter.
+            if "ninja: no work to do" in stripped.lower():
+                continue  # Skip no-work ninja message (already up to date)
 
-                        _ts_print(
-                            f"[BUILD] WARNING: No output for {silence_duration:.0f}s - dumping stacks"
-                        )
-                        dump_thread_stacks()
-                    except KeyboardInterrupt as ki:
-                        handle_keyboard_interrupt(ki)
-                        raise
-                    except Exception:
-                        pass
-                # Write to error log (captures both stdout and stderr)
-                stderr_tee.write_line(line)
+            # Check for key build milestones (show even in quiet/non-verbose mode)
+            is_key_milestone = False
+            custom_message_shown = False
 
-                # Track errors for smart detection
-                if _is_compilation_error(line):
-                    last_error_lines.append(line)
-                    if len(last_error_lines) > 50:
-                        last_error_lines.pop(0)
-
-                # Filter out noisy Meson/Ninja INFO lines that clutter output
-                # Note: TimestampFormatter may add timestamp prefix, so check contains not startswith
-                stripped = line.strip()
-                if " INFO:" in stripped or stripped.startswith("INFO:"):
-                    continue  # Skip Meson INFO lines
-                if "Entering directory" in stripped:
-                    continue  # Skip Ninja directory change messages
-                if "calculating backend command" in stripped.lower():
-                    continue  # Skip Meson backend calculation message
-                # Note: "Can't invoke target" errors are NOT filtered here.
-                # They are preserved in output for caller diagnostics (e.g., ambiguous target).
-                # The caller controls whether to display them via the quiet parameter.
-                if "ninja: no work to do" in stripped.lower():
-                    continue  # Skip no-work ninja message (already up to date)
-
-                # Check for key build milestones (show even in quiet/non-verbose mode)
-                is_key_milestone = False
-                custom_message_shown = False
-
-                # Check for library archiving (static libraries like libcrash_handler.a)
-                archive_match = archive_pattern.search(stripped)
-                if archive_match:
-                    if "libcrash_handler" in stripped:
-                        is_key_milestone = True
-                        custom_message_shown = True
-                        lib_match = re.search(
-                            r"(ci[\\/]meson[\\/]native[\\/]lib\S+\.a)", stripped
-                        )
-                        if lib_match:
-                            rel_path = lib_match.group(1)
-                            full_path = build_dir / rel_path
-                            try:
-                                display_path = full_path.relative_to(Path.cwd())
-                            except ValueError:
-                                display_path = full_path
-                            _ts_print(f"[BUILD] ✓ Core library: {display_path}")
-                            seen_libcrash_handler = True
-
-                # Check for PCH compilation
-                pch_match = pch_pattern.search(stripped)
-                if pch_match:
+            # Check for library archiving (static libraries like libcrash_handler.a)
+            archive_match = archive_pattern.search(stripped)
+            if archive_match:
+                if "libcrash_handler" in stripped:
                     is_key_milestone = True
                     custom_message_shown = True
-                    seen_pch = True  # Track that we've seen PCH compilation
-                    # Extract PCH path from the line
-                    # Format: "[1/1] Generating tests/test_pch with a custom command"
-                    pch_path_match = re.search(
-                        r"Generating\s+(\S+test_pch)\b", stripped
+                    lib_match = re.search(
+                        r"(ci[\\/]meson[\\/]native[\\/]lib\S+\.a)", stripped
                     )
-                    if pch_path_match:
-                        rel_path = (
-                            pch_path_match.group(1) + ".h.pch"
-                        )  # Add extension for display
+                    if lib_match:
+                        rel_path = lib_match.group(1)
                         full_path = build_dir / rel_path
                         try:
                             display_path = full_path.relative_to(Path.cwd())
                         except ValueError:
                             display_path = full_path
-                        _ts_print(f"[BUILD] ✓ Precompiled header: {display_path}")
+                        _ts_print(f"[BUILD] ✓ Core library: {display_path}")
+                        seen_libcrash_handler = True
 
-                # Check for fastled shared library linking (fastled.dll/fastled.so)
-                test_link_match = link_pattern.search(stripped)
-                if test_link_match:
-                    _link_rel_path = test_link_match.group(1)
-                    _link_stem = Path(_link_rel_path).stem
-                    if _link_stem == "fastled" and Path(
-                        _link_rel_path
-                    ).suffix.lower() in (".dll", ".so", ".dylib"):
-                        is_key_milestone = True
-                        custom_message_shown = True
-                        seen_libfastled = True
-                        _link_full = build_dir / _link_rel_path
-                        try:
-                            _link_display = _link_full.relative_to(Path.cwd())
-                        except ValueError:
-                            _link_display = _link_full
-                        _ts_print(f"[BUILD] ✓ Core library: {_link_display}")
-
-                # Check for test/example linking
-                if test_link_match:
-                    if (
-                        "tests/" in stripped
-                        or "tests\\" in stripped
-                        or "examples/" in stripped
-                        or "examples\\" in stripped
-                    ):
-                        # Exclude test infrastructure (runner.exe is not a test)
-                        # Extract test name from the stripped line
-                        test_name_match = re.search(
-                            r"[\\/](runner|test_runner|example_runner)\.", stripped
-                        )
-                        if not test_name_match:
-                            seen_any_test = (
-                                True  # Track that we've seen at least one test
-                            )
-                            # Show "Building tests..." stage message on first test
-                            if not shown_tests_stage:
-                                _ts_print("[BUILD] Building tests...")
-                                shown_tests_stage = True
-                            is_key_milestone = True
-
-                # Suppress output unless verbose mode enabled
-                # In quiet or non-verbose mode: still print error/failure lines to stderr
-                # In verbose mode: show full compilation output for detailed debugging
-                # WARNING: The milestone detection below (is_key_milestone) requires quiet=False!
-                #   Do NOT suppress milestone messages - they provide essential build progress feedback.
-                if quiet or not verbose:
-                    # Print error and failure lines so compiler errors are never silently swallowed
-                    # Exception: Store "Can't invoke target" errors in validation list (shown on self-healing)
-                    stripped_lower = stripped.lower()
-                    if "error:" in stripped_lower or "FAILED:" in stripped:
-                        # In quiet mode, store "Can't invoke target" errors for later diagnostic use
-                        # These are shown only when self-healing occurs (all targets fail)
-                        if quiet and "can't invoke target" in stripped_lower:
-                            # Cap at 5 errors to prevent list bloat
-                            if len(suppressed_errors) < 5:
-                                suppressed_errors.append(stripped)
-                            continue
-                        _ts_print(line, file=sys.stderr)
-                        continue
-
-                    # Show key milestones even in quiet/non-verbose mode
-                    # But skip if we already printed a custom message (like library path)
-                    if is_key_milestone and not custom_message_shown:
-                        _ts_print(f"[BUILD] {line}")
-
-                    continue
-
-                # Rewrite Ninja paths to show full build-relative paths for clarity
-                # Ninja outputs paths relative to build directory (e.g., "tests/fx_frame.exe")
-                # Users expect to see full paths (e.g., ".build/meson-quick/tests/fx_frame.exe")
-                display_line = line
-                link_match = link_pattern.search(line)
-                if link_match:
-                    rel_path = link_match.group(1)
-                    # Convert build-relative path to project-relative path
+            # Check for PCH compilation
+            pch_match = pch_pattern.search(stripped)
+            if pch_match:
+                is_key_milestone = True
+                custom_message_shown = True
+                seen_pch = True  # Track that we've seen PCH compilation
+                # Extract PCH path from the line
+                # Format: "[1/1] Generating tests/test_pch with a custom command"
+                pch_path_match = re.search(r"Generating\s+(\S+test_pch)\b", stripped)
+                if pch_path_match:
+                    rel_path = (
+                        pch_path_match.group(1) + ".h.pch"
+                    )  # Add extension for display
                     full_path = build_dir / rel_path
                     try:
-                        # Make path relative to project root for cleaner display
                         display_path = full_path.relative_to(Path.cwd())
-                        # Rewrite the line with full path
-                        display_line = line.replace(rel_path, str(display_path))
                     except ValueError:
-                        # If path is outside project, show absolute path
-                        display_line = line.replace(rel_path, str(full_path))
+                        display_path = full_path
+                    _ts_print(f"[BUILD] ✓ Precompiled header: {display_path}")
 
-                # Echo the (possibly rewritten) line (only in verbose mode)
-                _ts_print(display_line)
+            # Check for fastled shared library linking (fastled.dll/fastled.so)
+            test_link_match = link_pattern.search(stripped)
+            if test_link_match:
+                _link_rel_path = test_link_match.group(1)
+                _link_stem = Path(_link_rel_path).stem
+                if _link_stem == "fastled" and Path(_link_rel_path).suffix.lower() in (
+                    ".dll",
+                    ".so",
+                    ".dylib",
+                ):
+                    is_key_milestone = True
+                    custom_message_shown = True
+                    seen_libfastled = True
+                    _link_full = build_dir / _link_rel_path
+                    try:
+                        _link_display = _link_full.relative_to(Path.cwd())
+                    except ValueError:
+                        _link_display = _link_full
+                    _ts_print(f"[BUILD] ✓ Core library: {_link_display}")
 
-        returncode = cast(int, proc.wait())
+            # Check for test/example linking
+            if test_link_match:
+                if (
+                    "tests/" in stripped
+                    or "tests\\" in stripped
+                    or "examples/" in stripped
+                    or "examples\\" in stripped
+                ):
+                    # Exclude test infrastructure (runner.exe is not a test)
+                    # Extract test name from the stripped line
+                    test_name_match = re.search(
+                        r"[\\/](runner|test_runner|example_runner)\.", stripped
+                    )
+                    if not test_name_match:
+                        seen_any_test = True  # Track that we've seen at least one test
+                        # Show "Building tests..." stage message on first test
+                        if not shown_tests_stage:
+                            _ts_print("[BUILD] Building tests...")
+                            shown_tests_stage = True
+                        is_key_milestone = True
+
+            # Suppress output unless verbose mode enabled
+            # In quiet or non-verbose mode: still print error/failure lines to stderr
+            # In verbose mode: show full compilation output for detailed debugging
+            # WARNING: The milestone detection below (is_key_milestone) requires quiet=False!
+            #   Do NOT suppress milestone messages - they provide essential build progress feedback.
+            if quiet or not verbose:
+                # Print error and failure lines so compiler errors are never silently swallowed
+                # Exception: Store "Can't invoke target" errors in validation list (shown on self-healing)
+                stripped_lower = stripped.lower()
+                if "error:" in stripped_lower or "FAILED:" in stripped:
+                    # In quiet mode, store "Can't invoke target" errors for later diagnostic use
+                    # These are shown only when self-healing occurs (all targets fail)
+                    if quiet and "can't invoke target" in stripped_lower:
+                        # Cap at 5 errors to prevent list bloat
+                        if len(suppressed_errors) < 5:
+                            suppressed_errors.append(stripped)
+                        continue
+                    _ts_print(line, file=sys.stderr)
+                    continue
+
+                # Show key milestones even in quiet/non-verbose mode
+                # But skip if we already printed a custom message (like library path)
+                if is_key_milestone and not custom_message_shown:
+                    _ts_print(f"[BUILD] {line}")
+
+                continue
+
+            # Rewrite Ninja paths to show full build-relative paths for clarity
+            # Ninja outputs paths relative to build directory (e.g., "tests/fx_frame.exe")
+            # Users expect to see full paths (e.g., ".build/meson-quick/tests/fx_frame.exe")
+            display_line = line
+            link_match = link_pattern.search(line)
+            if link_match:
+                rel_path = link_match.group(1)
+                # Convert build-relative path to project-relative path
+                full_path = build_dir / rel_path
+                try:
+                    # Make path relative to project root for cleaner display
+                    display_path = full_path.relative_to(Path.cwd())
+                    # Rewrite the line with full path
+                    display_line = line.replace(rel_path, str(display_path))
+                except ValueError:
+                    # If path is outside project, show absolute path
+                    display_line = line.replace(rel_path, str(full_path))
+
+            # Echo the (possibly rewritten) line (only in verbose mode)
+            _ts_print(display_line)
+
+        returncode = cast(int, proc.wait(timeout=_COMPILE_POLL_SECONDS))
 
         # Write standardized footer to error log
         stderr_tee.write_footer(returncode)
         stderr_tee.close()
+        tee_closed = True
 
         # Save last error snippet if compilation failed
         if returncode != 0 and last_error_lines:
@@ -549,63 +926,110 @@ def compile_meson(
         # invocation a few times with a short backoff. This is a no-op on
         # non-Windows platforms because ``is_link_permission_denied_error``
         # returns False off-Windows.
-        if returncode != 0 and is_link_permission_denied_error(output):
-            for _attempt in range(_LLD_PERM_DENIED_MAX_RETRIES):
-                _ts_print(
-                    f"[MESON] ⚠️  ld.lld permission denied on runner binary "
-                    f"(attempt {_attempt + 1}/{_LLD_PERM_DENIED_MAX_RETRIES}) - "
-                    f"killing stale runner processes and retrying",
-                    file=sys.stderr,
+        latest_output = output
+        if returncode != 0 and is_link_permission_denied_error(latest_output):
+
+            def _describe_lld(_latest: str, attempt: int) -> str:
+                return (
+                    f"ld.lld permission denied on runner binary "
+                    f"(attempt {attempt}/{_LLD_PERM_DENIED_MAX_RETRIES}) - "
+                    f"killing stale runner processes and retrying"
                 )
+
+            def _before_lld_retry() -> None:
                 _killed_retry = kill_stale_runner_processes(build_dir)
                 if _killed_retry:
                     _ts_print(
                         f"[MESON] 🧹 Killed {_killed_retry} stale runner process(es)",
                         file=sys.stderr,
                     )
-                # Backoff 0.5s, 1.0s, 1.5s — gives Windows/AV time to release
-                # any remaining handles on the .exe.
-                time.sleep(0.5 * (_attempt + 1))
 
-                # Re-invoke ninja for the same compile command. We reuse the
-                # original ``cmd`` (meson compile -C build_dir [target]) so
-                # ninja does an incremental relink of just the failed target.
-                try:
-                    retry_proc = RunningProcess(
-                        cmd,
-                        timeout=600,
-                        auto_run=True,
-                        check=False,
-                        output_formatter=TimestampFormatter(),
-                    )
-                    retry_proc.wait(echo=False)
-                    returncode = cast(int, retry_proc.returncode)
-                    retry_output = str(retry_proc.stdout)
-                    # Merge retry output into the captured output so downstream
-                    # diagnostics include the retry context.
-                    output = output + "\n" + retry_output
-                except KeyboardInterrupt as ki:
-                    handle_keyboard_interrupt(ki)
-                    raise
-                except Exception as retry_error:
-                    _ts_print(
-                        f"[MESON] ⚠️  Retry invocation failed: {retry_error}",
-                        file=sys.stderr,
-                    )
-                    break
+            _outcome = _retry_ninja(
+                cmd,
+                output,
+                max_retries=_LLD_PERM_DENIED_MAX_RETRIES,
+                backoff_seconds=0.5,
+                still_transient=is_link_permission_denied_error,
+                describe=_describe_lld,
+                before_retry=_before_lld_retry,
+                label="Link",
+                started=compile_started,
+                deadline_seconds=_COMPILE_HARD_TIMEOUT_SECONDS,
+                env=None,
+                output_formatter=TimestampFormatter(),
+            )
+            returncode = _outcome.returncode
+            output = _outcome.output
+            latest_output = _outcome.latest
 
-                if returncode == 0:
-                    _ts_print(
-                        f"[MESON] ✅ Link retry succeeded on attempt {_attempt + 1}",
-                        file=sys.stderr,
-                    )
-                    break
+        # zccache exit-113 retry (#4132).
+        # zccache under load sometimes returns 113 without running the
+        # compiler. That is a daemon problem, not a defect in the code being
+        # built, so name it as such and re-invoke ninja: only the failed
+        # objects rebuild, and the daemon has had a moment to drain.
+        if returncode != 0 and is_zccache_transient_failure(latest_output):
 
-                # Only keep retrying while the failure is still the same
-                # permission-denied pattern. A different failure means the
-                # retry loop is done (fall through to normal error handling).
-                if not is_link_permission_denied_error(retry_output):
-                    break
+            def _describe_zccache(latest: str, attempt: int) -> str:
+                return (
+                    format_zccache_transient_message(
+                        find_zccache_transient_failures(latest)
+                    )
+                    + f"\n  Retrying the build "
+                    f"(attempt {attempt}/{_ZCCACHE_TRANSIENT_MAX_RETRIES})"
+                )
+
+            _outcome = _retry_ninja(
+                cmd,
+                output,
+                max_retries=_ZCCACHE_TRANSIENT_MAX_RETRIES,
+                backoff_seconds=2.0,
+                still_transient=is_zccache_transient_failure,
+                describe=_describe_zccache,
+                before_retry=None,
+                label="zccache",
+                started=compile_started,
+                deadline_seconds=_COMPILE_HARD_TIMEOUT_SECONDS,
+                env=None,
+                output_formatter=TimestampFormatter(),
+            )
+            returncode = _outcome.returncode
+            output = _outcome.output
+            latest_output = _outcome.latest
+
+        # Recover from Clang stale-header errors and explicit zccache rebuild
+        # refusals, including legacy chained PCHs without import provenance.
+        # Drop only PCH artifacts and retry once within the original deadline.
+        if returncode != 0 and is_stale_pch_error(latest_output, build_dir):
+
+            def _describe_pch(_latest: str, _attempt: int) -> str:
+                return (
+                    "STALE PCH DETECTED: compiler or zccache rejected a "
+                    "precompiled header. Purging PCHs and retrying once."
+                )
+
+            def _before_pch_retry() -> None:
+                removed = purge_pch_artifacts(build_dir)
+                _ts_print(
+                    f"[MESON] 🗑️  Purged {removed} PCH artifact(s)", file=sys.stderr
+                )
+
+            _outcome = _retry_ninja(
+                cmd,
+                output,
+                max_retries=1,
+                backoff_seconds=0.0,
+                still_transient=lambda latest: is_stale_pch_error(latest, build_dir),
+                describe=_describe_pch,
+                before_retry=_before_pch_retry,
+                label="Stale-PCH",
+                started=compile_started,
+                deadline_seconds=_COMPILE_HARD_TIMEOUT_SECONDS,
+                env=None,
+                output_formatter=TimestampFormatter(),
+            )
+            returncode = _outcome.returncode
+            output = _outcome.output
+            latest_output = _outcome.latest
 
         if returncode != 0:
             # In quiet mode, don't print failure messages (fallback retries handle this)
@@ -670,7 +1094,8 @@ def compile_meson(
 
         # Save ninja skip state so the next run can bypass ninja for this target.
         if target:
-            save_ninja_skip_state(build_dir, target)
+            save_ninja_skip_state(build_dir, target, source_hash=native_source_hash)
+        save_native_inputs(native_inputs)
 
         return CompileResult(
             success=True,
@@ -679,6 +1104,22 @@ def compile_meson(
             error_log_file=None,  # Success - no error log needed
         )
 
+    except _CompileDeadlineExceeded as exc:
+        if tee_closed:
+            # Retry failures occur after the initial attempt's tee is closed.
+            with error_log_path.open("a", encoding="utf-8") as error_log:
+                error_log.write(f"{exc}\n")
+        else:
+            stderr_tee.write_line(str(exc))
+            stderr_tee.write_footer(-1)
+            stderr_tee.close()
+        return CompileResult(
+            success=False,
+            error_output=str(exc),
+            suppressed_errors=[],
+            error_log_file=error_log_path,
+            timed_out=True,
+        )
     except KeyboardInterrupt as ki:
         handle_keyboard_interrupt(ki)
         raise

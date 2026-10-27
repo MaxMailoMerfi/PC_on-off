@@ -20,6 +20,7 @@ from running_process import RunningProcess
 from ci.meson.build_timer import BuildTimer
 from ci.meson.cache_utils import save_test_result_state
 from ci.meson.compile import CompileResult, _is_compilation_error, compile_meson
+from ci.meson.mtime_stabilizer import restore_executable_bits
 from ci.meson.output import print_banner, print_error, print_success
 from ci.meson.phase_tracker import PhaseTracker
 from ci.meson.runner_helpers import _apply_phase_timing, _write_failure_log
@@ -223,6 +224,10 @@ def run_sequential_compile(
             break
         last_error_output = result.error_output
         all_suppressed_errors.extend(result.suppressed_errors)
+        if result.timed_out:
+            # A wall-clock deadline is a real build failure, not a missing or
+            # ambiguous Meson target. A later fuzzy candidate cannot mask it.
+            break
 
     ctx.build_timer.checkpoint("compile_done")
 
@@ -335,7 +340,7 @@ def _resolve_test_command(
 def _make_direct_test_env(
     source_dir: Path, build_dir: Path, build_mode: str
 ) -> dict[str, str]:
-    """Build env for the direct test subprocess (PATH/LD_LIBRARY_PATH + ASAN)."""
+    """Build env for the direct test process (PATH/LD_LIBRARY_PATH + ASAN)."""
     test_env = os.environ.copy()
     fastled_lib_dir = str(build_dir / "ci" / "meson" / "native")
     if os.name == "nt":
@@ -464,6 +469,14 @@ def run_direct_test(ctx: DirectTestContext) -> MesonTestResult:
             num_tests_passed=0,
             num_tests_failed=0,
         )
+
+    # After resolution, not before: `_resolve_test_command` may relink the
+    # runner, and a link zccache serves from its cache comes back without the
+    # executable bit (FastLED#4205). `test_execution.py` restores it on the
+    # `meson test` path; this is the other way a test binary gets spawned, and
+    # it had no such call -- so a single named test died on
+    # `Permission denied (os error 13)` with nothing pointing at the mode.
+    restore_executable_bits(ctx.build_dir)
 
     print_banner("Test", "▶️", verbose=ctx.verbose)
     print(f"Running: {ctx.meson_test_name}")

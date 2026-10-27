@@ -9,6 +9,7 @@
 #include "fl/stl/span.h"
 #include "fl/stl/shared_ptr.h"
 #include "fl/stl/has_include.h"
+#include "fl/stl/noexcept.h"
 
 #if !FL_HAS_INCLUDE(<Arduino.h>)
   #error "This implementation requires Arduino.h - compile with Arduino framework"
@@ -20,24 +21,27 @@
 // IWYU pragma: end_keep
 #include "platforms/is_platform.h"
 
-// Check for Arduino I2S library availability and completeness
-#if defined(FL_IS_SAMD21)
-#define ARDUINO_I2S_FULLY_SUPPORTED 0
-#define ARDUINO_I2S_BROKEN_REASON "I2S not supported on SAMD21"
-#elif FL_HAS_INCLUDE(<I2S.h>)
-// IWYU pragma: begin_keep
-#include <I2S.h>
-#include "fl/stl/noexcept.h"
-// IWYU pragma: end_keep
-
-// Define ARDUINO_I2S_FULLY_SUPPORTED only when ALL I2S components are present and functional
+// Check known-broken platforms before probing or including I2S.h. On Renesas
+// boards the library header can exist while including it fails because the
+// bundled FSP does not provide r_i2s_api.h.
 #if defined(ARDUINO_UNOR4_WIFI) || defined(ARDUINO_UNOR4_MINIMA) || \
     defined(ARDUINO_ARCH_RENESAS) || defined(ARDUINO_ARCH_RENESAS_UNO) || \
     defined(_RENESAS_RA_) || defined(ARDUINO_FSP)
-    // Known broken: Renesas RA platforms with incomplete FSP I2S support
-    #define ARDUINO_I2S_FULLY_SUPPORTED 0
-    #define ARDUINO_I2S_BROKEN_REASON "Renesas FSP missing r_i2s_api.h header"
-#elif !defined(I2S_PHILIPS_MODE) || !defined(I2S_LEFT_JUSTIFIED_MODE) || !defined(I2S_RIGHT_JUSTIFIED_MODE)
+#define ARDUINO_I2S_FULLY_SUPPORTED 0
+#define ARDUINO_I2S_BROKEN_REASON "Renesas FSP missing r_i2s_api.h header"
+#elif defined(FL_IS_SAMD21)
+#define ARDUINO_I2S_FULLY_SUPPORTED 0
+#define ARDUINO_I2S_BROKEN_REASON "I2S not supported on SAMD21"
+#elif defined(FL_IS_SAMD51)
+#define ARDUINO_I2S_FULLY_SUPPORTED 0
+#define ARDUINO_I2S_BROKEN_REASON "Arduino I2S library is incompatible with SAMD51"
+#elif FL_HAS_INCLUDE(<I2S.h>)
+// IWYU pragma: begin_keep
+#include <I2S.h>
+// IWYU pragma: end_keep
+
+// Define ARDUINO_I2S_FULLY_SUPPORTED only when ALL I2S components are present and functional
+#if !defined(I2S_PHILIPS_MODE) || !defined(I2S_LEFT_JUSTIFIED_MODE) || !defined(I2S_RIGHT_JUSTIFIED_MODE)
     // Missing essential I2S mode constants - incomplete library implementation
     #define ARDUINO_I2S_FULLY_SUPPORTED 0
     #define ARDUINO_I2S_BROKEN_REASON "Missing I2S mode constants (incomplete library)"
@@ -61,14 +65,14 @@ namespace fl {
 
 class Arduino_I2S_Audio : public audio::IInput {
 public:
-    Arduino_I2S_Audio(const audio::ConfigI2S &config)
+    Arduino_I2S_Audio(const audio::ConfigI2S &config) FL_NO_EXCEPT
         : mConfig(config), mHasError(false), mTotalSamplesRead(0), mInitialized(false) {}
 
-    ~Arduino_I2S_Audio() {
+    ~Arduino_I2S_Audio() FL_NO_EXCEPT {
         stop();
     }
 
-    void start() FL_NOEXCEPT override {
+    void start() FL_NO_EXCEPT override {
         if (mInitialized) {
             FL_WARN("Arduino I2S is already initialized");
             return;
@@ -98,7 +102,7 @@ public:
         FL_WARN("Arduino I2S audio input started successfully");
     }
 
-    void stop() FL_NOEXCEPT override {
+    void stop() FL_NO_EXCEPT override {
         if (!mInitialized) {
             return;
         }
@@ -109,14 +113,14 @@ public:
         FL_WARN("Arduino I2S audio input stopped");
     }
 
-    bool error(fl::string *msg = nullptr) FL_NOEXCEPT override {
+    bool error(fl::string *msg = nullptr) FL_NO_EXCEPT override {
         if (msg && mHasError) {
             *msg = mErrorMessage;
         }
         return mHasError;
     }
 
-    audio::Sample read() FL_NOEXCEPT override {
+    audio::Sample read() FL_NO_EXCEPT override {
         if (!mInitialized) {
             FL_WARN("Arduino I2S is not initialized");
             return audio::Sample();  // Invalid sample
@@ -170,7 +174,7 @@ public:
         // Update total samples counter
         mTotalSamplesRead += samples_read;
 
-        fl::span<const i16> data(buffer, samples_read) FL_NOEXCEPT;
+        fl::span<const i16> data(buffer, samples_read);
         return audio::Sample(data, timestamp_ms);
     }
 
@@ -181,7 +185,7 @@ private:
     bool mInitialized;
     u64 mTotalSamplesRead;
 
-    int convertCommFormatToMode(audio::I2SCommFormat format) FL_NOEXCEPT {
+    int convertCommFormatToMode(audio::I2SCommFormat format) FL_NO_EXCEPT {
         // Map FastLED I2S formats to Arduino I2S modes
         switch (format) {
             case audio::I2SCommFormat::Philips:
@@ -198,7 +202,7 @@ private:
 };
 
 // Platform-specific audio input creation function for Arduino
-fl::shared_ptr<audio::IInput> arduino_create_audio_input(const audio::Config& config, fl::string* error_message = nullptr) FL_NOEXCEPT {
+fl::shared_ptr<audio::IInput> arduino_create_audio_input(const audio::Config& config, fl::string* error_message = nullptr) FL_NO_EXCEPT {
     if (config.is<audio::ConfigI2S>()) {
         FL_WARN("Creating Arduino I2S audio source");
         audio::ConfigI2S i2s_config = config.get<audio::ConfigI2S>();
@@ -223,7 +227,7 @@ fl::shared_ptr<audio::IInput> arduino_create_audio_input(const audio::Config& co
 #else // !ARDUINO_I2S_FULLY_SUPPORTED
 
 // Null audio implementation fallback for platforms without complete I2S support
-fl::shared_ptr<audio::IInput> arduino_create_audio_input(const audio::Config& config, fl::string* error_message = nullptr) FL_NOEXCEPT {
+fl::shared_ptr<audio::IInput> arduino_create_audio_input(const audio::Config& config, fl::string* error_message = nullptr) FL_NO_EXCEPT {
     FL_UNUSED(config);
 #ifdef ARDUINO_I2S_BROKEN_REASON
     const char* ERROR_MESSAGE = "Arduino I2S not supported: " ARDUINO_I2S_BROKEN_REASON;

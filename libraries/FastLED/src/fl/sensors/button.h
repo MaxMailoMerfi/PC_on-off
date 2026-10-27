@@ -31,16 +31,16 @@ enum class ButtonStrategy {
 // api. Note that this class does not support analog mode nor pullups/pulldowns.
 class ButtonLowLevel {
   public:
-    ButtonLowLevel(int pin, ButtonStrategy strategy = ButtonStrategy::kHighLowFloating);
-    ~ButtonLowLevel() FL_NOEXCEPT;
-    ButtonLowLevel(const ButtonLowLevel &other) FL_NOEXCEPT = default;
-    ButtonLowLevel &operator=(const ButtonLowLevel &other) FL_NOEXCEPT = delete;
-    ButtonLowLevel(ButtonLowLevel &&other) FL_NOEXCEPT = delete;
-    bool isPressed();
+    ButtonLowLevel(int pin, ButtonStrategy strategy = ButtonStrategy::kHighLowFloating) FL_NO_EXCEPT;
+    ~ButtonLowLevel() FL_NO_EXCEPT;
+    ButtonLowLevel(const ButtonLowLevel &other) FL_NO_EXCEPT = default;
+    ButtonLowLevel &operator=(const ButtonLowLevel &other) FL_NO_EXCEPT = delete;
+    ButtonLowLevel(ButtonLowLevel &&other) FL_NO_EXCEPT = delete;
+    bool isPressed() FL_NO_EXCEPT;
 
-    bool highLowFloating();
+    bool highLowFloating() FL_NO_EXCEPT;
 
-    void setStrategy(ButtonStrategy strategy);
+    void setStrategy(ButtonStrategy strategy) FL_NO_EXCEPT;
 
   private:
     fl::DigitalPin mPin;
@@ -53,30 +53,30 @@ class ButtonLowLevel {
 class Button : public IButtonInput {
   public:
     Button(int pin,
-           ButtonStrategy strategy = ButtonStrategy::kHighLowFloating);
+           ButtonStrategy strategy = ButtonStrategy::kHighLowFloating) FL_NO_EXCEPT;
 
-    int onClick(fl::function<void()> callback);
-    void removeOnClick(int id) {
+    int onClick(fl::function<void()> callback) FL_NO_EXCEPT;
+    void removeOnClick(int id) FL_NO_EXCEPT {
         mOnClickCallbacks.remove(id);
     }
 
-    void setStrategy(ButtonStrategy strategy) {
+    void setStrategy(ButtonStrategy strategy) FL_NO_EXCEPT {
         mButton.setStrategy(strategy);
     }
 
-    bool isPressed() const FL_NOEXCEPT override {
+    bool isPressed() const FL_NO_EXCEPT override {
         return mButton.isPressed();
     }
 
-    bool clicked() const FL_NOEXCEPT override {
+    bool clicked() const FL_NO_EXCEPT override {
         return mClickedThisFrame;
     }
 
   protected:
     struct Listener : public EngineEvents::Listener {
-        Listener(Button *owner);
-        ~Listener() FL_NOEXCEPT;
-        void addToEngineEventsOnce();
+        Listener(Button *owner) FL_NO_EXCEPT;
+        ~Listener() FL_NO_EXCEPT;
+        void addToEngineEventsOnce() FL_NO_EXCEPT;
 
         // We do an experiment here, what about listening to the end frame event
         // instea do of the begin frame event? This will put the activation of
@@ -84,7 +84,7 @@ class Button : public IButtonInput {
         // used for all UI elements, so that the button state is updated before
         // the next frame is drawn. This seems like the only way to do this, or
         // by using platform pre loop, but not all platforms support that.
-        void onEndFrame() override;
+        void onEndFrame() FL_NO_EXCEPT override;
 
       private:
         Button *mOwner;

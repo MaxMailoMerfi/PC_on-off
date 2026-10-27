@@ -64,7 +64,12 @@
     #include "platforms/arm/mgm240/watchdog_mgm240.impl.hpp"
 #elif defined(FL_IS_AVR) && FL_HAS_INCLUDE(<avr/wdt.h>)
     #include "platforms/avr/watchdog_avr.impl.hpp"
-#elif defined(FL_IS_ARM_LPC)
+#elif defined(FL_IS_ARM_LPC_845) || defined(FL_IS_ARM_LPC_804)
+    // Only the chips whose vendor CMSIS PAL ships in ArduinoCore-LPC8xx
+    // (<LPC845.h> / <LPC804.h>). LPC11xx / LPC15xx have different SYSCON
+    // layouts and no in-tree PAL — they take the no-op fallback below
+    // (the previous hand-rolled impl poked LPC84x register addresses on
+    // them, which was silently wrong).
     #include "platforms/arm/lpc/watchdog_lpc.impl.hpp"
 #else
     // Fallback: no real or emulated WDT available — all methods are no-ops.
@@ -79,3 +84,10 @@
 // `src/fl/wdt/_build.cpp.hpp` — included from the regular fl/ unity build,
 // not from here. Including `.cpp.hpp` files outside the unity build is a
 // hard ban per agents/docs/cpp-standards.md.
+
+// Boot-guard counter storage (fl/wdt/boot_guard.h): platforms that keep it in
+// reset-persistent memory define FL_WATCHDOG_HAS_BOOT_GUARD_STORAGE and
+// supply it in their impl; everywhere else the counter is always 0.
+#if !defined(FL_WATCHDOG_HAS_BOOT_GUARD_STORAGE)
+    #include "platforms/shared/watchdog_boot_guard_noop.hpp"
+#endif

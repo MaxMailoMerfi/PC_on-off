@@ -8,6 +8,7 @@
 #include "fl/log/log.h"
 #include "fl/system/delay.h"
 #include "fl/stl/vector.h"
+#include "fl/stl/noexcept.h"
 
 namespace fl {
 namespace validation {
@@ -17,7 +18,7 @@ bool testRxChannel(
     int pin_tx,
     int pin_rx,
     u32 hz,
-    size_t buffer_size) {
+    size_t buffer_size) FL_NO_EXCEPT {
 
     FL_WARN("[RX TEST] Testing RX channel with manual GPIO toggle on PIN " << pin_tx);
 
@@ -64,7 +65,7 @@ bool testRxChannel(
 
     // Check if we successfully captured data
     if (wait_result != fl::RxWaitResult::SUCCESS) {
-        FL_ERROR("[RX TEST]: RX channel wait failed (result: " << static_cast<int>(wait_result) << ")");
+        FL_ERROR("[RX TEST]: RX channel wait failed (result: " << (static_cast<int>(wait_result)) << ")");
         FL_ERROR("[RX TEST]: RX may not be working - check PIN_RX (" << pin_rx << ") and RMT peripheral");
         FL_ERROR("[RX TEST]: If using non-RMT TX, ensure physical jumper from PIN " << pin_tx << " to PIN " << pin_rx);
         return false;

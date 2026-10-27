@@ -1,7 +1,6 @@
 """Implementation of individual lint stages."""
 
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -19,6 +18,7 @@ from ci.python_lint_cache import (
     invalidate_python_cache,
     mark_python_lint_success,
 )
+from ci.util.js_tools_cache import repository_tools_dir
 
 
 # IWYU (Include-What-You-Use) is currently disabled because it doesn't work well
@@ -133,7 +133,7 @@ def run_clang_tidy(no_fingerprint: bool, run_tidy: bool) -> bool:
 
 def run_noexcept_check(run_tidy: bool) -> bool:
     """
-    Report where FL_NOEXCEPT enforcement lives.
+    Report where AST-backed C++ enforcement lives.
 
     Args:
         run_tidy: Preserved for CLI compatibility
@@ -142,9 +142,12 @@ def run_noexcept_check(run_tidy: bool) -> bool:
         Always True; the default unified C++ linter owns this check.
     """
     print("")
-    print("FL_NOEXCEPT AST CHECK")
-    print("---------------------")
-    print("Handled by the default unified C++ linter: ci/tools/check_noexcept.py")
+    print("C++ AST CHECKS")
+    print("--------------")
+    print(
+        "Handled by the default unified C++ linter: "
+        "ci/tools/check_noexcept.py and ci/tools/check_array_params.py"
+    )
     return True
 
 
@@ -200,13 +203,13 @@ def run_cpp_lint(
 
         for folder in folders:
             print(f"Running clang-format on {folder}")
-            result = subprocess.run(
+            result = RunningProcess.run(
                 ["uv", "run", "ci/run-clang-format.py", "-i", "-r", folder],
                 capture_output=False,
             )
             if result.returncode != 0:
                 # Retry once (as bash script does)
-                result = subprocess.run(
+                result = RunningProcess.run(
                     ["uv", "run", "ci/run-clang-format.py", "-i", "-r", folder],
                     capture_output=False,
                 )
@@ -222,12 +225,18 @@ def run_cpp_lint(
         cmd = ["uv", "run", "python", "ci/lint_cpp/run_all_checkers.py"]
         if use_rust_cpp_lint:
             cmd.append("--rust")
+        else:
+            cmd.append("--no-rust")
 
+        # 900s (15 min) covers cold CI runners that must `cargo install`
+        # the zccache binary from source — happens on macOS when soldr's
+        # GitHub release fetch hits the per-IP API rate limit and falls
+        # back to cargo. Well under the workflow's 30-min cap.
         result = RunningProcess.run(
             cmd,
             cwd=None,
             check=False,
-            timeout=300,
+            timeout=900,
         )
         if result.stdout:
             print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
@@ -255,29 +264,13 @@ def run_cpp_lint(
 
 
 def run_iwyu_pragma_check() -> bool:
-    """
-    Run IWYU pragma checker on platform headers.
-
-    Returns:
-        True if all platform headers have IWYU pragma markings, False otherwise
-    """
-    print("")
-    print("🔍 IWYU PRAGMA CHECK")
-    print("--------------------")
-
-    if not ENABLE_IWYU:
-        print("⏭️  IWYU pragma check disabled (ENABLE_IWYU = False)")
-        return True
-
-    result = subprocess.run(
-        ["uv", "run", "python", "ci/lint_cpp/iwyu_pragma_check.py"],
-        capture_output=False,
-    )
-
-    if result.returncode == 0:
-        return True
-    else:
-        return False
+    """No-op: the IWYU "// IWYU pragma: private" check now ships as the
+    `IwyuPragmaPrivateChecker` per-file checker in the Rust crate
+    (`ci/lint_cpp_rs/src/checkers/bare_legacy.rs`) and runs as part of
+    `run_cpp_lint()` above. Kept as a stub so existing callers
+    (`ci/lint.py` orchestrator) don't need to lose the call site during
+    the migration window. See FastLED #3297."""
+    return True
 
 
 def run_iwyu_analysis(
@@ -315,7 +308,7 @@ def run_iwyu_analysis(
             print("Running IWYU with auto-fix on C++ headers...")
         else:
             print("Running IWYU on C++ test suite...")
-        result = subprocess.run(
+        result = RunningProcess.run(
             cmd,
             capture_output=False,
         )
@@ -351,10 +344,11 @@ def run_js_lint(no_fingerprint: bool) -> bool:
 
     # Determine ESLint executable path
     eslint_exe = ""
+    js_tools_dir = repository_tools_dir(Path.cwd())
     if sys.platform in ("win32", "cygwin", "msys"):
-        eslint_exe = ".cache/js-tools/node_modules/.bin/eslint.cmd"
+        eslint_exe = js_tools_dir / "node_modules" / ".bin" / "eslint.cmd"
     else:
-        eslint_exe = ".cache/js-tools/node_modules/.bin/eslint"
+        eslint_exe = js_tools_dir / "node_modules" / ".bin" / "eslint"
 
     # Check if fast linting is available
     lint_script = Path("ci/lint-js-fast")
@@ -367,13 +361,13 @@ def run_js_lint(no_fingerprint: bool) -> bool:
 
         # On Windows, use shell=True to properly invoke bash scripts
         if sys.platform in ("win32", "cygwin", "msys"):
-            result = subprocess.run(
+            result = RunningProcess.run(
                 "bash ci/lint-js-fast",
                 shell=True,
                 capture_output=False,
             )
         else:
-            result = subprocess.run(
+            result = RunningProcess.run(
                 ["bash", "ci/lint-js-fast"],
                 capture_output=False,
             )
@@ -385,7 +379,7 @@ def run_js_lint(no_fingerprint: bool) -> bool:
         print(
             f"{Colors.BLUE}⚠️  Fast JavaScript linting not available. Setting up now...{Colors.NC}"
         )
-        result = subprocess.run(
+        result = RunningProcess.run(
             ["uv", "run", "ci/setup-js-linting-fast.py"],
             capture_output=False,
         )
@@ -398,13 +392,13 @@ def run_js_lint(no_fingerprint: bool) -> bool:
 
                 # On Windows, use shell=True to properly invoke bash scripts
                 if sys.platform in ("win32", "cygwin", "msys"):
-                    result = subprocess.run(
+                    result = RunningProcess.run(
                         "bash ci/lint-js-fast",
                         shell=True,
                         capture_output=False,
                     )
                 else:
-                    result = subprocess.run(
+                    result = RunningProcess.run(
                         ["bash", "ci/lint-js-fast"],
                         capture_output=False,
                     )
@@ -435,14 +429,14 @@ def run_ruff() -> bool:
     print("Running ruff check (linting + import sorting)")
 
     # Run ruff check
-    result = subprocess.run(
+    result = RunningProcess.run(
         ["uv", "run", "ruff", "check", "--fix", "test.py"],
         capture_output=False,
     )
     if result.returncode != 0:
         return False
 
-    result = subprocess.run(
+    result = RunningProcess.run(
         [
             "uv",
             "run",
@@ -463,14 +457,14 @@ def run_ruff() -> bool:
     print("Running ruff format (formatting)")
 
     # Run ruff format
-    result = subprocess.run(
+    result = RunningProcess.run(
         ["uv", "run", "ruff", "format", "test.py"],
         capture_output=False,
     )
     if result.returncode != 0:
         return False
 
-    result = subprocess.run(
+    result = RunningProcess.run(
         [
             "uv",
             "run",
@@ -490,7 +484,7 @@ def run_ruff() -> bool:
     print("Running KeyboardInterrupt handler checks")
 
     # Run keyboard interrupt checker
-    result = subprocess.run(
+    result = RunningProcess.run(
         [
             "uv",
             "run",
@@ -501,7 +495,6 @@ def run_ruff() -> bool:
             "--exclude",
             "ci/tmp",
             "ci/wasm",
-            ".pio",
         ],
         capture_output=False,
     )
@@ -511,7 +504,7 @@ def run_ruff() -> bool:
     print("Running sys.path.insert/append checks")
 
     # Run sys.path checker
-    result = subprocess.run(
+    result = RunningProcess.run(
         [
             "uv",
             "run",
@@ -522,7 +515,6 @@ def run_ruff() -> bool:
             "--exclude",
             "ci/tmp",
             "ci/wasm",
-            ".pio",
         ],
         capture_output=False,
     )
@@ -532,7 +524,7 @@ def run_ruff() -> bool:
     print("Running dict type annotation checks")
 
     # Run dict type checker
-    result = subprocess.run(
+    result = RunningProcess.run(
         [
             "uv",
             "run",
@@ -543,7 +535,46 @@ def run_ruff() -> bool:
             "--exclude",
             "ci/tmp",
             "ci/wasm",
-            ".pio",
+        ],
+        capture_output=False,
+    )
+    if result.returncode != 0:
+        return False
+
+    print("Running stdlib-subprocess ban checks")
+
+    # The stdlib subprocess module is banned outright in favour of
+    # RunningProcess (no baseline, no noqa escape). The checker scans the
+    # whole tree and excludes .venv/.build/.cache/node_modules/ci/tmp
+    # itself. See ci/lint_python/subprocess_capture_checker.py.
+    result = RunningProcess.run(
+        [
+            "uv",
+            "run",
+            "python",
+            "ci/lint_python/subprocess_capture_checker.py",
+            ".",
+        ],
+        capture_output=False,
+    )
+    if result.returncode != 0:
+        return False
+
+    print("Running pyserial ban checks (AutoResearch complex)")
+
+    # Ban raw pyserial in ci/autoresearch/ — device serial must go through
+    # fbuild's Rust monitor (RpcClient / create_serial_interface). See
+    # ci/lint_python/pyserial_checker.py and
+    # agents/docs/hardware-autoresearch.md -> "Device serial".
+    result = RunningProcess.run(
+        [
+            "uv",
+            "run",
+            "python",
+            "ci/lint_python/pyserial_checker.py",
+            "ci/autoresearch",
+            "--exclude",
+            "ci/tmp",
         ],
         capture_output=False,
     )
@@ -563,7 +594,7 @@ def run_ty() -> bool:
     """
     print("Running ty (fast type check)")
 
-    result = subprocess.run(
+    result = RunningProcess.run(
         ["uv", "run", "ty", "check", "--output-format", "concise"],
         capture_output=False,
     )
@@ -598,7 +629,7 @@ def run_pyright(no_fingerprint: bool) -> bool:
             needs_pyright = False
 
     if needs_pyright:
-        result = subprocess.run(
+        result = RunningProcess.run(
             ["uv", "run", "pyright", "--threads"],
             capture_output=False,
         )
@@ -675,7 +706,9 @@ def run_cpp_lint_single_file(
     if use_rust_cpp_lint:
         cmd.append("--rust")
     cmd.append(file_path)
-    result = RunningProcess.run(cmd, cwd=None, check=False, timeout=300)
+    # 900s (15 min) — see full-pass call above for rationale (cold cargo
+    # install fallback when soldr can't fetch zccache prebuilt binary).
+    result = RunningProcess.run(cmd, cwd=None, check=False, timeout=900)
     if result.stdout:
         print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
     if result.stderr:
@@ -707,31 +740,11 @@ def run_cpp_lint_single_file(
 
 
 def run_iwyu_pragma_check_single_file(file_path: str) -> bool:
-    """
-    Check IWYU pragma on a single file.
-
-    Args:
-        file_path: Absolute path to the file
-
-    Returns:
-        True if file has IWYU pragma or is not in platforms/, False otherwise
-    """
-    if not ENABLE_IWYU:
-        return True
-
-    result = RunningProcess.run(
-        ["uv", "run", "python", "ci/lint_cpp/iwyu_pragma_check.py", file_path],
-        cwd=None,
-        check=False,
-        timeout=30,
-    )
-
-    if result.returncode != 0:
-        # Print the error message from the checker
-        if result.stdout:
-            print(result.stdout, end="")
-        return False
-
+    """No-op single-file variant. The `IwyuPragmaPrivateChecker` per-file
+    Rust checker already runs on the single-file `bash lint <file>` path
+    via the normal cpp-lint dispatch, so the legacy child-process shim is
+    redundant. See FastLED #3297."""
+    del file_path  # accepted for API compatibility
     return True
 
 
@@ -795,7 +808,7 @@ def run_python_lint_single_file(file_path: str, strict: bool = False) -> bool:
     print(f"🐍 Python lint: {os.path.relpath(file_path)}")
 
     # Run ruff check with auto-fix
-    result = subprocess.run(
+    result = RunningProcess.run(
         ["uv", "run", "ruff", "check", "--fix", file_path],
         capture_output=False,
     )
@@ -804,7 +817,7 @@ def run_python_lint_single_file(file_path: str, strict: bool = False) -> bool:
         return False
 
     # Run ruff format
-    result = subprocess.run(
+    result = RunningProcess.run(
         ["uv", "run", "ruff", "format", file_path],
         capture_output=False,
     )
@@ -813,7 +826,7 @@ def run_python_lint_single_file(file_path: str, strict: bool = False) -> bool:
         return False
 
     # Run keyboard interrupt checker
-    result = subprocess.run(
+    result = RunningProcess.run(
         [
             "uv",
             "run",
@@ -828,7 +841,7 @@ def run_python_lint_single_file(file_path: str, strict: bool = False) -> bool:
         return False
 
     # Run dict type annotation checker
-    result = subprocess.run(
+    result = RunningProcess.run(
         [
             "uv",
             "run",
@@ -844,7 +857,7 @@ def run_python_lint_single_file(file_path: str, strict: bool = False) -> bool:
 
     # Run pyright strict type checking (optional)
     if strict:
-        result = subprocess.run(
+        result = RunningProcess.run(
             ["uv", "run", "pyright", file_path],
             capture_output=False,
         )
@@ -871,7 +884,7 @@ def run_js_lint_single_file(file_path: str) -> bool:
     print(f"🌐 JS lint: {os.path.relpath(file_path)}")
 
     # ESLint runs from .cache/js-tools/ with its local config
-    js_tools_dir = Path(".cache/js-tools").resolve()
+    js_tools_dir = repository_tools_dir(Path.cwd())
     if sys.platform in ("win32", "cygwin", "msys"):
         eslint_exe = js_tools_dir / "node_modules" / ".bin" / "eslint.cmd"
     else:
@@ -894,7 +907,7 @@ def run_js_lint_single_file(file_path: str) -> bool:
     abs_file = Path(file_path).resolve()
     rel_file = os.path.relpath(str(abs_file), str(js_tools_dir))
 
-    result = subprocess.run(
+    result = RunningProcess.run(
         [
             str(eslint_exe),
             "--no-eslintrc",

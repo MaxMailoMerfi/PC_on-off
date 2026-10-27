@@ -29,10 +29,11 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
+
+from running_process import PIPE, RunningProcess
 
 from ci.wasm_flags import get_link_flags, get_sketch_compile_flags
 from ci.wasm_tools import run_emcc
@@ -48,17 +49,48 @@ WASM_PCH_HEADER = (
 BUILD_DIR_PREFIX = PROJECT_ROOT / ".build"
 
 
-def get_build_dir(mode: str) -> Path:
+def get_build_dir(mode: str, defines: list[str] | None = None) -> Path:
     """Get the meson build directory for the given mode."""
-    return BUILD_DIR_PREFIX / f"meson-wasm-{mode}"
+    if not defines:
+        return BUILD_DIR_PREFIX / f"meson-wasm-{mode}"
+    define_key = hashlib.sha256(json.dumps(defines).encode()).hexdigest()[:12]
+    return BUILD_DIR_PREFIX / f"meson-wasm-{mode}-{define_key}"
 
 
-def get_sketch_cache_dir(example_name: str) -> Path:
-    """Get per-sketch cache directory next to the .ino file: <sketch_dir>/.build/wasm/."""
-    ino_file = PROJECT_ROOT / "examples" / example_name / f"{example_name}.ino"
-    if not ino_file.exists():
-        raise FileNotFoundError(f"Sketch not found: {ino_file}")
-    d = ino_file.parent / ".build" / "wasm"
+def resolve_example_dir(example_name: str) -> Path:
+    """Resolve an example name to its directory.
+
+    Examples live either directly under examples/ (e.g. examples/Blink/) or
+    nested one or more levels deep (e.g. examples/Fx/FxCylon/). Accepts a bare
+    name ("FxCylon") or a relative path ("Fx/FxCylon").
+    """
+    examples_root = PROJECT_ROOT / "examples"
+    name = Path(example_name).name
+
+    direct = examples_root / example_name
+    if (direct / f"{name}.ino").exists():
+        return direct
+
+    for ino in examples_root.rglob(f"{name}.ino"):
+        if ino.parent.name == name:
+            return ino.parent
+
+    raise FileNotFoundError(f"Sketch not found: {examples_root / example_name}")
+
+
+def get_sketch_cache_dir(
+    example_name: str, mode: str = "quick", defines: list[str] | None = None
+) -> Path:
+    """Get a per-sketch cache isolated by build mode and compiler defines."""
+    ino_file = resolve_example_dir(example_name) / f"{Path(example_name).name}.ino"
+    cache_name = "wasm"
+    if mode != "quick" or defines:
+        signature = mode
+        if defines:
+            define_key = hashlib.sha256(json.dumps(defines).encode()).hexdigest()[:12]
+            signature = f"{signature}-{define_key}"
+        cache_name = f"wasm-{signature}"
+    d = ino_file.parent / ".build" / cache_name
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -93,14 +125,6 @@ def _normalize_meson_private_paths(build_dir: Path) -> None:
         message = "\n".join(lines)
         print(message)
         raise RuntimeError(message)
-
-
-def _cleanup_stale_meson_lockfile(build_dir: Path) -> None:
-    """Remove stale meson-private/meson.lock before meson setup (see issue #2484)."""
-    from ci.meson.build_config import cleanup_stale_meson_lockfile
-
-    # Helper logs its own status message; we just call through.
-    cleanup_stale_meson_lockfile(build_dir)
 
 
 # ============================================================================
@@ -271,9 +295,16 @@ def _get_emcc_version_signature() -> str:
         return _cached_emcc_version_value
 
     try:
-        result = subprocess.run([emcc, "--version"], capture_output=True, text=True)
+        result = RunningProcess.run(
+            [emcc, "--version"],
+            stdout=PIPE,
+            stderr=PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         version_text = ((result.stdout or "") + (result.stderr or "")).strip()
-    except OSError:
+    except (OSError, RuntimeError):
         version_text = "ERROR"
 
     _cached_emcc_version_key = emcc
@@ -311,7 +342,7 @@ def _link_environment_fingerprint_matches(build_dir: Path, mode: str) -> bool:
 # changes (additions/removals at the top level rebump the mtime). For
 # deeper-tree changes that don't bump src/'s own mtime, the cache may be
 # stale but the next interpreter invocation rebuilds it. Cross-process
-# callers (one Python subprocess per build) pay the walk once and skip
+# callers (one Python process per build) pay the walk once and skip
 # subsequent calls within the same process. Reset for tests via
 # _src_file_list_hash_reset_for_tests().
 _src_file_list_hash_cache: dict[str, tuple[float, int, str]] = {}
@@ -421,7 +452,7 @@ def _is_stale_build_error(output: str) -> bool:
     return any(pattern in output_lower for pattern in _STALE_BUILD_PATTERNS)
 
 
-def _recover_stale_wasm_build(build_dir: Path) -> bool:
+def _recover_stale_wasm_build(build_dir: Path, mode: str) -> bool:
     """Recover from stale WASM build state by cleaning deps and reconfiguring.
 
     Returns True if recovery succeeded and caller should retry the build.
@@ -432,11 +463,14 @@ def _recover_stale_wasm_build(build_dir: Path) -> bool:
             Path(sys.prefix) / "Scripts" / "ninja.EXE"
         )
         try:
-            subprocess.run(
+            RunningProcess.run(
                 [ninja_exe, "-C", str(build_dir), "-t", "cleandead"],
-                capture_output=True,
+                stdout=PIPE,
+                stderr=PIPE,
                 text=True,
                 timeout=60,
+                encoding="utf-8",
+                errors="replace",
             )
             print("[WASM] Cleaned stale Ninja outputs")
         except Exception as e:
@@ -468,8 +502,6 @@ def _recover_stale_wasm_build(build_dir: Path) -> bool:
 
         # Step 4: Force Meson reconfiguration
         print("[WASM] Forcing Meson reconfiguration...")
-        # Extract mode from build dir name (e.g., "meson-wasm-quick" -> "quick")
-        mode = build_dir.name.replace("meson-wasm-", "")
         generated_cross = _render_wasm_cross_file(build_dir)
         cmd = [
             get_meson_executable(),
@@ -480,9 +512,7 @@ def _recover_stale_wasm_build(build_dir: Path) -> bool:
             str(build_dir),
             f"-Dbuild_mode={mode}",
         ]
-        # Remove any stale meson lockfile before reconfigure (see issue #2484).
-        _cleanup_stale_meson_lockfile(build_dir)
-        result = subprocess.run(cmd, cwd=PROJECT_ROOT)
+        result = RunningProcess.run(cmd, cwd=PROJECT_ROOT)
         if result.returncode == 0:
             _normalize_meson_private_paths(build_dir)
             print("[WASM] Self-healing reconfiguration complete")
@@ -698,9 +728,7 @@ def ensure_meson_configured(build_dir: Path, mode: str, force: bool = False) -> 
             f"-Dbuild_mode={mode}",
         ]
         print(f"[WASM] Reconfiguring meson (mode: {mode})...")
-        # Remove any stale meson lockfile before reconfigure (see issue #2484).
-        _cleanup_stale_meson_lockfile(build_dir)
-        result = subprocess.run(cmd, cwd=PROJECT_ROOT)
+        result = RunningProcess.run(cmd, cwd=PROJECT_ROOT)
         if result.returncode != 0:
             print(f"[WASM] Meson reconfiguration failed (rc {result.returncode})")
             return False
@@ -729,9 +757,7 @@ def ensure_meson_configured(build_dir: Path, mode: str, force: bool = False) -> 
         cmd.insert(2, "--reconfigure")
 
     print(f"[WASM] Configuring meson (mode: {mode})...")
-    # Remove any stale meson lockfile before setup (see issue #2484).
-    _cleanup_stale_meson_lockfile(build_dir)
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT)
+    result = RunningProcess.run(cmd, cwd=PROJECT_ROOT)
     if result.returncode != 0:
         print(f"[WASM] Meson setup failed with return code {result.returncode}")
         return False
@@ -746,7 +772,9 @@ def ensure_meson_configured(build_dir: Path, mode: str, force: bool = False) -> 
     return True
 
 
-def build_library(build_dir: Path, verbose: bool = False) -> tuple[bool, bool]:
+def build_library(
+    build_dir: Path, mode: str, verbose: bool = False
+) -> tuple[bool, bool]:
     """
     Build libfastled.a using ninja.
 
@@ -778,7 +806,15 @@ def build_library(build_dir: Path, verbose: bool = False) -> tuple[bool, bool]:
         cmd.append("-v")
 
     print("[WASM] Building libfastled.a...")
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True)
+    result = RunningProcess.run(
+        cmd,
+        cwd=PROJECT_ROOT,
+        stdout=PIPE,
+        stderr=PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if result.returncode != 0:
         # Print captured output so the user sees what happened
         if result.stdout:
@@ -791,9 +827,9 @@ def build_library(build_dir: Path, verbose: bool = False) -> tuple[bool, bool]:
         combined_output = (result.stdout or "") + (result.stderr or "")
         if _is_stale_build_error(combined_output):
             print("[WASM] Stale build state detected, auto-recovering...")
-            if _recover_stale_wasm_build(build_dir):
+            if _recover_stale_wasm_build(build_dir, mode):
                 print("[WASM] Retrying build after recovery...")
-                retry = subprocess.run(cmd, cwd=PROJECT_ROOT)
+                retry = RunningProcess.run(cmd, cwd=PROJECT_ROOT)
                 if retry.returncode == 0:
                     _save_library_fingerprint(build_dir)
                     print(
@@ -815,7 +851,7 @@ def build_library(build_dir: Path, verbose: bool = False) -> tuple[bool, bool]:
                     library_archive.unlink()
                 except OSError:
                     pass
-                retry = subprocess.run(cmd, cwd=PROJECT_ROOT)
+                retry = RunningProcess.run(cmd, cwd=PROJECT_ROOT)
                 if retry.returncode == 0:
                     _save_library_fingerprint(build_dir)
                     print("[WASM] Library build successful (after archive cleanup)")
@@ -835,22 +871,28 @@ def create_wrapper(example_name: str, sketch_cache_dir: Path) -> Path:
 
     Returns path to the wrapper file.
     """
-    example_dir = PROJECT_ROOT / "examples" / example_name
-    ino_file = example_dir / f"{example_name}.ino"
+    example_dir = resolve_example_dir(example_name)
+    # Derive filenames from the resolved directory, not the caller's string: a
+    # relative form like "Fx/FxCylon" would otherwise produce a nested wrapper
+    # path (sketch_cache_dir/Fx/FxCylon_wrapper.cpp) instead of a flat one.
+    sketch_name = example_dir.name
+    ino_file = example_dir / f"{sketch_name}.ino"
 
     if not ino_file.exists():
         raise FileNotFoundError(f"Example not found: {ino_file}")
 
     # Discover additional .cpp files in the example directory tree (sorted for determinism)
+    excluded_dirs = {".build", ".fbuild", ".vscode", "build", "fastled_js"}
     extra_cpps = sorted(
         f
         for f in example_dir.rglob("*.cpp")
-        if f.name != f"{example_name}.ino" and ".build" not in f.parts
+        if not f.name.endswith(".ino.cpp")
+        and all(part not in excluded_dirs for part in f.parts)
     )
 
-    wrapper_path = sketch_cache_dir / f"{example_name}_wrapper.cpp"
+    wrapper_path = sketch_cache_dir / f"{sketch_name}_wrapper.cpp"
     lines = [
-        f"// Auto-generated wrapper for {example_name}.ino",
+        f"// Auto-generated wrapper for {sketch_name}.ino",
         "// C++20 header unit import — ~2x faster than PCH for sketch compilation.",
         '// The .ino\'s #include "FastLED.h" is a harmless no-op after this import.',
         'import "wasm_pch.h";',
@@ -961,7 +1003,7 @@ def build_sketch_pch(
             from ci.wasm_tools import get_emar
 
             emar = get_emar()
-            subprocess.run(
+            RunningProcess.run(
                 [emar, "r", str(library_archive), str(pch_codegen_o)],
                 cwd=str(PROJECT_ROOT),
                 check=False,
@@ -975,7 +1017,7 @@ def build_sketch_pch(
 def _parse_clang_from_verbose(stderr_text: str) -> list[str] | None:
     """Parse the clang command from emcc verbose stderr output.
 
-    emcc with EMCC_VERBOSE=1 prints subprocess commands to stderr.
+    emcc with EMCC_VERBOSE=1 prints the child compiler commands to stderr.
     We look for the clang invocation that has -c (compile mode).
     """
     import shlex
@@ -1052,8 +1094,8 @@ def _fast_compile(
         print(f"[WASM] Fast compile cmd: {cmd[:3]}...({len(cmd)} args)")
 
     try:
-        result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
-    except OSError:
+        result = RunningProcess.run(cmd, cwd=str(PROJECT_ROOT))
+    except (OSError, RuntimeError):
         # Executable not found (e.g. stale cache with bad path) — fall back
         cache_file.unlink(missing_ok=True)
         cache_key_file.unlink(missing_ok=True)
@@ -1075,7 +1117,7 @@ def _intercept_emcc_compile(
     """Run emcc compile with verbose output to capture clang command.
 
     Runs emcc normally but with EMCC_VERBOSE=1 and EM_FORCE_RESPONSE_FILES=0
-    so the full clang subprocess command is printed to stderr. We parse it
+    so the full clang child command is printed to stderr. We parse it
     and save a template for future fast compiles via _fast_compile().
 
     Returns the emcc exit code.
@@ -1088,13 +1130,18 @@ def _intercept_emcc_compile(
     env["EMCC_VERBOSE"] = "1"
     env["EM_FORCE_RESPONSE_FILES"] = "0"
 
-    result = subprocess.run(
+    result = RunningProcess.run(
         [emcc] + emcc_args,
         cwd=str(PROJECT_ROOT),
-        stderr=subprocess.PIPE,
+        stdout=PIPE,
+        stderr=PIPE,
         text=True,
         env=env,
+        encoding="utf-8",
+        errors="replace",
     )
+    if result.stdout:
+        print(result.stdout)
 
     if result.returncode != 0:
         if result.stderr:
@@ -1147,8 +1194,8 @@ def compile_sketch(
     library_archive = build_dir / "ci" / "meson" / "wasm" / "libfastled.a"
     # Find the .ino file that the wrapper #includes
     example_name = wrapper_path.stem.replace("_wrapper", "")
-    example_dir = PROJECT_ROOT / "examples" / example_name
-    ino_file = example_dir / f"{example_name}.ino"
+    example_dir = resolve_example_dir(example_name)
+    ino_file = example_dir / f"{Path(example_name).name}.ino"
     if object_path.exists():
         object_mtime = object_path.stat().st_mtime
         wrapper_mtime = wrapper_path.stat().st_mtime
@@ -1202,7 +1249,7 @@ def compile_sketch(
     if native_emcc is not None:
         if verbose:
             print(f"[WASM] Using native emcc: {native_emcc}")
-        result = subprocess.run(
+        result = RunningProcess.run(
             [native_emcc] + emcc_args,
             cwd=str(PROJECT_ROOT),
         )
@@ -1229,7 +1276,7 @@ def compile_sketch(
 def _parse_wasm_ld_from_verbose(stderr_text: str) -> list[str] | None:
     """Parse the wasm-ld command from emcc verbose stderr output.
 
-    emcc with EMCC_VERBOSE=1 prints subprocess commands as:
+    emcc with EMCC_VERBOSE=1 prints the child commands as:
       /path/to/wasm-ld.exe arg1 arg2 ...
     """
     import shlex
@@ -1272,7 +1319,7 @@ def _intercept_emcc_link(
     mode: str,
     library_archive: Path | None = None,
 ) -> int:
-    """Run emcc link as subprocess with verbose output to capture wasm-ld command.
+    """Run emcc link as a child process with verbose output to capture wasm-ld command.
 
     Uses EMCC_VERBOSE=1 to make emcc print the wasm-ld command to stderr,
     then saves it (with placeholders) for future fast re-linking via _fast_link().
@@ -1293,13 +1340,18 @@ def _intercept_emcc_link(
     env["EMCC_TEMP_DIR"] = str(emcc_tmp)
     env["EM_FORCE_RESPONSE_FILES"] = "0"  # ensure full command, no @file
 
-    result = subprocess.run(
+    result = RunningProcess.run(
         [emcc] + emcc_args,
         cwd=cwd,
-        stderr=subprocess.PIPE,
+        stdout=PIPE,
+        stderr=PIPE,
         text=True,
         env=env,
+        encoding="utf-8",
+        errors="replace",
     )
+    if result.stdout:
+        print(result.stdout)
 
     if result.returncode != 0:
         # Print captured stderr so user sees the error
@@ -1426,8 +1478,8 @@ def _fast_link(
 
     print("[WASM] Fast linking (wasm-ld only)...")
     try:
-        result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
-    except OSError:
+        result = RunningProcess.run(cmd, cwd=str(PROJECT_ROOT))
+    except (OSError, RuntimeError):
         # Executable not found (e.g. stale cache with bad path) — fall back
         _clear_link_cache(build_dir)
         return False
@@ -1615,39 +1667,6 @@ def _run_npx(args: list[str], cwd: Path) -> int:
     return npx_func(args, cwd=str(cwd))
 
 
-def _get_vite_source_mtime(template_dir: Path) -> float:
-    """Get the most recent mtime of any Vite frontend source file.
-
-    Uses os.scandir with directory-level pruning instead of rglob to avoid
-    walking node_modules (2626 files, 420ms → 4ms). On Windows, DirEntry.stat()
-    reuses FindFirstFile data (no extra syscall per file).
-    """
-    max_mtime = 0.0
-    _EXTS = frozenset((".ts", ".js", ".html", ".css", ".json"))
-    _SKIP = frozenset(("node_modules", "dist"))
-    stack = [str(template_dir)]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as it:
-                for entry in it:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            if entry.name not in _SKIP:
-                                stack.append(entry.path)
-                        elif entry.is_file(follow_symlinks=False):
-                            _, ext = os.path.splitext(entry.name)
-                            if ext in _EXTS:
-                                mtime = entry.stat(follow_symlinks=False).st_mtime
-                                if mtime > max_mtime:
-                                    max_mtime = mtime
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-    return max_mtime
-
-
 def copy_templates(output_dir: Path) -> None:
     """Copy template files using the bundled esbuild frontend pipeline."""
     from ci.esbuild_frontend import copy_dist_to_output
@@ -1657,12 +1676,15 @@ def copy_templates(output_dir: Path) -> None:
 
 def generate_manifest(example_name: str, output_dir: Path) -> None:
     """Generate files.json manifest for data files."""
-    example_dir = PROJECT_ROOT / "examples" / example_name
+    example_dir = resolve_example_dir(example_name)
     data_extensions = frozenset(
         (".json", ".csv", ".txt", ".cfg", ".bin", ".dat", ".mp3", ".wav")
     )
     data_files: list[dict[str, str | int]] = []
     _SKIP = frozenset(("fastled_js", ".build"))
+    # clangd/editor integration artifacts (`fastled --write-clangd`, IDE
+    # setups) that match data extensions but must never ship as sketch data.
+    _SKIP_FILES = frozenset(("compile_commands.json",))
 
     # Use os.scandir with directory pruning — avoids walking fastled_js/ and .build/
     # On Windows, DirEntry.stat() reuses FindFirstFile data (no extra syscall)
@@ -1678,9 +1700,18 @@ def generate_manifest(example_name: str, output_dir: Path) -> None:
                 for entry in it:
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            if entry.name not in _SKIP:
+                            # Prune hidden dirs (.vscode, .build variants) in
+                            # addition to the explicit skip list.
+                            if entry.name not in _SKIP and not entry.name.startswith(
+                                "."
+                            ):
                                 stack.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
+                            # IDE/tooling artifacts live next to the .ino but
+                            # are not sketch data: listing them makes the
+                            # frontend fetch (and 404) them at runtime.
+                            if entry.name.startswith(".") or entry.name in _SKIP_FILES:
+                                continue
                             _, ext = os.path.splitext(entry.name)
                             if ext.lower() in data_extensions:
                                 rel_path = entry.path[example_len:]
@@ -1700,9 +1731,9 @@ def generate_asset_manifest(example_name: str, output_dir: Path) -> None:
     """Generate the v1 asset manifest for `<sketch>/data/*.lnk` files.
 
     Part of FastLED issue #2284. Scans the sketch's ``data/`` directory for
-    ``*.lnk`` asset-link files, parses each into ``{url, sha256, fallback}``
-    (sha256/fallback are reserved and not enforced in v1), and writes the
-    resulting manifest to ``<output_dir>/asset_manifest.json``.
+    ``*.lnk`` asset-link files, parses each into ``{url, sha256, fallback}``,
+    and writes the resulting manifest to ``<output_dir>/asset_manifest.json``.
+    The browser loader verifies ``sha256`` and retries ``fallback`` (#4025).
 
     The HTML bootstrap (``src/platforms/wasm/compiler/index.ts``) fetches
     this file and injects it as ``window.fastledAssetManifest``. The C++
@@ -1711,7 +1742,7 @@ def generate_asset_manifest(example_name: str, output_dir: Path) -> None:
     """
     from ci.compiler.asset_scanner import scan_sketch_assets, write_manifest_json
 
-    sketch_dir = PROJECT_ROOT / "examples" / example_name
+    sketch_dir = resolve_example_dir(example_name)
     scan = scan_sketch_assets(sketch_dir)
     for warning in scan.warnings:
         print(f"[WASM] {warning}", file=sys.stderr)
@@ -1730,12 +1761,18 @@ def build(
     mode: str = "quick",
     verbose: bool = False,
     force: bool = False,
+    defines: list[str] | None = None,
 ) -> int:
     """Core build function — callable directly without argparse overhead."""
+    previous_defines = os.environ.get("FASTLED_WASM_EXTRA_DEFINES")
+    if defines:
+        os.environ["FASTLED_WASM_EXTRA_DEFINES"] = json.dumps(defines)
+    else:
+        os.environ.pop("FASTLED_WASM_EXTRA_DEFINES", None)
     try:
         start_time = time.time()
-        build_dir = get_build_dir(mode)
-        sketch_cache_dir = get_sketch_cache_dir(example)
+        build_dir = get_build_dir(mode, defines)
+        sketch_cache_dir = get_sketch_cache_dir(example, mode, defines)
         output_js = Path(output)
         # Auto-fix: if output looks like a directory (no .js suffix), append fastled.js
         if output_js.suffix != ".js":
@@ -1750,7 +1787,7 @@ def build(
 
         # Step 2: Build library via ninja (skipped if source fingerprint matches)
         lib_start = time.time()
-        lib_ok, lib_was_rebuilt = build_library(build_dir, verbose)
+        lib_ok, lib_was_rebuilt = build_library(build_dir, mode, verbose)
         if not lib_ok:
             return 1
 
@@ -1780,13 +1817,13 @@ def build(
             # undefined symbols usually mean stale object files.  Nuke
             # caches and retry the full build pipeline once.
             print("[WASM] Link failed, attempting self-healing rebuild...")
-            if _recover_stale_wasm_build(build_dir):
+            if _recover_stale_wasm_build(build_dir, mode):
                 # Also invalidate sketch cache so it gets recompiled
                 sketch_o = sketch_cache_dir / "sketch.o"
                 if sketch_o.exists():
                     sketch_o.unlink(missing_ok=True)
                 # Retry: library → PCH → sketch → link
-                lib_ok2, _ = build_library(build_dir, verbose)
+                lib_ok2, _ = build_library(build_dir, mode, verbose)
                 if lib_ok2:
                     sketch_pch2 = build_sketch_pch(
                         build_dir, mode, lib_was_rebuilt=True, verbose=verbose
@@ -1842,6 +1879,11 @@ def build(
 
         traceback.print_exc()
         return 1
+    finally:
+        if previous_defines is None:
+            os.environ.pop("FASTLED_WASM_EXTRA_DEFINES", None)
+        else:
+            os.environ["FASTLED_WASM_EXTRA_DEFINES"] = previous_defines
 
 
 def main() -> int:
@@ -1859,8 +1901,12 @@ def main() -> int:
     parser.add_argument(
         "--force", action="store_true", help="Force meson reconfiguration"
     )
+    parser.add_argument("--defines", help="Comma-separated compiler definitions")
     args = parser.parse_args()
-    return build(args.example, args.output, args.mode, args.verbose, args.force)
+    defines = args.defines.split(",") if args.defines else None
+    return build(
+        args.example, args.output, args.mode, args.verbose, args.force, defines
+    )
 
 
 if __name__ == "__main__":

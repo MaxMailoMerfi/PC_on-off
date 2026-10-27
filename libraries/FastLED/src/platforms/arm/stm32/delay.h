@@ -17,7 +17,7 @@ namespace fl {
 /// @param ns Number of nanoseconds
 /// @param hz CPU frequency in Hz
 /// @return Number of cycles (rounded up)
-constexpr u32 cycles_from_ns_stm32(u32 ns, u32 hz) FL_NOEXCEPT {
+constexpr u32 cycles_from_ns_stm32(u32 ns, u32 hz) FL_NO_EXCEPT {
   // Round up: cycles = ceil(ns * hz / 1e9)
   // Using: (ns * hz + 999'999'999) / 1'000'000'000
   return ((u64)ns * (u64)hz + 999999999UL) / 1000000000UL;
@@ -26,18 +26,22 @@ constexpr u32 cycles_from_ns_stm32(u32 ns, u32 hz) FL_NOEXCEPT {
 /// Platform-specific implementation of nanosecond delay with runtime frequency (STM32)
 /// @param ns Number of nanoseconds
 /// @param hz CPU frequency in Hz
-FASTLED_FORCE_INLINE void delayNanoseconds_impl(u32 ns, u32 hz) FL_NOEXCEPT {
+FASTLED_FORCE_INLINE void delayNanoseconds_impl(u32 ns, u32 hz) FL_NO_EXCEPT {
   u32 cycles = cycles_from_ns_stm32(ns, hz);
   if (cycles == 0) return;
+#if defined(DWT) || (defined(__CORTEX_M) && (__CORTEX_M >= 3))
   delay_cycles_dwt_arm(cycles);
+#else
+  delayMicroseconds((ns + 999) / 1000);
+#endif
 }
 
 /// Platform-specific implementation of nanosecond delay with auto-detected frequency (STM32)
 /// @param ns Number of nanoseconds
-FASTLED_FORCE_INLINE void delayNanoseconds_impl(u32 ns) FL_NOEXCEPT {
-  // Use GET_CPU_FREQUENCY() which provides a compile-time constant for STM32
+FASTLED_FORCE_INLINE void delayNanoseconds_impl(u32 ns) FL_NO_EXCEPT {
+  // Use FL_CPU_FREQUENCY() which provides a compile-time constant for STM32
   // This avoids issues with F_CPU being defined as runtime SystemCoreClock on STM32duino
-  u32 hz = GET_CPU_FREQUENCY();
+  u32 hz = FL_CPU_FREQUENCY();
   delayNanoseconds_impl(ns, hz);
 }
 

@@ -29,8 +29,8 @@
 #include "fl/channels/config.h"
 #include "fl/channels/wave3.h"
 #include "fl/channels/wave8.h"
-#include "fl/channels/detail/wave3.hpp"
-#include "fl/channels/detail/wave8.hpp"
+#include "fl/channels/detail/wave3.h"
+#include "fl/channels/detail/wave8.h"
 #include "fl/chipsets/spi.h"
 #include "fl/chipsets/chipset_timing_config.h"
 #include "fl/chipsets/led_timing.h"
@@ -2359,9 +2359,11 @@ FL_TEST_CASE("Wave3 eligibility - WS2815 NOT eligible") {
     FL_CHECK(!fl::canUseWave3(timing));
 }
 
-FL_TEST_CASE("Wave3 eligibility - SM16824E NOT eligible") {
+FL_TEST_CASE("Wave3 eligibility - SM16824E eligible") {
+    // With the datasheet-aligned timing (300/600/300, see issue #3203),
+    // SM16824E shares the WS2811-800kHz Wave3-eligible profile.
     fl::ChipsetTiming timing = fl::to_runtime_timing<fl::TIMING_SM16824E>();
-    FL_CHECK(!fl::canUseWave3(timing));
+    FL_CHECK(fl::canUseWave3(timing));
 }
 
 FL_TEST_CASE("Wave3 eligibility - GW6205 800KHz eligible") {
@@ -2616,7 +2618,21 @@ FL_TEST_CASE("Wave3 integration - WS2812B_V5 falls back to wave8") {
     // Verify clock frequency is wave8 clock (8 MHz)
     auto& mock7 = ParlioPeripheralMock::instance();
     const auto& config7 = mock7.getConfig();
-    FL_CHECK_EQ(config7.clock_freq_hz, (u32)8000000);
+    FL_CHECK_EQ(config7.clock_freq_hz, (u32)6530612);  // wave8 clock derived from WS2812B_V5 timing: 8e9 / 1225 ns (FastLED#3586)
+}
+
+FL_TEST_CASE("Wave8 integration - WS2811 400KHz derives 3.2MHz clock") {
+    resetMockHistory();
+    auto& driver = ParlioEngine::getInstance();
+
+    fl::vector<int> pins = {1};
+    ChipsetTimingConfig timing =
+        fl::makeTimingConfig<fl::TIMING_WS2811_400KHZ>();
+    bool init_ok = driver.initialize(1, pins, timing, 10);
+    FL_REQUIRE(init_ok);
+
+    auto& mock = ParlioPeripheralMock::instance();
+    FL_CHECK_EQ(mock.getConfig().clock_freq_hz, (u32)3200000);
 }
 
 FL_TEST_CASE("Wave3 integration - transmit produces correct output size") {
@@ -2656,6 +2672,51 @@ FL_TEST_CASE("Wave3 integration - transmit produces correct output size") {
 // Wave3/Wave8 Mode Switch Corner Cases
 //=============================================================================
 
+FL_TEST_CASE("PARLIO mode switches preserve the encoded waveform") {
+    resetMockHistory();
+    auto& driver = ParlioEngine::getInstance();
+    auto& mock = ParlioPeripheralMock::instance();
+    fl::vector<int> pins = {1};
+    u8 source[] = {0x00, 0x96, 0xff};
+
+    for (unsigned pass = 0; pass < 4; ++pass) {
+        const bool wave3 = (pass % 2) == 0;
+        ChipsetTimingConfig timing = wave3 ? getWS2812Timing()
+            : ChipsetTimingConfig(225, 355, 645, 280, "WS2812B_V5");
+        FL_REQUIRE(driver.initialize(1, pins, timing, 1));
+        mock.clearTransmissionHistory();
+        FL_REQUIRE(driver.beginTransmission(source, sizeof(source), 1, sizeof(source)));
+
+        ChipsetTiming reference = {};
+        reference.T1 = timing.t1_ns;
+        reference.T2 = timing.t2_ns;
+        reference.T3 = timing.t3_ns;
+        reference.RESET = timing.reset_us;
+        fl::vector<u8> expected;
+        for (u8 byte : source) {
+            if (wave3) {
+                const auto lut = buildWave3ExpansionLUT(reference);
+                Wave3Byte encoded;
+                wave3_convert_byte_to_wave3byte(byte, lut, &encoded);
+                for (u8 value : encoded.data) expected.push_back(value);
+            } else {
+                const auto lut = buildWave8ByteExpansionLUT(buildWave8ExpansionLUT(reference));
+                Wave8Byte encoded;
+                wave8_expand_byte(byte, lut, &encoded);
+                for (const auto& symbol : encoded.symbols) expected.push_back(symbol.data);
+            }
+        }
+        const auto& history = mock.getTransmissionHistory();
+        FL_REQUIRE_FALSE(history.empty());
+        const auto& bytes = history.front().buffer_copy;
+        FL_REQUIRE_GE(bytes.size(), expected.size());
+        for (fl::size i = 0; i < expected.size(); ++i) {
+            FL_CHECK_EQ(bytes[i], expected[i]);
+        }
+        FL_CHECK_EQ(driver.poll(), ParlioEngineState::READY);
+    }
+}
+
 FL_TEST_CASE("Wave3 corner case - mode switch wave3 to wave8") {
     resetMockHistory();
     auto& driver = ParlioEngine::getInstance();
@@ -2677,7 +2738,7 @@ FL_TEST_CASE("Wave3 corner case - mode switch wave3 to wave8") {
     FL_REQUIRE(init_ok);
 
     u32 wave8_clock = mock9.getConfig().clock_freq_hz;
-    FL_CHECK_EQ(wave8_clock, (u32)8000000);  // Should be wave8 clock
+    FL_CHECK_EQ(wave8_clock, (u32)6530612);  // wave8 clock derived from WS2812B_V5 timing: 8e9 / 1225 ns (FastLED#3586)  // Should be wave8 clock
 
     // Verify transmission works in wave8 mode
     uint8_t scratch[15] = {0xFF, 0xAA, 0x55, 0xF0, 0x0F,
@@ -2699,7 +2760,7 @@ FL_TEST_CASE("Wave3 corner case - mode switch wave8 to wave3") {
     FL_REQUIRE(init_ok);
 
     auto& mock10 = ParlioPeripheralMock::instance();
-    FL_CHECK_EQ(mock10.getConfig().clock_freq_hz, (u32)8000000);
+    FL_CHECK_EQ(mock10.getConfig().clock_freq_hz, (u32)6530612);  // wave8 clock derived from WS2812B_V5 timing: 8e9 / 1225 ns (FastLED#3586)
 
     // Second: reinit with WS2812 (wave3) — different timing forces reinit
     ChipsetTimingConfig timing_ws2812 = getWS2812Timing();
@@ -2784,7 +2845,7 @@ FL_TEST_CASE("Wave3 corner case - mock reset between modes") {
     ChipsetTimingConfig timing_v5(225, 355, 645, 280, "WS2812B_V5");
     init_ok = driver.initialize(1, pins, timing_v5, 10);
     FL_REQUIRE(init_ok);
-    FL_CHECK_EQ(mock11.getConfig().clock_freq_hz, (u32)8000000);
+    FL_CHECK_EQ(mock11.getConfig().clock_freq_hz, (u32)6530612);  // wave8 clock derived from WS2812B_V5 timing: 8e9 / 1225 ns (FastLED#3586)
 
     // Verify transmission works after reset+reinit
     uint8_t scratch[15] = {0xFF, 0xAA, 0x55, 0xF0, 0x0F,

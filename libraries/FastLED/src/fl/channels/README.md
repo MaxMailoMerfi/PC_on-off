@@ -28,6 +28,8 @@ Two complementary dispatch modes are available (introduced by issue #2428, refin
   In either case, naming `Bus::X` at the call site is what links the driver's translation unit, so `--gc-sections` drops every driver the sketch doesn't reference. Bus/chipset mismatches become `static_assert` errors rather than runtime warnings.
 - **Runtime selection** — `FastLED.add(cfg)` is **non-template**. Pick the driver by setting `cfg.options.mBus = fl::Bus::RMT` (typed `enum class`). The non-template path auto-enrolls every driver on the platform via `fl::enableAllDrivers()` and emits a one-time `FL_WARN_ONCE` explaining the binary-size trade-off (suppress with `-DFASTLED_SUPPRESS_RUNTIME_DRIVER_WARNING`). For minimum binary size, use the compile-time path instead. Custom/mock drivers (whose names aren't in the `fl::Bus` enum) bind via priority dispatch — register the mock with `manager.addDriver()` and either let it win by priority, or use `manager.setExclusiveDriver(name)` to force-select.
 
+**Why `Channel` still derives from `CPixelLEDController<RGB>`:** `FastLED.add(ChannelPtr)` puts the channel on the `CLEDController` draw list via `addToDrawList()` (`DeferRegister`), and the MY9221 `addLeds<>` path returns a `Channel` as a `CLEDController&`. Removing the base would need a separate channel draw list in `FastLED.show()` and a slim/managed MY9221 path.
+
 ---
 
 ## Basic Usage
@@ -101,28 +103,69 @@ void loop() {
 
 Every `addLeds<>` variant also accepts an optional trailing `fl::Bus B = fl::Bus::AUTO` template parameter — see "Compile-Time Bus Selection" below for how to pin the driver from the call site.
 
+### Select a strip configuration at runtime
+
+The template arguments to `addLeds<>` must be known at compile time, so the
+template itself cannot be stored in a variable. Use the non-template Channel
+API when a saved setting or user input selects the chipset, pins, or color
+order during `setup()`:
+
+```cpp
+#include "FastLED.h"
+#include "fl/channels/config.h"
+
+constexpr int NUM_LEDS = 60;
+CRGB leds[NUM_LEDS];
+
+uint8_t readStripSetting() {
+    return 0;  // Replace with an EEPROM, file, web UI, or other saved setting.
+}
+
+void setup() {
+    const fl::ChannelConfig options[] = {
+        fl::ChannelConfig(fl::makeClockless<fl::TIMING_WS2813>(4),
+                          fl::span<CRGB>(leds, NUM_LEDS), GRB),
+        fl::ChannelConfig(fl::makeClockless<fl::TIMING_WS2812_800KHZ>(5),
+                          fl::span<CRGB>(leds, NUM_LEDS), RGB),
+        fl::ChannelConfig(fl::makeClockless<fl::TIMING_WS2811_400KHZ>(6),
+                          fl::span<CRGB>(leds, NUM_LEDS), BRG),
+    };
+
+    const uint8_t selected = readStripSetting();
+    if (selected < sizeof(options) / sizeof(options[0])) {
+        FastLED.add(options[selected]);
+    }
+}
+
+void loop() {
+    fill_rainbow(leds, NUM_LEDS, millis() / 16, 7);
+    FastLED.show();
+}
+```
+
+`makeClockless<>()` builds each supported timing value into the firmware. The
+resulting `ChannelConfig` objects are ordinary values, so the final selection
+can be made at runtime without a chipset switch statement.
+
 ### Compile-Time Bus Selection (`fl::Bus`)
 
-The `fl::Bus` enum (in `fl/channels/bus.h`) is the single identifier that flows through both the templated APIs and the runtime registry overrides. Each value names exactly one concrete driver:
+The `fl::Bus` enum (in `fl/channels/bus.h`) is the portable identifier that flows through both the templated APIs and the runtime registry overrides. Some portable values map to different concrete vendor drivers on different chips; `deviceInfo<Bus, Which>()` reports the concrete `vendor_name` and `device_name`.
 
-| `fl::Bus::X` | Driver string (`busName(X)` / `IChannelDriver::getName()`) |
-|---|---|
-| `RMT` | `"RMT"` |
-| `PARLIO` | `"PARLIO"` |
-| `SPI` | `"SPI"` |
-| `I2S` | `"I2S"` |
-| `I2S_SPI` | `"I2S_SPI"` |
-| `LCD_RGB` | `"LCD_RGB"` |
-| `LCD_SPI` | `"LCD_SPI"` |
-| `LCD_CLOCKLESS` | `"LCD_CLOCKLESS"` |
-| `UART` | `"UART"` |
-| `FLEX_IO` | `"FLEX_IO"` |
-| `OBJECT_FLED` | `"OBJECT_FLED"` |
-| `BIT_BANG` | `"BIT_BANG"` |
-| `STUB` | `"STUB"` |
-| `AUTO` | sentinel - resolves to `DefaultBus<Chipset>::value` for the platform |
+| `fl::Bus::X` | Portable string (`busName(X)`) | Typical concrete driver |
+|---|---|---|
+| `RMT` | `"RMT"` | ESP32 RMT4/RMT5 |
+| `FLEX_IO` | `"FLEX_IO"` | PARLIO, LCD_CAM, I2S, Teensy FlexIO/ObjectFLED |
+| `SPI` | `"SPI"` | Platform SPI path |
+| `DUAL_SPI` | `"DUAL_SPI"` | Platform dual-SPI path |
+| `QUAD_SPI` | `"QUAD_SPI"` | Platform quad-SPI path |
+| `OCTAL_SPI` | `"OCTAL_SPI"` | Platform octal-SPI path |
+| `UART` | `"UART"` | ESP32 UART / Teensy LPUART |
+| `BIT_BANG` | `"BIT_BANG"` | Portable fallback (all platforms) |
+| `AUTO` | sentinel - resolves to `DefaultBus<Chipset>::value` for the platform | — |
 
-`busName(Bus)` returns the canonical string literal. This is what `ChannelManager::findDriverByName` matches against each driver's `getName()`. Driver names match the enumerator exactly, including underscores (`"BIT_BANG"`, `"FLEX_IO"`, `"OBJECT_FLED"`).
+> Concrete parallel-I/O drivers are still chip-specific. For example, PARLIO is only available on chips that ship Espressif's PARLIO peripheral (`SOC_PARLIO_SUPPORTED=1`). Sketches select that portable slot with `fl::enableDriver<fl::Bus::FLEX_IO, 0>()`; `deviceInfo<fl::Bus::FLEX_IO, 0>()` reports whether the concrete driver is available.
+
+`busName(Bus)` returns the portable string literal. Concrete runtime driver names can differ (`"PARLIO"`, `"LCD_SPI"`, `"OBJECT_FLED"`, etc.); use `busDriverName(Bus, Which, isSpi)` or `deviceInfo<Bus, Which>()` when the concrete name matters.
 
 ```cpp
 #include "FastLED.h"
@@ -160,22 +203,28 @@ fl::ChannelConfigOf<fl::ClocklessChipset> cfg{
 fl::TypedChannel<fl::Bus::AUTO, fl::ClocklessChipset>::create(cfg);
 // Explicit bus selection.
 fl::TypedChannel<fl::Bus::RMT, fl::ClocklessChipset>::create(cfg);      // OK
-fl::TypedChannel<fl::Bus::LCD_SPI, fl::ClocklessChipset>::create(cfg);  // compile error
+fl::TypedChannel<fl::Bus::DUAL_SPI, fl::ClocklessChipset>::create(cfg);  // compile error
 ```
 
 `TypedChannel<Bus, Chipset>` lives in `fl/channels/channel_typed.h`. It returns a `ChannelPtr` to the regular non-template runtime `Channel` so callbacks, the draw list, and `ChannelManager` see one channel type.
 
-**`addLeds<>` Bus pinning (#2460):** every `FastLED.addLeds<>` variant accepts an optional trailing `fl::Bus B = fl::Bus::AUTO` template parameter. `B = AUTO` (the default) leaves call sites byte-for-byte unchanged; `B != AUTO` ODR-uses `fl::BusTraits<B>::instance` via `fl::busKeepAlive<B>()` so `--gc-sections` retains the named driver TU.
+**`addLeds<>` Bus pinning (#2460):** every `FastLED.addLeds<>` variant accepts an optional trailing `fl::Bus B = fl::Bus::AUTO` template parameter. Clockless `addLeds<>()` (routed through `fl::SlimBridgeController`) and non-Channel-API SPI paths ODR-use `fl::BusTraits<B>::instance` via `fl::busKeepAlive<B>()` for an explicit `B != AUTO` so `--gc-sections` retains the named driver TU. On platforms where SPI controllers use the Channel API, see the `SlimSpiBridgeController` paragraph below for how `AUTO` resolves and how the selected driver is registered with `ChannelManager`.
 
 ```cpp
 // Clockless: pin to RMT at compile time.
 FastLED.addLeds<WS2812, 4, GRB, fl::Bus::RMT>(leds, 60);
 
-// SPI: pin to SPI at compile time.
-FastLED.addLeds<APA102, 23, 18, RGB, DATA_RATE_MHZ(12), fl::Bus::SPI>(leds, 60);
+// SPI: use the platform's compile-time default bus.
+FastLED.addLeds<APA102, 23, 18, RGB, DATA_RATE_MHZ(12), fl::Bus::AUTO>(leds, 60);
+// Or name a bus supported by the target (for example, RP2xxx hardware SPI).
+FastLED.addLeds<APA102, 11, 10, RGB, DATA_RATE_MHZ(12), fl::Bus::SPI, 1>(leds, 60);
 ```
 
-The Bus parameter triggers linker keep-alive in every variant. For the SPI variants on the `FASTLED_SPI_USES_CHANNEL_API` branch, the parameter also populates `cfg.options.mBus = B` so the channel routes through the named driver at runtime. Non-Channel-API controllers (older `ClocklessController` subclasses that pre-date the Channel API) keep their platform-default routing and rely on the linker keep-alive alone — for full runtime routing through a specific Bus, prefer `FastLED.add(cfg)` with `cfg.options.mBus = B`.
+For SPI variants on the `FASTLED_SPI_USES_CHANNEL_API` branch, the four `addLeds<ESPIChipsets ...>()` overloads (#4585) route through `fl::SlimSpiBridgeController<CHIPSET, RGB_ORDER, B, B_WHICH>` (`fl/channels/slim_spi_bridge_controller.h`) instead of instantiating a runtime `fl::Channel`. The slim controller resolves the Bus/instance the same way `TypedChannel<B, SpiChipsetConfig, Which>` did — `kBus = detail::resolve_bus<B, SpiChipsetConfig>::value` resolves `AUTO`, a `BusSupports<kBus, SpiChipsetConfig, Which>` `static_assert` enforces the compile-time contract, `BusTraits<kBus, Which>::registerWithManager()` registers the selected driver, and every frame it calls `ChannelManager::selectDriverForChannel()` with the same `busDriverName(kBus, Which, /*spi=*/true)` affinity key `Channel::resolveDynamicDriver()` used — so the runtime dispatch and linker keep-alive behavior are unchanged, just without the `Channel` object in between. An explicit Bus must satisfy `BusSupports` for the target platform; `AUTO` is the portable choice.
+
+`SpiChipset::MY9221` is the one chipset kept on the old `TypedChannel<B, SpiChipsetConfig, Which>` path: `Channel::encodeMY9221()` never emits bytes on the unmanaged path (it only ever feeds the colour-managed pipeline), and legacy `addLeds<>()` has no way to bind a colour profile to what it returns, so `SlimSpiBridgeController` — which only implements the unmanaged writers — would silently drop every MY9221 frame. `FastLED.h` tag-dispatches on `CHIPSET != MY9221` at compile time (C++11 has no `if constexpr`) so only the taken branch is ever instantiated.
+
+Non-Channel-API controllers (older `ClocklessController` subclasses that pre-date the Channel API) keep their platform-default routing and rely on linker keep-alive alone — for full runtime routing through a specific Bus, prefer `FastLED.add(cfg)` with `cfg.options.mBus = B`.
 
 ### Runtime Bus Selection (non-template `FastLED.add(cfg)`)
 
@@ -211,17 +260,18 @@ Passing `fl::Bus::AUTO` (the default) skips the pinning step and lets `ChannelMa
 
 ### Opt-In Driver Registration (`enableDrivers<>` / `enableAllDrivers` / `setExclusiveDriver<>`)
 
-**Default behaviour: no driver auto-registration.** Only the platform-default driver TU (named by the legacy clockless controller's Phase 5b pre-bind via `BusTraits<DefaultBus<Chipset>>::instancePtr()`) is linked into the binary; every other driver is `--gc-sections`-eligible until something names its `BusTraits<Bus::X>::instancePtr()`. This is the binary-size fix for #2420 / #2421 — the old `FASTLED_DISABLE_LEGACY_DRIVER_REGISTRY` macro has been removed; the default IS the opt-in path.
+**Default behaviour: no driver auto-registration.** Only the platform-default driver TU (named by the legacy clockless `addLeds<>()` controller's `fl::SlimBridgeController` registration via `BusTraits<DefaultBus<Chipset>>::instancePtr()`) is linked into the binary; every other driver is `--gc-sections`-eligible until something names its `BusTraits<Bus::X>::instancePtr()`. This is the binary-size fix for #2420 / #2421 — the old `FASTLED_DISABLE_LEGACY_DRIVER_REGISTRY` macro has been removed; the default IS the opt-in path.
 
 To register additional drivers at runtime, sketches pick one of three opt-in calls:
 
 ```cpp
-// 1. Selective opt-in: only RMT and PARLIO end up linked AND registered.
+// 1. Selective opt-in: only RMT and the FLEX_IO slot end up linked AND registered.
 #include "platforms/esp/32/drivers/rmt/rmt_5/bus_traits.h"
 #include "platforms/esp/32/drivers/parlio/bus_traits.h"
 
 void setup() {
-    fl::enableDrivers<fl::Bus::RMT, fl::Bus::PARLIO>();
+    fl::enableDrivers<fl::Bus::RMT>();
+    fl::enableDriver<fl::Bus::FLEX_IO, 0>();
 }
 ```
 
@@ -249,12 +299,19 @@ void setup() {
 #include "platforms/esp/32/drivers/lcd_spi/bus_traits.h"
 
 void setup() {
-    FastLED.setExclusiveDriver<fl::Bus::LCD_SPI>();
+    FastLED.setExclusiveDriver<fl::Bus::FLEX_IO, 0>();
     FastLED.addLeds<APA102, 23, 18, RGB>(leds, 60);
 }
 ```
 
 Including the matching per-driver `bus_traits.h` is the explicit opt-in that makes the `BusTraits<Bus::X>` specialization visible at the call site — without that include the call fails to link and `--gc-sections` stays free to drop the driver TU.
+
+For parallel clocked-SPI output on the original ESP32, include
+`platforms/esp/32/drivers/i2s_spi/bus_traits.h` instead. Register one APA102,
+SK9822, or other clocked-SPI controller per data pin, give every controller the
+same clock pin, and select `Bus::FLEX_IO, 0` before registration as above. The
+I2S-SPI engine batches up to 16 data lanes into one transmission. ESP32-S3 uses
+the shown `lcd_spi/bus_traits.h` include with the same public API.
 
 ---
 
@@ -270,15 +327,19 @@ Engines are tried in priority order (highest first) until one accepts the channe
 
 | Engine | Priority | Platforms | Notes |
 |--------|----------|-----------|-------|
-| **I2S_SPI** | 10 | ESP32-dev (original) | Native I2S parallel SPI for true SPI chipsets |
+| **I2S** (unified) | 10 | ESP32-dev (original) | I2S1 wave8 clockless bank (16 lanes) + SPI-chipset delegation, `Bus::FLEX_IO` instance 0 |
 | **LCD_SPI** | 10 | ESP32-S3 | LCD_CAM SPI driver for true SPI chipsets |
+| **I2S0** (second bank) | 9 | ESP32-dev (original) | Second 16-lane wave8 clockless bank on I2S0 (`Bus::FLEX_IO` instance 1) — 32 parallel lanes total; contended with the clocked-SPI use of I2S0 (port-claim registry, first mode wins) |
 | **PARLIO** | 4 | ESP32-P4, C6, H2, C5 | Parallel I/O with hardware timing |
 | **LCD_RGB** | 3 | ESP32-P4 | LCD RGB peripheral (parallel clockless) |
 | **RMT** | 2 (Recommended default) | All ESP32 variants | Reliable, broad chipset support |
 | **LCD_CLOCKLESS** | 2 | ESP32-S3 | LCD_CAM clockless (replaces the misnamed I2S) |
 | **I2S** | 1 | ESP32-S3 | LCD_CAM via legacy I80 bus (experimental) |
 | **SPI** | 0 | ESP32, S2, S3 | DMA-based, deprioritized due to reliability |
-| **UART** | -1 | All ESP32 variants | Wave8 encoding (experimental, not recommended) |
+| **UART** | -1 | All ESP32 variants | Wave10/wave4 frame-geometry encoding, per-chipset selection |
+| **UART2** (second lane) | -2 | ESP32-dev (original) | Second concurrent UART lane on the UART2 block (`Bus::UART` instance 1); UART0 stays reserved for the console |
+
+**Classic-ESP32 32-lane operation (FastLED#3576 Phase 1):** the I2S engines are capacity-aware — the primary bank accepts at most 16 clockless channels per frame, so the 17th+ channel overflows to the `I2S0` second bank, then to RMT. Each I2S block is a shared resource between its clockless bank and the clocked-SPI driver: ownership is arbitrated at `initialize()` time by the port-claim registry (`platforms/esp/32/drivers/i2s/i2s_port_claim.h`) — whichever mode claims a block first per session keeps it, and the other driver's channels fall through the priority list cleanly.
 
 **Teensy 4.x:**
 
@@ -373,9 +434,32 @@ void setup() {
 
 ## Advanced Features
 
+### RX Capture Backends
+
+`FastLED.addRx(RxChannelConfig(pin, backend))` creates a receive channel for
+capturing/validating LED waveforms. Backends (`fl::RxBackend`):
+
+| Backend | Platforms | Notes |
+|---------|-----------|-------|
+| `PLATFORM_DEFAULT` | all | Maps to the best available backend (RMT on ESP32) |
+| `RMT` | ESP32 family | Symbol-accurate; on **classic ESP32** the RMT receiver has no ping-pong/DMA, so a capture is one-shot into channel RAM — ~256 symbols ≈ 10 WS2812 LEDs max |
+| `I2S_RX` | classic ESP32 | 1-bit oversampler: I2S0 master-RX samples the pin at 16 MHz (62.5 ns) into a circular DMA ring; capture length is RAM-bound (~165 WS2812 LEDs), 16× the RMT ceiling. Contends for I2S0 with the second clockless bank / clocked-SPI driver via the port-claim registry — `begin()` fails cleanly when I2S0 is busy |
+| `ISR` | ESP32 family | GPIO-interrupt edge timestamping (lower precision) |
+
+The backend chosen at channel creation is sticky: re-arming via
+`RxChannel::begin()` preserves it (carry `channel->backend()` into the new
+config when building one from scratch).
+
 ### Channel Lifecycle Events
 
 Register callbacks for channel lifecycle events:
+
+`IChannel::name()` is stable only when the channel configuration supplies a
+name. If `ChannelConfig::mName` is unset, FastLED generates `Channel_<id>` only
+when `FASTLED_LOG_RUNTIME_ENABLED` is enabled; builds that compile runtime
+logging out return an empty string instead. Event listeners, telemetry, and
+other code that requires a stable name should use the named `ChannelConfig`
+constructor shown below or assign `config.mName` explicitly.
 
 ```cpp
 #include "FastLED.h"
@@ -398,6 +482,8 @@ void setup() {
         Serial.printf("%s -> %s\n", ch.name().c_str(), driver.c_str());
     });
 
+    // The named constructor sets ChannelConfig::mName, so callbacks receive
+    // "my_strip" even when FASTLED_LOG_RUNTIME_ENABLED is disabled.
     // Create channel (triggers onChannelCreated)
     auto timing = fl::makeTimingConfig<fl::TIMING_WS2812_800KHZ>();
     fl::ChannelConfig config("my_strip", fl::ClocklessChipset(5, timing),
@@ -698,6 +784,48 @@ void loop() {
 ## Implementing a Custom Channel Engine
 
 Third-party developers can create custom channel drivers to support new hardware peripherals or transmission protocols. This section covers the requirements and best practices.
+
+### **Rule: Parallel-IO peripherals — one engine for both clockless and SPI modes**
+
+> **Any parallel-IO peripheral driver (FlexIO, ObjectFLED, ESP32 PARLIO, LCD_CAM, I2S, etc.) must put its SPI mode and its clockless mode in the SAME `ChannelEngine`, unless the hardware truly cannot share the dispatch path.**
+
+Forking into two separate engines (e.g. `ChannelEngineFlexIO` and `ChannelEngineFlexIOSPI`) creates Bus enum proliferation, priority-table juggling, two registrations, two `BusTraits<>` specializations, and two engines competing for the same silicon block. The peripheral itself can only run in one mode at a time, so internal mode-switch logic in `show()` is the architecturally correct shape.
+
+**How to apply:**
+
+```cpp
+class ChannelEngineMyPeripheral : public fl::IChannelDriver {
+    // Both modes -> one engine returns BOTH caps.
+    Capabilities getCapabilities() const FL_NO_EXCEPT override {
+        return Capabilities(/*clockless=*/true, /*spi=*/true);
+    }
+
+    bool canHandle(const ChannelDataPtr& data) const FL_NO_EXCEPT override {
+        if (!data) return false;
+        if (data->isClockless()) return pin_routes_for_clockless(data->getPin());
+        if (data->isSpi()) {
+            const auto* spi = data->getChipset().ptr<SpiChipsetConfig>();
+            return spi && pins_route_for_spi(spi->dataPin, spi->clockPin);
+        }
+        return false;
+    }
+
+    void show() FL_NO_EXCEPT override {
+        for (auto& ch : mTransmittingChannels) {
+            if (ch->isClockless()) { run_clockless_mode(ch); }
+            else if (ch->isSpi())  { run_spi_mode(ch); }
+            // Mode switch between channels => reconfigure peripheral
+            // (shifter/timer config, DMA TCD, etc.) before transmitting.
+        }
+    }
+};
+```
+
+`BusTraits<Bus::X>` registers ONCE. `BusSupports<Bus::X, ClocklessChipset>` AND `BusSupports<Bus::X, SpiChipsetConfig>` both specialize to `fl::true_type`. Sketches selecting `Bus::X` with either chipset type get the right mode automatically.
+
+**Exception (rule does NOT apply):** genuinely separate peripherals — e.g. ESP32 LPSPI vs I2S_SPI are different silicon blocks with completely different register layouts and DMA paths. Two drivers is correct there. The "parallel-IO" qualifier in the rule excludes this case — the rule covers shared-peripheral-different-mode, not different-peripheral-same-protocol.
+
+**Why:** Established 2026-06-27 during the #3428 FlexIO-SPI / ObjectFLED-SPI implementation. The initial design forked into separate FLEX_IO_SPI + OBJECT_FLED_SPI bus slots; the user reverted to the unified pattern because forking made the Bus enum + priority table + registration scaffolding 4× the maintenance burden for zero behavioral benefit. The CodeRabbit ruleset (`.coderabbit.yaml`) flags Bus enum additions that look like a parallel-IO peripheral mode fork.
 
 ### Overview
 

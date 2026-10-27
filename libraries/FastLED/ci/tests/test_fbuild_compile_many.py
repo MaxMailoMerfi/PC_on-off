@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from ci.boards import Board
-from ci.compiler.pio import PioCompiler
+from ci.compiler.board_compiler import BoardCompiler
 from ci.util import cpu_count as cpu_count_module
 from ci.util import fbuild_runner
 
@@ -20,6 +20,26 @@ def test_cpu_count_no_longer_caps_on_github_actions(
     monkeypatch.setattr(cpu_count_module.os, "cpu_count", lambda: 8)
 
     assert cpu_count_module.cpu_count() == 8
+
+
+def test_fbuild_executable_override_uses_explicit_local_binary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    binary = tmp_path / "fbuild.exe"
+    binary.write_bytes(b"")
+    monkeypatch.setenv("FBUILD_EXECUTABLE", str(binary))
+
+    assert fbuild_runner.get_fbuild_executable() == str(binary)
+
+
+def test_fbuild_executable_override_rejects_missing_binary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    missing = tmp_path / "missing-fbuild"
+    monkeypatch.setenv("FBUILD_EXECUTABLE", str(missing))
+
+    with pytest.raises(FileNotFoundError, match="FBUILD_EXECUTABLE"):
+        fbuild_runner.get_fbuild_executable()
 
 
 def test_run_fbuild_ci_uses_expected_command_and_parses_results(
@@ -44,6 +64,7 @@ def test_run_fbuild_ci_uses_expected_command_and_parses_results(
             auto_run: bool,
             capture: bool,
             env: dict[str, str] | None = None,
+            **kwargs: object,
         ) -> None:
             assert auto_run is False
             assert capture is True
@@ -65,7 +86,7 @@ def test_run_fbuild_ci_uses_expected_command_and_parses_results(
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.delenv("FASTLED_FRAMEWORK_JOBS", raising=False)
     monkeypatch.delenv("FASTLED_SKETCH_JOBS", raising=False)
-    monkeypatch.setattr("running_process.RunningProcess", FakeRunningProcess)
+    monkeypatch.setattr(fbuild_runner, "RunningProcess", FakeRunningProcess)
 
     result = fbuild_runner.run_fbuild_ci(
         board="uno",
@@ -117,6 +138,7 @@ def test_run_fbuild_ci_fails_when_output_is_partially_unparseable(
             auto_run: bool,
             capture: bool,
             env: dict[str, str] | None = None,
+            **kwargs: object,
         ) -> None:
             assert cmd[1] == "ci"
             assert timeout == 1800
@@ -144,7 +166,7 @@ def test_run_fbuild_ci_fails_when_output_is_partially_unparseable(
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.delenv("FASTLED_FRAMEWORK_JOBS", raising=False)
     monkeypatch.delenv("FASTLED_SKETCH_JOBS", raising=False)
-    monkeypatch.setattr("running_process.RunningProcess", FakeRunningProcess)
+    monkeypatch.setattr(fbuild_runner, "RunningProcess", FakeRunningProcess)
 
     result = fbuild_runner.run_fbuild_ci(
         board="uno",
@@ -161,14 +183,60 @@ def test_run_fbuild_ci_fails_when_output_is_partially_unparseable(
     assert "weird output format" in result.output
 
 
-def test_pio_compiler_build_prefers_ci_results(
+def test_run_fbuild_compile_fails_on_build_error_with_zero_returncode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    compiler = PioCompiler(
+    class FakeRunningProcess:
+        def __init__(
+            self,
+            cmd: list[str],
+            timeout: int,
+            auto_run: bool,
+            capture: bool,
+            env: dict[str, str] | None = None,
+            **kwargs: object,
+        ) -> None:
+            assert cmd[:4] == ["fbuild.exe", str(tmp_path), "build", "-e"]
+            assert timeout == 1800
+            assert auto_run is False
+            assert capture is True
+            assert env is not None
+            self.stdout = "\n".join(
+                [
+                    "   0.00 =   BUILDING lpc845brk   =",
+                    "build error: build failed: local library 'FastLED' compilation failed",
+                    "fbuild version: 2.2.30",
+                ]
+            )
+            self.returncode = 0
+
+        def start(self) -> None:
+            pass
+
+        def wait(self, echo: bool) -> int:
+            assert echo is True
+            return 0
+
+    monkeypatch.setattr(fbuild_runner, "get_fbuild_executable", lambda: "fbuild.exe")
+    monkeypatch.setattr(fbuild_runner, "RunningProcess", FakeRunningProcess)
+
+    result = fbuild_runner.run_fbuild_compile(
+        tmp_path,
+        environment="lpc845brk",
+        verbose=False,
+    )
+
+    assert result.success is False
+    assert result.returncode == 0
+    assert "build error:" in result.output
+
+
+def test_board_compiler_build_prefers_ci_results(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    compiler = BoardCompiler(
         board=Board(board_name="uno"),
         verbose=False,
-        global_cache_dir=tmp_path / "cache",
-        use_fbuild=True,
     )
     compiler.build_dir = tmp_path / "board"
     compiler.build_dir.mkdir(parents=True, exist_ok=True)
@@ -184,7 +252,7 @@ def test_pio_compiler_build_prefers_ci_results(
     other_log.write_text("demo ok", encoding="utf-8")
 
     # compile-many is gated behind FASTLED_USE_FBUILD_CI in
-    # PioCompiler._build_fbuild (FastLED/fbuild#335). Opt in here so the
+    # BoardCompiler._build_fbuild (FastLED/fbuild#335). Opt in here so the
     # ci-results path actually runs in this test; without the env var
     # the dispatch falls through to the legacy serial loop and the
     # mocked run_fbuild_ci below would never be called.
@@ -244,7 +312,7 @@ def test_pio_compiler_build_prefers_ci_results(
         return True
 
     monkeypatch.setattr(
-        "ci.compiler.pio.generate_build_info_json_from_existing_build",
+        "ci.compiler.board_compiler.generate_build_info_json_from_existing_build",
         fake_generate_build_info,
     )
 
@@ -274,8 +342,6 @@ def test_fbuild_supports_subcommand_uses_sub_help_form(
     detection always returned False and CI silently fell back to the
     legacy serial loop. Regression guard for that bug.
     """
-    import subprocess
-
     monkeypatch.setattr(fbuild_runner, "get_fbuild_executable", lambda: "fbuild.exe")
     fbuild_runner.fbuild_supports_ci.cache_clear()
     fbuild_runner.fbuild_supports_compile_many.cache_clear()
@@ -289,7 +355,7 @@ def test_fbuild_supports_subcommand_uses_sub_help_form(
         captured.append(cmd)
         return FakeProc()
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(fbuild_runner.RunningProcess, "run", fake_run)
 
     assert fbuild_runner.fbuild_supports_ci() is True
     assert fbuild_runner.fbuild_supports_compile_many() is True

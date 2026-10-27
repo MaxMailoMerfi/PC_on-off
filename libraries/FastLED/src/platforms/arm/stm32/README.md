@@ -1,6 +1,6 @@
 # FastLED Platform: STM32
 
-STM32 family support (e.g., F1, F2, F4 series).
+STM32 family support (e.g., F1, F2, F4, G0, H7, U5 series).
 
 ## Supported Cores
 
@@ -16,7 +16,7 @@ FastLED supports multiple STM32 Arduino cores:
 - `fastpin_arm_stm32.h`, `fastpin_arm_stm_legacy.h`, `fastpin_arm_stm_new.h`: Pin helpers/variants.
 - `clockless_arm_stm32.h`: Clockless driver for STM32.
 - `armpin.h`: Generic ARM pin template utilities.
-- `cm3_regs.h`: CM3 register helpers (used by Roger Clark core).
+- `cm3_regs.h`: Tier-3 legacy libmaple/Roger Clark fallback for cores without CMSIS. Existing vendor CMSIS definitions take precedence, including CMSIS 6 on the Zephyr-based Uno Q. Comparator member names avoid STM32 HAL macros; the clockless driver uses CMSIS 6 `DCB` or older `CoreDebug` to enable tracing.
 - `led_sysdefs_arm_stm32.h`: System defines for STM32.
 
 Notes:
@@ -136,6 +136,9 @@ STM32 platforms now support RGBW (4-channel) LED strips like SK6812.
 
 ### Implementation
 The clockless driver (`clockless_arm_stm32.h`) automatically detects RGBW mode and processes 4 bytes per pixel when needed, using the same precise timing as RGB mode.
+
+### Slim-bridge clockless path (#4594)
+`ClocklessController` is a `fl::SlimBridgeController`: `addLeds<>()` encodes pixels (colour order, scale, dither, RGBW) into a `ChannelData` buffer and hands it to a per-pin `ClocklessStm32Driver` (`IChannelDriver`). The driver wraps the cycle-counted bit-bang cores (M0 asm core from `m0clockless.h`; DWT/CYCCNT loop on Cortex-M3/M4/M7, which now emits `8 + XTRA0` bits per byte so the `XTRA0` template argument is honored) and registers itself lazily with `ChannelManager::registry()` the first time a controller is constructed. Each pin/timing/wait/`XTRA0` specialization gets its own driver named `STM32_CLOCKLESS_P<pin>_T<t1>_<t2>_<t3>_R<reset>_W<wait>_X<xtra0>`, so two controllers on the same pin with different timings never share a driver. With `FASTLED_ALLOW_INTERRUPTS=1`, the interrupt window opens between 3-byte groups. Arduino GIGA uses its own `platforms/arm/giga/clockless_arm_giga.h` and stays on the legacy path.
 
 ## Optional feature defines
 

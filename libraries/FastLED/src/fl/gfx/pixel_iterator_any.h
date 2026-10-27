@@ -5,7 +5,6 @@
 
 #include "fl/chipsets/encoders/pixel_iterator.h"
 #include "pixel_controller.h"
-#include "fl/stl/variant.h"
 #include "fl/stl/optional.h"
 #include "fl/stl/vector.h"
 #include "rgbw.h"
@@ -29,102 +28,97 @@ class PixelIteratorAny {
     /// @param newOrder Desired color order (RGB, RBG, GRB, GBR, BRG, BGR)
     /// @param rgbw RGBW conversion settings
     PixelIteratorAny(PixelController<RGB> &controller, EOrder newOrder, Rgbw rgbw,
-                     Rgbww rgbww = RgbwwInvalid::value())
-        : mRgbw(rgbw), mRgbww(rgbww) {
-        init(controller, newOrder);
+                     Rgbww rgbww = RgbwwInvalid::value()) FL_NO_EXCEPT
+        : mController(controller), mOrder(newOrder), mRgbw(rgbw), mRgbww(rgbww) {
+        bindIterator();
     }
 
     template<typename PIXEL_CONTROLLER>
     PixelIteratorAny(PIXEL_CONTROLLER &controller, EOrder newOrder, Rgbw rgbw,
-                     Rgbww rgbww = RgbwwInvalid::value())
-        : mRgbw(rgbw), mRgbww(rgbww) {
-        // (#2558) Bugfix surfaced by CodeRabbit on PR #2560: the previous
-        // implementation constructed rgbController for normalization but then
-        // called init(controller, ...) — passing the un-normalized original
-        // controller. init() takes a PixelController<RGB>&, so a non-RGB
-        // PIXEL_CONTROLLER would have failed to compile if this branch was
-        // ever instantiated; the bug stayed latent until now.
-        PixelController<RGB> rgbController(controller);  // Normalize to RGB order.
-        init(rgbController, newOrder);
+                     Rgbww rgbww = RgbwwInvalid::value()) FL_NO_EXCEPT
+        : mController(controller),  // Normalize to RGB order (#2558).
+          mOrder(newOrder), mRgbw(rgbw), mRgbww(rgbww) {
+        bindIterator();
     }
 
     /// @brief Get the type-erased PixelIterator
-    PixelIterator& get() { return *mPixelIterator; }
-    const PixelIterator& get() const { return *mPixelIterator; }
+    PixelIterator& get() FL_NO_EXCEPT { return *mPixelIterator; }
+    const PixelIterator& get() const FL_NO_EXCEPT { return *mPixelIterator; }
 
     /// @brief Implicit conversion to PixelIterator reference
-    operator PixelIterator&() { return *mPixelIterator; }
+    operator PixelIterator&() FL_NO_EXCEPT { return *mPixelIterator; }
 
     /// @brief Set XYMap for pixel addressing
     /// @param xymap XYMap with embedded width/height (nullptr to disable)
-    void setXYMap(const fl::shared_ptr<const XYMap>& xymap) {
+    void setXYMap(const fl::shared_ptr<const XYMap>& xymap) FL_NO_EXCEPT {
         mXyMap = xymap;
     }
 
-    /// @brief Initialize the adapter with color order conversion
-    void init(PixelController<RGB> &controller, EOrder newOrder) {
-        // Step 1: Create the appropriate PixelController variant based on color order
-        switch (newOrder) {
-        case RGB:
-            mAnyController = controller;
-            break;
-        case RBG:
-            mAnyController = PixelController<RBG>(controller);
-            break;
-        case GRB:
-            mAnyController = PixelController<GRB>(controller);
-            break;
-        case GBR:
-            mAnyController = PixelController<GBR>(controller);
-            break;
-        case BRG:
-            mAnyController = PixelController<BRG>(controller);
-            break;
-        case BGR:
-            mAnyController = PixelController<BGR>(controller);
-            break;
+    /// @brief Copy: the iterator must be re-aimed, not copied.
+    ///
+    /// This class is self-referential -- `mPixelIterator` is a type-erased
+    /// `PixelIterator` holding a `void*` into `mController`, a member of the
+    /// same object. The compiler-generated copy carried that pointer across
+    /// unchanged, so the copy's iterator kept reading the *source* object's
+    /// controller. Where the source was a temporary, as in
+    /// `ReorderingPixelIteratorAny`'s addressing branch, that was a read of
+    /// dead stack on every addressed frame (#4201).
+    PixelIteratorAny(const PixelIteratorAny& other) FL_NO_EXCEPT
+        : mController(other.mController), mOrder(other.mOrder),
+          mRgbw(other.mRgbw), mRgbww(other.mRgbww), mXyMap(other.mXyMap) {
+        bindIterator();
+    }
+
+    PixelIteratorAny(PixelIteratorAny&& other) FL_NO_EXCEPT
+        : mController(other.mController), mOrder(other.mOrder),
+          mRgbw(other.mRgbw), mRgbww(other.mRgbww), mXyMap(fl::move(other.mXyMap)) {
+        bindIterator();
+    }
+
+    PixelIteratorAny& operator=(const PixelIteratorAny& other) FL_NO_EXCEPT {
+        if (this != &other) {
+            mController = other.mController;
+            mOrder = other.mOrder;
+            mRgbw = other.mRgbw;
+            mRgbww = other.mRgbww;
+            mXyMap = other.mXyMap;
+            bindIterator();
         }
+        return *this;
+    }
 
-        // Step 2: Use visitor pattern to construct PixelIterator with correct pointer type
-        // Note: fl::Optional::emplace takes a constructed object, not constructor args
-        struct PixelIteratorInitVisitor {
-            PixelIteratorInitVisitor(Rgbw rgbw, Rgbww rgbww)
-                : rgbw(rgbw), rgbww(rgbww) {}
-            fl::Optional<PixelIterator>* pixelIteratorPtr;
-            Rgbw rgbw;
-            Rgbww rgbww;
-
-            // Need concrete overloads for each type in the variant
-            void accept(PixelController<RGB>& controller) {
-                pixelIteratorPtr->emplace(PixelIterator(&controller, rgbw, rgbww));
-            }
-            void accept(PixelController<RBG>& controller) {
-                pixelIteratorPtr->emplace(PixelIterator(&controller, rgbw, rgbww));
-            }
-            void accept(PixelController<GRB>& controller) {
-                pixelIteratorPtr->emplace(PixelIterator(&controller, rgbw, rgbww));
-            }
-            void accept(PixelController<GBR>& controller) {
-                pixelIteratorPtr->emplace(PixelIterator(&controller, rgbw, rgbww));
-            }
-            void accept(PixelController<BRG>& controller) {
-                pixelIteratorPtr->emplace(PixelIterator(&controller, rgbw, rgbww));
-            }
-            void accept(PixelController<BGR>& controller) {
-                pixelIteratorPtr->emplace(PixelIterator(&controller, rgbw, rgbww));
-            }
-        };
-
-        PixelIteratorInitVisitor visitor(mRgbw, mRgbww);
-        visitor.pixelIteratorPtr = &mPixelIterator;
-        mAnyController.visit(visitor);
+    PixelIteratorAny& operator=(PixelIteratorAny&& other) FL_NO_EXCEPT {
+        if (this != &other) {
+            mController = other.mController;
+            mOrder = other.mOrder;
+            mRgbw = other.mRgbw;
+            mRgbww = other.mRgbww;
+            mXyMap = fl::move(other.mXyMap);
+            bindIterator();
+        }
+        return *this;
     }
 
   private:
-    fl::variant<PixelController<RGB>, PixelController<RBG>,
-                PixelController<GRB>, PixelController<GBR>,
-                PixelController<BRG>, PixelController<BGR>>
-        mAnyController;
+    /// @brief Point `mPixelIterator` at this object's own controller.
+    ///
+    /// Every path that changes `mController` has to end here, because the
+    /// iterator holds a raw pointer into it and nothing else fixes that up.
+    ///
+    /// One `PixelController<RGB>` for every order. This used to hold a
+    /// `variant` of six `PixelController<EOrder>` instantiations and visit it
+    /// -- six copies of a ~870 B vtable set plus a 127 B visit thunk each, of
+    /// which a sketch uses one, measured at ~5.9 KB on an esp32dev Blink
+    /// build. A colour order is a pure permutation of the three per-channel
+    /// values, so the iterator applies it and the other five instantiations
+    /// are never referenced (FastLED#4402).
+    void bindIterator() FL_NO_EXCEPT {
+        mPixelIterator.emplace(PixelIterator(&mController, mRgbw, mRgbww));
+        mPixelIterator->setColorOrder(mOrder);
+    }
+
+    PixelController<RGB> mController;
+    EOrder mOrder;
 
     // fl::optional used just as a way to defer construction.
     fl::Optional<PixelIterator> mPixelIterator;

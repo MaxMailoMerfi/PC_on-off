@@ -5,6 +5,7 @@
 #pragma once
 
 #include "fl/stl/json.h"
+#include "fl/log/log.h"  // IWYU pragma: keep -- FL_WARN
 #include "fl/system/delay.h"
 #include "fl/stl/int.h"
 #include "fl/stl/cctype.h"
@@ -26,6 +27,8 @@
 #include "fl/stl/string.h"
 #include "fl/stl/strstream.h"
 #include "fl/stl/string_view.h"
+#include "fl/remote/rpc/response_stream.h"
+#include "fl/stl/noexcept.h"
 
 namespace fl {
 
@@ -39,7 +42,7 @@ namespace fl {
 /// @param prefix Optional prefix to prepend (default: "")
 /// @return Formatted string ready to be written to output
 /// @note Generic JSON serialization - works for any JSON, not just JSON-RPC
-fl::string formatJsonResponse(const fl::json& response, const char* prefix = "");
+fl::string formatJsonResponse(const fl::json& response, const char* prefix = "") FL_NO_EXCEPT;
 
 // =============================================================================
 // Generic I/O Functions (Templated for Testability)
@@ -53,14 +56,14 @@ fl::string formatJsonResponse(const fl::json& response, const char* prefix = "")
 /// @return Optional string containing the line (without delimiter), or nullopt if timeout
 /// @note Follows Arduino's readStringUntil() style - blocks until complete line or timeout
 template<typename SerialIn>
-fl::optional<fl::string> readSerialLine(SerialIn& serial, char delimiter = '\n', fl::optional<u32> timeoutMs = fl::nullopt);
+fl::optional<fl::string> readSerialLine(SerialIn& serial, char delimiter = '\n', fl::optional<u32> timeoutMs = fl::nullopt) FL_NO_EXCEPT;
 
 /// @brief Write a string with newline to a serial-like output
 /// @tparam SerialOut Type providing println() method
 /// @param serial Serial output destination
 /// @param str String to write
 template<typename SerialOut>
-void writeSerialLine(SerialOut& serial, const fl::string& str);
+void writeSerialLine(SerialOut& serial, const fl::string& str) FL_NO_EXCEPT;
 
 // =============================================================================
 // Serial Adapters (Using fl:: Functions)
@@ -69,8 +72,8 @@ void writeSerialLine(SerialOut& serial, const fl::string& str);
 /// @brief Serial adapter using fl:: input functions (fl::available, fl::read)
 /// @note Works across all FastLED platforms (AVR, ESP32, STM32, host, etc.)
 struct SerialReader {
-    int available() const { return fl::available(); }
-    int read() { return fl::read(); }
+    int available() const FL_NO_EXCEPT { return fl::available(); }
+    int read() FL_NO_EXCEPT { return fl::read(); }
 };
 
 /// @brief Optimized readSerialLine for fl:: serial input
@@ -79,7 +82,7 @@ struct SerialReader {
 /// @param timeoutMs Optional timeout in milliseconds (nullopt = wait forever)
 /// @return Optional string containing the line (without delimiter), or nullopt if timeout
 /// @note Delegates to normalized fl::readLine() API with default skipChar='\r'
-inline fl::optional<fl::string> readSerialLine(SerialReader& serial, char delimiter = '\n', fl::optional<u32> timeoutMs = fl::nullopt) {
+inline fl::optional<fl::string> readSerialLine(SerialReader& serial, char delimiter = '\n', fl::optional<u32> timeoutMs = fl::nullopt) FL_NO_EXCEPT {
     (void)serial;  // Unused, we call fl::readLine() directly
     return fl::readLine(delimiter, '\r', timeoutMs);
 }
@@ -87,7 +90,10 @@ inline fl::optional<fl::string> readSerialLine(SerialReader& serial, char delimi
 /// @brief Serial adapter using fl:: output functions (fl::println)
 /// @note Works across all FastLED platforms
 struct SerialWriter {
-    void println(const char* str) { fl::println(str); }
+    void println(const char* str) FL_NO_EXCEPT { fl::println(str); }
+    void write(const char* data, fl::size len) FL_NO_EXCEPT {
+        fl::write_bytes(reinterpret_cast<const fl::u8*>(data), len);  // ok reinterpret cast
+    }
 };
 
 // =============================================================================
@@ -105,8 +111,13 @@ struct SerialWriter {
 /// auto responseSink = fl::createSerialResponseSink("REMOTE: ");
 /// fl::Remote remote(requestSource, responseSink);
 /// @endcode
+/// Lines at least this long are reported when discarded. Below it, a
+/// non-JSON line is ordinary serial noise; above it, it is more likely a
+/// request that lost bytes on the way in.
+constexpr fl::size kDroppedRequestWarnBytes = 64;
+
 inline fl::function<fl::optional<fl::json>()>
-createSerialRequestSource(const char* prefix = "") {
+createSerialRequestSource(const char* prefix = "") FL_NO_EXCEPT {
     return [prefix]() -> fl::optional<fl::json> {
         // Non-blocking check - any data available?
         int avail = fl::available();
@@ -145,6 +156,22 @@ createSerialRequestSource(const char* prefix = "") {
 
         // Only parse if input starts with '{'
         if (view.empty() || view[0] != '{') {
+            // A short line here is ordinary serial noise -- boot banners,
+            // stray newlines -- and warning about it would drown the log.
+            // A long one is almost certainly a request that arrived damaged,
+            // and dropping that silently is expensive to debug: the caller
+            // sees no reply and no error, indistinguishable from an idle
+            // link, while the device keeps answering everything else. That
+            // is exactly how a receive-buffer truncation presented in
+            // FastLED#3956 -- 735 bytes transmitted, nothing returned, and
+            // no layer saying anything.
+            // Measure what arrived, not what survived normalisation: the
+            // view above has had its prefix stripped and whitespace trimmed,
+            // so a 64-byte line can fall under the threshold and stay silent,
+            // and the reported count would understate what was received.
+            if (line->size() >= kDroppedRequestWarnBytes) {
+                FL_WARN("[RPC] discarded a " << (static_cast<unsigned>(line->size())) << " byte line that does not begin with '{'; a request that arrived truncated looks exactly like this");
+            }
             return fl::nullopt;
         }
 
@@ -159,12 +186,35 @@ createSerialRequestSource(const char* prefix = "") {
 /// @return ResponseSink callback suitable for fl::Remote constructor
 /// @note Composes protocol layer (schema filtering) with transport layer (serial I/O)
 inline fl::function<void(const fl::json&)>
-createSerialResponseSink(const char* prefix = "REMOTE: ") {
+createSerialResponseSink(const char* prefix = "REMOTE: ") FL_NO_EXCEPT {
     return [prefix](const fl::json& response) {
         // Format and write to serial (no filtering needed - protocol uses flat structure)
         SerialWriter serial;
         fl::string formatted = formatJsonResponse(response, prefix);
         writeSerialLine(serial, formatted);
+    };
+}
+
+/// @brief Create a streamed JSON-RPC ResponseSink that writes directly to serial
+/// @param prefix Optional prefix to prepend to responses (default: "REMOTE: ")
+/// @return Streaming response sink suitable for fl::Remote constructor
+inline fl::ResponseStreamSink
+createSerialResponseStreamSink(const char* prefix = "REMOTE: ") FL_NO_EXCEPT {
+    return [prefix](fl::JsonStreamCallback writeJson) {
+        SerialWriter serial;
+        if (prefix && prefix[0] != '\0') {
+            serial.write(prefix, fl::strlen(prefix));
+        }
+
+        fl::JsonStreamWriter writer([&serial](const char* data, fl::size len) {
+            serial.write(data, len);
+        });
+        if (writeJson) {
+            writeJson(writer);
+        }
+        writer.flush();
+        serial.write("\n", 1);
+        fl::flush();
     };
 }
 
@@ -179,7 +229,7 @@ createSerialResponseSink(const char* prefix = "REMOTE: ") {
 /// fl::Remote remote(source, sink);
 /// @endcode
 inline fl::pair<fl::function<fl::optional<fl::json>()>, fl::function<void(const fl::json&)>>
-createSerialTransport(const char* responsePrefix = "REMOTE: ", const char* requestPrefix = "") {
+createSerialTransport(const char* responsePrefix = "REMOTE: ", const char* requestPrefix = "") FL_NO_EXCEPT {
     return {createSerialRequestSource(requestPrefix), createSerialResponseSink(responsePrefix)};
 }
 
@@ -188,13 +238,13 @@ createSerialTransport(const char* responsePrefix = "REMOTE: ", const char* reque
 // =============================================================================
 
 template<typename SerialIn>
-fl::optional<fl::string> readSerialLine(SerialIn& serial, char delimiter, fl::optional<u32> timeoutMs) {
+fl::optional<fl::string> readSerialLine(SerialIn& serial, char delimiter, fl::optional<u32> timeoutMs) FL_NO_EXCEPT {
     // Delegate to readSerialStringUntil with default skipChar='\r'
     return readSerialStringUntil(serial, delimiter, '\r', timeoutMs);
 }
 
 template<typename SerialIn>
-fl::optional<fl::string> readSerialStringUntil(SerialIn& serial, char delimiter, char skipChar, fl::optional<u32> timeoutMs) {
+fl::optional<fl::string> readSerialStringUntil(SerialIn& serial, char delimiter, char skipChar, fl::optional<u32> timeoutMs) FL_NO_EXCEPT {
     // Follows Arduino Serial.readStringUntil() API - blocks until delimiter found
     fl::sstream buffer;
 
@@ -242,7 +292,7 @@ fl::optional<fl::string> readSerialStringUntil(SerialIn& serial, char delimiter,
 }
 
 template<typename SerialOut>
-void writeSerialLine(SerialOut& serial, const fl::string& str) {
+void writeSerialLine(SerialOut& serial, const fl::string& str) FL_NO_EXCEPT {
     serial.println(str.c_str());
 }
 

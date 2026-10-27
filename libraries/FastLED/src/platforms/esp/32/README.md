@@ -38,7 +38,7 @@ Notes:
 FastLED supports the parallel I2S clockless driver on the following ESP32 targets in this tree:
 
 - ESP32 (classic, e.g., "ESP32Dev")
-  - Enable via build flags (PlatformIO `platformio.ini`):
+  - Enable via build flags (`platformio.ini`):
     ```ini
     [env:esp32dev]
     platform = espressif32
@@ -54,7 +54,7 @@ FastLED supports the parallel I2S clockless driver on the following ESP32 target
   - Constraints: all lanes use identical timing (same LED chipset); up to 24 lanes.
 
 - ESP32-S3
-  - Enable via build flags (PlatformIO `platformio.ini`):
+  - Enable via build flags (`platformio.ini`):
     ```ini
     [env:esp32s3]
     platform = espressif32
@@ -89,6 +89,11 @@ Additional I2S defines and guidance:
   - **`FASTLED_ALL_PINS_HARDWARE_SPI`**: **DEPRECATED**. Hardware SPI is now the unconditional default. This define is accepted for backwards compatibility but no longer required.
   - **`FASTLED_FORCE_SOFTWARE_SPI`**: Force software bit-banging SPI instead of hardware SPI. The SPI bus manager will still handle device registration and conflict detection, but all data transmission uses software bit-banging. Use only if hardware SPI causes issues.
   - **`FASTLED_ESP32_SPI_BUS`**: Select SPI bus: `VSPI`, `HSPI`, or `FSPI`. Defaults per target: S2/S3 use `FSPI`, others default to `VSPI` (see `fastspi_esp32.h`).
+  - For independent per-controller selection with the ESP-IDF backend, pass
+    `fl::Esp32SpiBus::HOST2` or `fl::Esp32SpiBus::HOST3` as the final argument:
+    `FastLED.addLeds<APA102, DATA, CLOCK, RGB, DATA_RATE_MHZ(20)>(leds, count, fl::Esp32SpiBus::HOST3);`.
+    An omitted override remains `AUTO` and preserves the existing automatic
+    host allocation order.
   - **`FASTLED_ESP32_SPI_BULK_TRANSFER`**: When `1`, batches pixels into blocks to reduce transfer overhead and improve throughput at the cost of RAM. Default `0`.
   - **`FASTLED_ESP32_SPI_BULK_TRANSFER_SIZE`**: Bulk block size (CRGBs) when bulk mode is enabled. Default `64`.
 
@@ -336,7 +341,7 @@ Multi-lane SPI requires DMA-capable memory for internal buffers:
 - **Large installations** (>500 LEDs/strip): **PSRAM strongly recommended**
 - ESP32-S3 EDMA enables PSRAM to be DMA-capable (automatic)
 
-**Enable PSRAM in PlatformIO:**
+**Enable PSRAM in `platformio.ini`:**
 ```ini
 [env:esp32s3]
 platform = espressif32
@@ -413,6 +418,40 @@ On ESP32, when using 9-16 lanes, the `SPIBusManager` automatically:
 3. Promotes to hexadeca-SPI mode
 4. Uses hardware-accelerated parallel transmission
 
+## `show()`, `wait()`, and FreeRTOS tasks
+
+Normal animation code should not add a fixed delay solely to make
+`FastLED.show()` work. The channel manager waits for the previous frame before
+it reuses driver-owned data for the next one, and the default ESP32 RMT path
+includes the minimum inter-frame latch fix from
+[PR #965](https://github.com/FastLED/FastLED/pull/965). A delay does not need to
+grow with LED count.
+
+`FastLED.delay(ms)` is an animation helper: it repeatedly calls `show()` while
+the interval elapses and yields between calls. Do not use it as a transmission-
+completion primitive in a FreeRTOS task.
+
+If a task must know that RMT, I2S, SPI, or another asynchronous backend has
+finished on the wire, use the explicit completion API:
+
+```cpp
+FastLED.show();
+if (!FastLED.wait(1000)) {
+    // A driver did not complete within one second.
+}
+```
+
+The wait cooperatively runs system work, so lower-priority and network tasks can
+continue. An application may still use `vTaskDelay()`, `fl::delay()`, or its own
+timer to set the animation frame rate; that is task scheduling, not an LED
+protocol requirement.
+
+Exact trait-based reset timing for the selectable IDF4 RMT and ESP32-S3 I2S
+channel backends is tracked in
+[issue #3932](https://github.com/FastLED/FastLED/issues/3932). If a problem is
+specific to one of those backends, an arbitrary application delay may hide the
+symptom, but fixing the backend timing is the correct solution.
+
 ## RMT backends (IDF4 vs IDF5) and how to select
 
 Two RMT implementations exist and are selected by IDF version unless you override it:
@@ -422,12 +461,20 @@ Two RMT implementations exist and are selected by IDF version unless you overrid
 
 Selection rules:
 - Default: `ESP_IDF_VERSION` decides. On IDF < 5, RMT5 is disabled; on IDF ≥ 5, RMT5 is enabled.
-- To force RMT4 on IDF5, set this build define (PlatformIO `platformio.ini`):
-  ```ini
-  build_flags =
-    -D FASTLED_RMT5=0
-  ```
-  This ensures only one RMT implementation is compiled. Do not link/use the IDF v5 `led_strip` driver in the same binary when forcing RMT4.
+- `-D FASTLED_RMT5=0` selects RMT4. **It is only supported on ESP‑IDF 4.x.**
+
+### RMT4 on IDF 5.x is not supported
+
+Forcing `-D FASTLED_RMT5=0` on ESP‑IDF 5.x or newer is rejected at compile time
+with a single diagnostic from `FastLED.h`. The legacy TX and RX engines do not
+build against IDF 5 headers: `RMTMEM` is no longer exposed publicly, and both
+engines predate the current `IChannelDriver` / `RmtRxChannel` contracts.
+
+Earlier releases suggested adding `-D ESP32_ARDUINO_NO_RGB_BUILTIN=1` to get past
+the guard. That define silences the guard but does not make the backend compile,
+so it is no longer recommended for this purpose. Use the RMT5 backend, which is
+already the IDF 5.x default — simply drop `-D FASTLED_RMT5=0`. If you need RMT4,
+build against ESP‑IDF 4.x. Tracking issue: FastLED#3936.
 
 Important compatibility note:
 - The RMT4 and RMT5 drivers cannot co‑exist in the same sketch/binary. Mixing both (e.g., using IDF v5 `led_strip` alongside FastLED’s RMT4) will trigger an Espressif runtime abort at startup.
@@ -445,12 +492,14 @@ Behavioral differences and practical guidance:
 - I2S (parallel)
   - Also DMA‑driven; while frame data is being transferred to the peripheral, your loop can continue doing work. Use more DMA buffers (`FASTLED_ESP32_I2S_NUM_DMA_BUFFERS 4`) to improve resilience under interrupt load.
 
-Quick PlatformIO examples
+Quick `platformio.ini` examples
 
-- Force RMT4 on IDF5 (legacy path):
+- Select RMT4 (legacy path) — requires an ESP‑IDF 4.x platform; rejected at
+  compile time on IDF 5.x and newer:
   ```ini
   [env:esp32dev_rmt4]
-  platform = espressif32
+  ; IDF 4.4 — the release FastLED's esp32dev_idf44 CI job builds against
+  platform = espressif32@4.4.0
   board = esp32dev
   framework = arduino
   build_flags =

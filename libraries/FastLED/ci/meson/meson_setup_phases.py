@@ -11,6 +11,8 @@ invocation.
 # pyright: reportMissingImports=false, reportUnknownVariableType=false
 
 import json
+import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -34,9 +36,11 @@ class MarkerPaths:
     debug: Path
     check: Path
     build_mode: Path
+    native_linker: Path
     compiler_version: Path
     zccache_version: Path
     enable_examples: Path
+    enable_full_examples: Path
     enable_unit_tests: Path
 
     @classmethod
@@ -49,9 +53,11 @@ class MarkerPaths:
             debug=build_dir / ".debug_config",
             check=build_dir / ".check_config",
             build_mode=build_dir / ".build_mode_config",
+            native_linker=build_dir / ".native_linker_config",
             compiler_version=build_dir / ".compiler_version_config",
             zccache_version=build_dir / ".zccache_version_config",
             enable_examples=build_dir / ".enable_examples_config",
+            enable_full_examples=build_dir / ".enable_full_examples_config",
             enable_unit_tests=build_dir / ".enable_unit_tests_config",
         )
 
@@ -165,7 +171,9 @@ def check_reconfigure_markers(
     debug: bool,
     check: bool,
     build_mode: str,
+    native_linker_identity: str,
     enable_examples: bool,
+    enable_full_examples: bool,
     enable_unit_tests: bool,
     use_thin_archives: bool,
 ) -> ReconfigureDecision:
@@ -301,6 +309,15 @@ def check_reconfigure_markers(
     else:
         decision.reasons.append("build_mode marker missing")
 
+    if markers.native_linker.exists():
+        try:
+            if markers.native_linker.read_text().strip() != native_linker_identity:
+                decision.reasons.append("native linker changed")
+        except OSError:
+            decision.reasons.append("native linker marker unreadable")
+    else:
+        decision.reasons.append("native linker marker missing")
+
     # enable_examples marker
     if markers.enable_examples.exists():
         try:
@@ -311,6 +328,23 @@ def check_reconfigure_markers(
                 )
         except (OSError, IOError):
             decision.reasons.append("enable_examples marker unreadable")
+
+    # A missing marker in an existing build has unknown target coverage. Reconfigure
+    # before recording the requested setting so the marker describes the real graph.
+    if markers.enable_full_examples.exists():
+        try:
+            marker_value = markers.enable_full_examples.read_text().strip()
+            if marker_value not in ("True", "False"):
+                decision.reasons.append("enable_full_examples marker unreadable")
+            elif (marker_value == "True") != enable_full_examples:
+                decision.reasons.append(
+                    "enable_full_examples changed: "
+                    f"{marker_value} → {enable_full_examples}"
+                )
+        except (OSError, IOError):
+            decision.reasons.append("enable_full_examples marker unreadable")
+    else:
+        decision.reasons.append("enable_full_examples marker missing")
 
     # enable_unit_tests marker
     if markers.enable_unit_tests.exists():
@@ -357,7 +391,7 @@ def check_reconfigure_markers(
 
 
 def check_meson_build_modified(source_dir: Path, build_dir: Path) -> bool:
-    """Return True if any meson.build is newer than build.ninja."""
+    """Return True if a Meson configuration input is newer than build.ninja."""
     build_ninja_path = build_dir / "build.ninja"
     if not build_ninja_path.exists():
         return False
@@ -365,24 +399,49 @@ def check_meson_build_modified(source_dir: Path, build_dir: Path) -> bool:
         build_ninja_mtime = build_ninja_path.stat().st_mtime
         meson_build_files = [
             source_dir / "meson.build",
+            source_dir / "meson.options",
             source_dir / "tests" / "meson.build",
             source_dir / "examples" / "meson.build",
+            source_dir / "ci" / "examples" / "example_groups.py",
+            source_dir / "ci" / "meson" / "compile_tests" / "meson.build",
         ]
         for meson_file in meson_build_files:
-            if meson_file.exists():
-                meson_file_mtime = meson_file.stat().st_mtime
-                if meson_file_mtime > build_ninja_mtime:
-                    _ts_print(
-                        f"[MESON] ⚠️  Detected modified meson.build: {meson_file.relative_to(source_dir)}"
-                    )
-                    _ts_print(
-                        f"[MESON]     File mtime: {meson_file_mtime:.6f} > build.ninja mtime: {build_ninja_mtime:.6f}"
-                    )
-                    return True
+            if not meson_file.exists():
+                _ts_print(
+                    f"[MESON] ⚠️  Missing configuration input: {meson_file.relative_to(source_dir)}"
+                )
+                return True
+            meson_file_mtime = meson_file.stat().st_mtime
+            if meson_file_mtime > build_ninja_mtime:
+                _ts_print(
+                    f"[MESON] ⚠️  Detected modified configuration input: {meson_file.relative_to(source_dir)}"
+                )
+                _ts_print(
+                    f"[MESON]     File mtime: {meson_file_mtime:.6f} > build.ninja mtime: {build_ninja_mtime:.6f}"
+                )
+                return True
     except (OSError, IOError) as e:
-        _ts_print(f"[MESON] Warning: Could not check meson.build timestamps: {e}")
+        _ts_print(f"[MESON] Warning: Could not check Meson input timestamps: {e}")
         return True
     return False
+
+
+def _write_test_list_watermark(build_dir: Path, max_tests_dir_mtime: float) -> None:
+    """Persist the tests/ dir mtime that the current cached list corresponds to.
+
+    Written atomically: a torn watermark would be parsed as corrupt and force a
+    full rescan, which is safe but silently costs ~400ms on every build.
+    """
+    watermark_path = build_dir / "test_list_watermark.txt"
+    temp_path = watermark_path.with_suffix(".tmp")
+    try:
+        temp_path.write_text(f"{max_tests_dir_mtime!r}\n")
+        temp_path.replace(watermark_path)
+    except OSError:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
 
 
 def detect_test_file_changes(
@@ -390,17 +449,23 @@ def detect_test_file_changes(
 ) -> bool:
     """Return True when discovered test files differ from the cached list."""
     test_list_cache_path = build_dir / "test_list_cache.txt"
-    skip_test_discovery = False
+    # Watermark = the max tests/ dir mtime observed by the scan that produced
+    # the cached list. It must NOT be the cache file's own mtime: the cache is
+    # written *after* discovery, so a test file created in between would carry
+    # an older parent-dir mtime than the cache and be masked forever -- the
+    # fast path would report "no changes" on every subsequent run and the new
+    # test would silently never build, while the suite still reported green.
+    # Comparing against a watermark captured *before* the scan makes anything
+    # added during or after that scan strictly newer, so it is always caught.
+    watermark_path = build_dir / "test_list_watermark.txt"
     if test_list_cache_path.exists():
         try:
-            tlc_mtime = test_list_cache_path.stat().st_mtime
-            if max_tests_dir_mtime <= tlc_mtime:
-                skip_test_discovery = True
-        except OSError:
+            watermark = float(watermark_path.read_text().strip())
+            if max_tests_dir_mtime <= watermark:
+                return False
+        except (OSError, ValueError):
+            # No/corrupt watermark -- fall through to the authoritative compare.
             pass
-
-    if skip_test_discovery:
-        return False
 
     try:
         import importlib.util
@@ -489,12 +554,10 @@ def detect_test_file_changes(
                     temp_cache.unlink()
                 except (OSError, IOError):
                     pass
+            _write_test_list_watermark(build_dir, max_tests_dir_mtime)
             return True
-        # No changes — touch cache so directory-mtime fast-path activates next run.
-        try:
-            test_list_cache.touch()
-        except OSError:
-            pass
+        # No changes — record the watermark so the fast path activates next run.
+        _write_test_list_watermark(build_dir, max_tests_dir_mtime)
         return False
 
     except KeyboardInterrupt as ki:
@@ -505,60 +568,99 @@ def detect_test_file_changes(
         return True
 
 
-def detect_example_file_changes(source_dir: Path, build_dir: Path) -> bool:
-    """Return True when ``examples/`` files have been added/removed/modified."""
+def detect_example_file_changes(source_dir: Path, build_dir: Path) -> "str | None":
+    """Return a reconfigure reason when ``examples/`` needs re-discovery, else None.
+
+    The reason is distinct for "cache missing" vs "files actually changed": a
+    missing cache means we *cannot prove* the examples are unchanged, which is
+    not the same claim as having observed a change (issue #3761). The caller
+    prints the returned reason, so this does not print one itself.
+
+    This never deletes the cache. Deleting it made a single false positive
+    self-perpetuating: only meson's ``--update`` rewrites the file, so any run
+    that was fully fingerprint-cached (meson never invoked) left the cache
+    missing and guaranteed another false "example files changed" next time.
+
+    The cache file's mtime doubles as a "contents last verified at" marker, and
+    is re-stamped whenever the content hash matches. Without that re-stamp a
+    single ``git checkout`` would leave every later run paying the full content
+    hash (~0.2s for ~300 files) forever, because the checkout's mtimes stay
+    newer than the cache the fast path compares against.
+    """
     try:
-        from ci.meson.example_metadata_cache import compute_example_files_hash
+        from ci.meson.example_metadata_cache import (
+            compute_example_files_hash,
+            max_example_files_mtime,
+        )
 
         examples_dir = source_dir / "examples"
         example_cache_file = build_dir / "examples" / "example_metadata.cache"
 
         if not examples_dir.exists():
-            return False
+            return None
 
-        skip_example_hash = False
-        if example_cache_file.exists():
-            try:
-                cache_mtime = example_cache_file.stat().st_mtime
-                max_example_dir_mtime = get_max_dir_mtime(examples_dir)
-                if max_example_dir_mtime <= cache_mtime:
-                    skip_example_hash = True
-            except OSError:
-                pass
+        if not example_cache_file.exists():
+            return "example metadata cache missing - cannot prove examples unchanged"
 
-        if skip_example_hash:
-            return False
-
-        current_example_hash = compute_example_files_hash(examples_dir)
-        cached_example_hash = ""
-        if example_cache_file.exists():
-            try:
-                with open(example_cache_file, "r") as f:
-                    cache_data = json.load(f)
-                cached_example_hash = cache_data.get("hash", "")
-            except KeyboardInterrupt as ki:
-                handle_keyboard_interrupt(ki)
-            except Exception:
-                cached_example_hash = ""
-
-        if current_example_hash != cached_example_hash:
-            print_warning(
-                "[MESON] ⚠️  Detected example file changes (files added/removed/modified)"
+        # Fast path: if nothing under examples/ is newer than the last-verified
+        # marker, the contents cannot have changed since. Both probes are
+        # needed — file mtimes catch in-place edits, directory mtimes catch
+        # additions and deletions (which leave sibling files untouched).
+        try:
+            verified_at = example_cache_file.stat().st_mtime
+            newest = max(
+                get_max_dir_mtime(examples_dir), max_example_files_mtime(examples_dir)
             )
-            if example_cache_file.exists():
-                try:
-                    example_cache_file.unlink()
-                except OSError:
-                    pass
-            return True
-        return False
+            # Strict `<`: an entry whose mtime lands in the same clock tick as
+            # the marker (Windows' system clock granularity is ~15ms) must fall
+            # through to the hash rather than be assumed unchanged.
+            if newest < verified_at:
+                return None
+        except OSError:
+            pass
+
+        cached_example_hash = ""
+        try:
+            # save_cache() writes UTF-8; reading with the platform locale codec
+            # (cp1252 on Windows) turns any non-ASCII example path or @filter
+            # string into a permanent decode failure, and therefore a
+            # reconfigure on every single run.
+            with open(example_cache_file, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+            cached_example_hash = cache_data.get("hash", "")
+        except KeyboardInterrupt as ki:
+            # Re-raise like the outer handler does. handle_keyboard_interrupt()
+            # only raises on the main thread; from a worker it just notifies and
+            # returns, so without this a Ctrl-C would fall through and be
+            # reported as "cache unreadable" — forcing a reconfigure out of an
+            # interrupt instead of unwinding.
+            handle_keyboard_interrupt(ki)
+            raise
+        except Exception:
+            cached_example_hash = ""
+
+        if not cached_example_hash:
+            return "example metadata cache unreadable - cannot prove examples unchanged"
+
+        # Stamp the marker from *before* the hash, so an edit that lands while
+        # we are hashing still looks newer than the marker on the next run.
+        verify_started = time.time()
+        if compute_example_files_hash(examples_dir) != cached_example_hash:
+            return "example files changed"
+
+        # Contents match: re-arm the fast path so the next run skips the hash.
+        try:
+            os.utime(example_cache_file, (verify_started, verify_started))
+        except OSError:
+            pass
+        return None
 
     except KeyboardInterrupt as ki:
         handle_keyboard_interrupt(ki)
         raise
     except Exception as e:
         _ts_print(f"[MESON] Warning: Could not check example file changes: {e}")
-        return True
+        return "example file check failed"
 
 
 def check_obsolete_zig_wrappers(source_dir: Path) -> None:

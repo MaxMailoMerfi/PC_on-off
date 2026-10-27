@@ -47,29 +47,17 @@ namespace fl {
 /// CodeRabbit suggestion to split into `.impl.hpp` (PR #2872 review,
 /// tracked at #2875) does not apply for template-heavy headers.
 
+// Use the vendor CMSIS PAL SPI_Type from <LPC845.h> / <LPC804.h> (brought
+// in via led_sysdefs_arm_lpc.h). SPI0/SPI1 pointer macros and SPI0_BASE/
+// SPI1_BASE come from the vendor header. FL_LPC_SPI0_BASE / FL_LPC_SPI1_BASE
+// kept as aliases for backward compat with users that pass the base address
+// as the pSPIX template parameter.
 #ifndef FL_LPC_SPI0_BASE
-#define FL_LPC_SPI0_BASE 0x40058000UL
+#define FL_LPC_SPI0_BASE SPI0_BASE
 #endif
 #ifndef FL_LPC_SPI1_BASE
-#define FL_LPC_SPI1_BASE 0x4005C000UL
+#define FL_LPC_SPI1_BASE SPI1_BASE
 #endif
-
-/// Minimal LPC8xx SPI controller view used by the FastLED SPI driver.
-/// Mirrors the relevant subset of MCUXpresso CMSIS LPC_SPI_Type; when the
-/// device header is on the include path the real type is what links.
-typedef struct {
-    volatile u32 CFG;          // 0x000 SPI configuration
-    volatile u32 DLY;          // 0x004 Delay between frames
-    volatile u32 STAT;         // 0x008 Status (R/W1C on some bits)
-    volatile u32 INTENSET;     // 0x00C Interrupt enable set
-    volatile u32 INTENCLR;     // 0x010 Interrupt enable clear
-    volatile u32 RXDAT;        // 0x014 Receive data
-    volatile u32 TXDATCTL;     // 0x018 Transmit data with control
-    volatile u32 TXDAT;        // 0x01C Transmit data only
-    volatile u32 TXCTL;        // 0x020 Transmit control only
-    volatile u32 DIV;          // 0x024 Clock divider (12-bit)
-    volatile u32 INTSTAT;      // 0x028 Interrupt status
-} FL_LPC_SPI_Type;
 
 // SPI register bit definitions (UM11029)
 #define FL_LPC_SPI_CFG_ENABLE         (1u << 0)
@@ -115,30 +103,59 @@ template <u8 _DATA_PIN, u8 _CLOCK_PIN, u32 _SPI_CLOCK_DIVIDER,
 class ARMHardwareSPIOutput {
     Selectable *mPSelect;
 
-    static inline FL_LPC_SPI_Type* spi_block() __attribute__((always_inline)) {
+    static inline SPI_Type* spi_block() __attribute__((always_inline)) {
         // C-style cast is the canonical embedded-register access pattern
         // (cf. clockless_arm_lpc_plu.h::reg32); the FastLED
         // reinterpret_cast linter explicitly allows C-style casts for MMIO
         // base addresses, where reinterpret_cast is otherwise flagged.
-        return (FL_LPC_SPI_Type*)(pSPIX);  // MMIO base address
+        return (SPI_Type*)(pSPIX);  // MMIO base address
     }
 
 public:
     ARMHardwareSPIOutput() : mPSelect(nullptr) {}
     explicit ARMHardwareSPIOutput(Selectable *pSelect) : mPSelect(pSelect) {}
 
-    void setSelect(Selectable *pSelect) FL_NOEXCEPT { mPSelect = pSelect; }
+    void setSelect(Selectable *pSelect) FL_NO_EXCEPT { mPSelect = pSelect; }
 
     /// Initialize SPI peripheral as master, 8-bit, MSB-first, CPOL=0, CPHA=0.
-    /// The user's startup code is responsible for:
-    ///   (a) enabling the SPI clock in SYSCON->SYSAHBCLKCTRL[11] / [12]
-    ///       (SPI0 / SPI1) on LPC845, or SYSCON->SYSAHBCLKCTRL0[11] on LPC804
-    ///   (b) routing MOSI/SCK through SWM to the requested pins
-    void init() FL_NOEXCEPT {
+    /// On LPC845 this is fully self-contained (clock enable, FCLKSEL
+    /// function-clock select, reset release, SWM routing) — the same
+    /// plumbing the DMA sibling silicon-validated in #3580; without it
+    /// the first spi->STAT read stalls the AHB bus forever. On LPC804
+    /// the old contract still applies: the user's startup enables the
+    /// SPI clock (SYSAHBCLKCTRL0[11]) and routes pins via SWM.
+    void init() FL_NO_EXCEPT {
         FastPin<_DATA_PIN>::setOutput();
         FastPin<_CLOCK_PIN>::setOutput();
 
-        FL_LPC_SPI_Type *spi = spi_block();
+#if defined(FL_IS_ARM_LPC_845)
+        const bool is_spi0 = (pSPIX == FL_LPC_SPI0_BASE);
+        SYSCON->SYSAHBCLKCTRL0 |=
+            (is_spi0 ? SYSCON_SYSAHBCLKCTRL0_SPI0_MASK
+                     : SYSCON_SYSAHBCLKCTRL0_SPI1_MASK) |
+            SYSCON_SYSAHBCLKCTRL0_SWM_MASK;
+        SYSCON->PRESETCTRL0 |=
+            (is_spi0 ? SYSCON_PRESETCTRL0_SPI0_RST_N_MASK
+                     : SYSCON_PRESETCTRL0_SPI1_RST_N_MASK);
+        SYSCON->FCLKSEL[is_spi0 ? 9 : 10] = SYSCON_FCLKSEL_SEL(0x1u);
+        if (is_spi0) {
+            SWM0->PINASSIGN.PINASSIGN3 =
+                (SWM0->PINASSIGN.PINASSIGN3 & ~SWM_PINASSIGN3_SPI0_SCK_IO_MASK) |
+                SWM_PINASSIGN3_SPI0_SCK_IO(_CLOCK_PIN);
+            SWM0->PINASSIGN.PINASSIGN4 =
+                (SWM0->PINASSIGN.PINASSIGN4 & ~SWM_PINASSIGN4_SPI0_MOSI_IO_MASK) |
+                SWM_PINASSIGN4_SPI0_MOSI_IO(_DATA_PIN);
+        } else {
+            SWM0->PINASSIGN.PINASSIGN5 =
+                (SWM0->PINASSIGN.PINASSIGN5 &
+                 ~(SWM_PINASSIGN5_SPI1_SCK_IO_MASK |
+                   SWM_PINASSIGN5_SPI1_MOSI_IO_MASK)) |
+                SWM_PINASSIGN5_SPI1_SCK_IO(_CLOCK_PIN) |
+                SWM_PINASSIGN5_SPI1_MOSI_IO(_DATA_PIN);
+        }
+#endif  // FL_IS_ARM_LPC_845
+
+        SPI_Type *spi = spi_block();
 
         // Disable before reconfig
         spi->CFG = 0;
@@ -154,16 +171,16 @@ public:
         spi->CFG = FL_LPC_SPI_CFG_ENABLE | FL_LPC_SPI_CFG_MASTER;
     }
 
-    void inline select() FL_NOEXCEPT __attribute__((always_inline)) {
+    void inline select() FL_NO_EXCEPT __attribute__((always_inline)) {
         if (mPSelect != nullptr) { mPSelect->select(); }
     }
 
-    void inline release() FL_NOEXCEPT __attribute__((always_inline)) {
+    void inline release() FL_NO_EXCEPT __attribute__((always_inline)) {
         waitFully();
         if (mPSelect != nullptr) { mPSelect->release(); }
     }
 
-    void endTransaction() FL_NOEXCEPT { release(); }
+    void endTransaction() FL_NO_EXCEPT { release(); }
 
     /// Wait until TX FIFO can accept another byte.
     static void wait() __attribute__((always_inline)) {
@@ -171,7 +188,7 @@ public:
     }
 
     /// Wait until the master is fully idle (transfer drained).
-    void waitFully() FL_NOEXCEPT {
+    void waitFully() FL_NO_EXCEPT {
         while (!(spi_block()->STAT & FL_LPC_SPI_STAT_MSTIDLE)) {}
     }
 
@@ -179,9 +196,9 @@ public:
     /// API used for sm16716-style strips. APA102 / SK9822 don't exercise
     /// this path (start bit is part of the byte stream).
     template <u8 BIT>
-    inline static void writeBit(u8 b) FL_NOEXCEPT {
+    inline static void writeBit(u8 b) FL_NO_EXCEPT {
         wait();
-        FL_LPC_SPI_Type *spi = spi_block();
+        SPI_Type *spi = spi_block();
         // OR in RXIGNORE so this transmit doesn't clock data into RXDAT;
         // the driver never drains RXDAT, so otherwise repeated writeBit()
         // calls would accumulate RXOV. Matches writeByte() below.
@@ -193,7 +210,7 @@ public:
     /// fill; this primitive only writes the TX data register.
     static void writeByte(u8 b) __attribute__((always_inline)) {
         wait();
-        FL_LPC_SPI_Type *spi = spi_block();
+        SPI_Type *spi = spi_block();
         // TXDATCTL with LEN=7 (8-bit transfer) and RX ignored.
         spi->TXDATCTL = static_cast<u32>(b) | FL_LPC_SPI_TXCTL_LEN_8BIT |
                         FL_LPC_SPI_TXCTL_RXIGNORE;
@@ -205,12 +222,12 @@ public:
     }
 
     /// Write `len` copies of `value` over SPI.
-    static void writeBytesValueRaw(u8 value, int len) FL_NOEXCEPT {
+    static void writeBytesValueRaw(u8 value, int len) FL_NO_EXCEPT {
         while (len--) { writeByte(value); }
     }
 
     /// Bracketed variant — select + write + flush + release.
-    void writeBytesValue(u8 value, int len) FL_NOEXCEPT {
+    void writeBytesValue(u8 value, int len) FL_NO_EXCEPT {
         select();
         writeBytesValueRaw(value, len);
         waitFully();
@@ -220,7 +237,7 @@ public:
     /// Bracketed bulk byte write with optional per-byte adjuster D.
     template <class D>
     void writeBytes(FASTLED_REGISTER u8 *data, int len,
-                    void *context = nullptr) FL_NOEXCEPT {
+                    void *context = nullptr) FL_NO_EXCEPT {
         u8 *end = data + len;
         select();
         while (data != end) {
@@ -240,7 +257,7 @@ public:
     /// byte per LED) via writeBit<0>.
     template <u8 FLAGS, class D, EOrder RGB_ORDER>
     void writePixels(PixelController<RGB_ORDER> pixels,
-                     void *context = nullptr) FL_NOEXCEPT {
+                     void *context = nullptr) FL_NO_EXCEPT {
         int len = pixels.mLen;
 
         select();
@@ -266,7 +283,7 @@ public:
 
     /// Finalize transmission. The MSTIDLE wait in waitFully() already
     /// drains the FIFO; no additional flush is needed.
-    static void finalizeTransmission() FL_NOEXCEPT {}
+    static void finalizeTransmission() FL_NO_EXCEPT {}
 };
 
 }  // namespace fl

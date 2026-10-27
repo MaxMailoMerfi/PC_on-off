@@ -2,8 +2,8 @@
 """Streaming execution path for ``run_meson_build_and_test``.
 
 Extracted from ``ci/meson/runner.py``. Runs ``stream_compile_and_run_tests``
-which compiles + executes tests in parallel — as soon as a test finishes
-linking it's launched while other tests are still compiling.
+which compiles all artifacts before executing tests in parallel. The phase
+boundary prevents dynamic loaders from opening partially linked libraries.
 
 This module owns the streaming-specific concerns: a test-callback closure
 that captures per-test output (so failures can be summarized at the end),
@@ -11,7 +11,9 @@ zombie-process tracking, the proactive ``all-with-examples`` target check,
 stale-build recovery retry, and the no-tests-ran fallback.
 """
 
+import math
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -20,6 +22,7 @@ from typing import Optional
 
 from running_process import RunningProcess
 
+from ci.compile_pch import is_stale_pch_error, purge_pch_artifacts
 from ci.meson.build_config import setup_meson_build
 from ci.meson.build_optimizer import BuildOptimizer
 from ci.meson.build_timer import BuildTimer
@@ -33,11 +36,59 @@ from ci.meson.runner_helpers import (
     _write_failure_log,
     _write_testlog_failures,
 )
-from ci.meson.streaming import TestResult, stream_compile_and_run_tests
-from ci.meson.test_execution import MesonTestResult, run_meson_test
+from ci.meson.streaming import (
+    TestResult,
+    is_example_artifact,
+    stream_compile_and_run_tests,
+)
+from ci.meson.test_execution import (
+    MesonTestResult,
+    examples_are_included,
+    run_meson_test,
+)
 from ci.util.global_interrupt_handler import handle_keyboard_interrupt
 from ci.util.output_formatter import TimestampFormatter
+from ci.util.test_types import describe_test_counts
 from ci.util.timestamp_print import ts_print as _ts_print
+
+
+_DEFAULT_TEST_PROCESS_TIMEOUT_SECONDS = 600
+_MACOS_TEST_PROCESS_TIMEOUT_SECONDS = 90
+
+
+def _test_process_timeout_seconds() -> int:
+    """Return the outer runner timeout for the current platform.
+
+    Apple runners have their own 20-second watchdog.  Keep a wider Python
+    deadline so normal watchdog diagnostics can flush, while still bounding a
+    pre-main sanitizer/dyld stall that cannot arm the in-process watchdog.
+    """
+    if sys.platform == "darwin":
+        return _MACOS_TEST_PROCESS_TIMEOUT_SECONDS
+    return _DEFAULT_TEST_PROCESS_TIMEOUT_SECONDS
+
+
+def _wait_for_test_process(proc: RunningProcess) -> TestResult:
+    """Wait for a runner and retain its captured output on every failure.
+
+    ``RunningProcess.wait()`` raises on timeout after killing the child.  The
+    captured stream remains available on ``proc.stdout``; include it in the
+    returned failure so phase markers and sanitizer diagnostics reach CI logs.
+    """
+    try:
+        returncode = proc.wait(echo=False)
+    except KeyboardInterrupt as ki:
+        handle_keyboard_interrupt(ki)
+        raise
+    except Exception as error:
+        captured = str(proc.stdout)
+        output = f"[MESON] Test execution error: {error}"
+        if captured:
+            output += f"\n[MESON] Captured runner output:\n{captured}"
+        return TestResult(success=False, output=output)
+
+    captured = str(proc.stdout)
+    return TestResult(success=returncode == 0, output=captured)
 
 
 def validate_test_artifact(
@@ -50,15 +101,10 @@ def validate_test_artifact(
     missing or stale, so the caller can surface the failure directly
     instead of silently running broken/old code.
 
-    Why this matters (FastLED #3011): the streaming compiler submits
-    tests to the runner as soon as Ninja prints ``[N/M] Linking <X>``
-    — but that line is Ninja's PRE-link announcement, NOT a success
-    signal. If the link then FAILS (zccache daemon crash under the
-    parallel-link storm, ld.lld permission error, etc.) ``test_path``
-    is either missing entirely (clean build) or stale from a previous
-    build sitting in the same build dir. Running it produces a
-    false pass or false fail; refusing to run it surfaces the link
-    failure where it belongs.
+    Why this matters (FastLED #3011): collected paths come from Ninja's
+    ``[N/M] Linking <X>`` PRE-link announcement. Execution is deferred until
+    the complete build succeeds (FastLED #3642), and this validator remains a
+    defense against a missing or stale artifact left by tool/cache anomalies.
     """
     if not test_path.exists():
         return TestResult(
@@ -74,7 +120,7 @@ def validate_test_artifact(
     try:
         dll_mtime = test_path.stat().st_mtime
     except OSError:
-        # stat() failure is non-fatal — let the subprocess loader
+        # stat() failure is non-fatal — let the child-process loader
         # surface whatever it actually sees on disk.
         return None
     if dll_mtime < build_start_time:
@@ -113,8 +159,10 @@ class StreamingContext:
     build_optimizer: Optional[BuildOptimizer]
 
 
-def _make_streaming_env(source_dir: Path, build_dir: Path) -> dict[str, str]:
-    """Build the environment dict for streamed test subprocesses.
+def _make_streaming_env(
+    source_dir: Path, build_dir: Path, build_mode: str
+) -> dict[str, str]:
+    """Build the environment dict for streamed test processes.
 
     Adds the fastled shared lib directory + clang toolchain runtime DLLs to
     PATH (Windows) or LD_LIBRARY_PATH (POSIX) so DLLs load without MSYS2.
@@ -130,6 +178,11 @@ def _make_streaming_env(source_dir: Path, build_dir: Path) -> dict[str, str]:
         streaming_env["LD_LIBRARY_PATH"] = (
             fastled_lib_dir + os.pathsep + streaming_env.get("LD_LIBRARY_PATH", "")
         )
+    # The streaming path invokes test DLLs directly, so it does not inherit
+    # the per-test timeout from Meson's test() environment. Sanitizer runs
+    # make the threaded JSON stress test exceed the default 20-second watchdog.
+    if build_mode in ("debug", "debug-thin"):
+        streaming_env.setdefault("FASTLED_TEST_TIMEOUT", "60")
     # source_dir is intentionally unused — only the build_dir matters for
     # DLL lookup, but the parameter is kept for symmetry with the rest of
     # the streaming context.
@@ -204,10 +257,23 @@ def _handle_streaming_failure(
     failed_outputs_lock: threading.Lock,
     duration: float,
     num_tests_run: int,
+    include_examples: bool,
 ) -> MesonTestResult:
     """Print failure details and write logs after the streaming path failed."""
+    # Attribute the failure counts too. An anonymous denominator is least
+    # affordable here: "355/357" cannot say whether the 2 failures were unit
+    # tests or examples, nor which population the total covers (#3779).
+    num_examples_run = sr.num_passed_examples + sr.num_failed_examples
+    breakdown = describe_test_counts(
+        num_passed=sr.num_passed,
+        num_run=num_tests_run,
+        num_examples_passed=sr.num_passed_examples,
+        num_examples_run=num_examples_run,
+        examples_included=include_examples,
+        filtered=bool(ctx.test_file_filter),
+    )
     print_error(
-        f"[MESON] ❌ Some tests failed ({sr.num_passed}/{num_tests_run} tests in {duration:.2f}s)"
+        f"[MESON] ❌ Some tests failed ({breakdown.describe(f' in {duration:.2f}s')})"
     )
     # Snapshot under lock — workers may still be running after shutdown(wait=False).
     with failed_outputs_lock:
@@ -247,6 +313,9 @@ def _handle_streaming_failure(
         num_tests_passed=sr.num_passed,
         num_tests_failed=sr.num_failed,
         failed_test_names=sr.failed_names,
+        num_examples_run=num_examples_run,
+        num_examples_passed=sr.num_passed_examples,
+        examples_included=include_examples,
     )
 
 
@@ -256,7 +325,7 @@ def run_streaming_path(ctx: StreamingContext) -> MesonTestResult:
         _ts_print("[MESON] Using streaming execution (compile + test in parallel)")
 
     failed_test_outputs: dict[str, str] = {}
-    streaming_env = _make_streaming_env(ctx.source_dir, ctx.build_dir)
+    streaming_env = _make_streaming_env(ctx.source_dir, ctx.build_dir, ctx.build_mode)
     failed_outputs_lock = threading.Lock()
 
     active_procs: set[RunningProcess] = set()
@@ -271,22 +340,20 @@ def run_streaming_path(ctx: StreamingContext) -> MesonTestResult:
         """
         try:
             # FastLED #3011 — refuse to run missing or stale artifacts.
-            # The streaming compiler submits tests as soon as Ninja prints
-            # "Linking <X>" (a PRE-link announcement, not success). If
-            # the link then fails, what's at test_path is either nothing
-            # or yesterday's DLL — running it produces false pass / fail.
+            # Execution now waits for the full build (FastLED #3642), while
+            # this check preserves defense against anomalous cache/tool output.
             failure = validate_test_artifact(test_path, ctx.start_time)
             if failure is not None:
                 return failure
 
             if test_path.suffix.lower() in (".dll", ".so", ".dylib"):
                 runner_suffix = ".exe" if os.name == "nt" else ""
-                if test_path.parent.name == "tests":
-                    runner = ctx.build_dir / "tests" / f"runner{runner_suffix}"
-                else:
+                if is_example_artifact(test_path):
                     runner = (
                         ctx.build_dir / "examples" / f"example_runner{runner_suffix}"
                     )
+                else:
+                    runner = ctx.build_dir / "tests" / f"runner{runner_suffix}"
                 if not runner.exists():
                     return TestResult(
                         success=False,
@@ -305,7 +372,7 @@ def run_streaming_path(ctx: StreamingContext) -> MesonTestResult:
             proc = RunningProcess(
                 cmd,
                 cwd=ctx.source_dir,
-                timeout=600,
+                timeout=_test_process_timeout_seconds(),
                 auto_run=True,
                 check=False,
                 env=env,
@@ -315,17 +382,16 @@ def run_streaming_path(ctx: StreamingContext) -> MesonTestResult:
             with active_procs_lock:
                 active_procs.add(proc)
             try:
-                returncode = proc.wait(echo=False)
+                result = _wait_for_test_process(proc)
             finally:
                 with active_procs_lock:
                     active_procs.discard(proc)
-            captured = str(proc.stdout)
 
-            if returncode != 0:
+            if not result.success:
                 with failed_outputs_lock:
-                    failed_test_outputs[test_path.stem] = captured
+                    failed_test_outputs[test_path.stem] = result.output
 
-            return TestResult(success=returncode == 0, output=captured)
+            return result
 
         except KeyboardInterrupt as ki:
             handle_keyboard_interrupt(ki)
@@ -334,13 +400,16 @@ def run_streaming_path(ctx: StreamingContext) -> MesonTestResult:
                 output="[MESON] Test interrupted by user",
             )
         except Exception as e:
-            return TestResult(
+            result = TestResult(
                 success=False,
                 output=f"[MESON] Test execution error: {e}",
             )
+            with failed_outputs_lock:
+                failed_test_outputs[test_path.stem] = result.output
+            return result
 
     def _kill_active_procs() -> None:
-        """Kill all running test subprocesses (called on halt)."""
+        """Kill all running test processes (called on halt)."""
         with active_procs_lock:
             for p in list(active_procs):
                 try:
@@ -353,16 +422,17 @@ def run_streaming_path(ctx: StreamingContext) -> MesonTestResult:
     setattr(test_callback, "kill_all", _kill_active_procs)
 
     # Debug builds with ASAN are significantly slower (esp. Windows CI).
-    compile_timeout = 2700 if ctx.use_debug else 600
+    # #4529 needed 1130.84s for a cold full-debug/ASan compile. Keep a
+    # measured margin while leaving the 45-minute CI job time for tests.
+    compile_timeout = 1800 if ctx.use_debug else 600
 
-    include_examples = not (
-        ctx.exclude_suites and "fastled:examples" in ctx.exclude_suites
-    )
+    include_examples = examples_are_included(ctx.exclude_suites)
     compile_target = "all-with-examples" if include_examples else None
 
     if compile_target == "all-with-examples":
         _check_all_with_examples_target(ctx)
 
+    compile_started = time.monotonic()
     sr = stream_compile_and_run_tests(
         build_dir=ctx.build_dir,
         test_callback=test_callback,
@@ -385,12 +455,44 @@ def run_streaming_path(ctx: StreamingContext) -> MesonTestResult:
             ctx.verbose,
             enable_examples=True,
         ):
+            remaining = compile_timeout - (time.monotonic() - compile_started)
+            if remaining <= 0:
+                sr.compile_output += (
+                    "\nHard compilation deadline exceeded before stale-build retry"
+                )
+            else:
+                sr = stream_compile_and_run_tests(
+                    build_dir=ctx.build_dir,
+                    test_callback=test_callback,
+                    target=compile_target,
+                    verbose=ctx.verbose,
+                    compile_timeout=max(1, math.ceil(remaining)),
+                    build_optimizer=ctx.build_optimizer,
+                    test_file_filter=ctx.test_file_filter,
+                    build_timer=ctx.build_timer,
+                )
+
+    # Recover from Clang stale-header errors and explicit zccache rebuild
+    # refusals, including legacy chained PCHs without import provenance.
+    # Purge only PCH artifacts and retry once within the original deadline.
+    if not sr.success and is_stale_pch_error(sr.compile_output, ctx.build_dir):
+        removed = purge_pch_artifacts(ctx.build_dir)
+        _ts_print("=" * 80, file=sys.stderr)
+        _ts_print(
+            "[MESON] ⚠️  STALE PCH DETECTED: compiler or zccache rejected a "
+            f"precompiled header. Purged {removed} PCH artifact(s) and "
+            "retrying once.",
+            file=sys.stderr,
+        )
+        _ts_print("=" * 80, file=sys.stderr)
+        remaining = compile_timeout - (time.monotonic() - compile_started)
+        if remaining > 0:
             sr = stream_compile_and_run_tests(
                 build_dir=ctx.build_dir,
                 test_callback=test_callback,
                 target=compile_target,
                 verbose=ctx.verbose,
-                compile_timeout=compile_timeout,
+                compile_timeout=max(1, math.ceil(remaining)),
                 build_optimizer=ctx.build_optimizer,
                 test_file_filter=ctx.test_file_filter,
                 build_timer=ctx.build_timer,
@@ -407,19 +509,38 @@ def run_streaming_path(ctx: StreamingContext) -> MesonTestResult:
 
     if not sr.success:
         return _handle_streaming_failure(
-            ctx, sr, failed_test_outputs, failed_outputs_lock, duration, num_tests_run
+            ctx,
+            sr,
+            failed_test_outputs,
+            failed_outputs_lock,
+            duration,
+            num_tests_run,
+            include_examples,
         )
 
     _ts_print(ctx.build_timer.format_table())
-    print_success(
-        f"✅ All tests passed ({sr.num_passed}/{num_tests_run} in {duration:.2f}s)"
+    num_examples_run = sr.num_passed_examples + sr.num_failed_examples
+    breakdown = describe_test_counts(
+        num_passed=sr.num_passed,
+        num_run=num_tests_run,
+        num_examples_passed=sr.num_passed_examples,
+        num_examples_run=num_examples_run,
+        examples_included=include_examples,
+        # A name/file selector drops non-matching artifacts before they are
+        # ever submitted, so a population that ran nothing under one was
+        # filtered out -- not verified as up to date.
+        filtered=bool(ctx.test_file_filter),
     )
+    print_success(f"✅ All tests passed ({breakdown.describe(f' in {duration:.2f}s')})")
     result = MesonTestResult(
         success=True,
         duration=duration,
         num_tests_run=num_tests_run,
         num_tests_passed=sr.num_passed,
         num_tests_failed=sr.num_failed,
+        num_examples_run=num_examples_run,
+        num_examples_passed=sr.num_passed_examples,
+        examples_included=include_examples,
     )
     result = _apply_phase_timing(result, ctx.build_timer)
     _apply_compile_sub_phases(result, sr.compile_sub_phases)

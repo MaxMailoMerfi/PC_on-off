@@ -8,6 +8,7 @@
 
 #include "fl/stl/stdint.h"
 
+#include "fl/gfx/blur.h"
 #include "fl/gfx/gradient.h"
 #include "fl/stl/shared_ptr.h"  // For FASTLED_SHARED_PTR macros and shared_ptr
 #include "fl/math/wave/wave_simulation.h"
@@ -28,14 +29,14 @@ FASTLED_SHARED_PTR(WaveCrgbGradientMap);
 /// into CRGB color values for LED display.
 class WaveCrgbMap {
   public:
-    virtual ~WaveCrgbMap() FL_NOEXCEPT = default;
+    virtual ~WaveCrgbMap() FL_NO_EXCEPT = default;
 
     /// @brief Convert wave simulation values to LED colors
     /// @param xymap Coordinate mapping from 2D grid to 1D LED array
     /// @param waveSim Wave simulation containing amplitude values
     /// @param leds Output LED array to write colors to
     virtual void mapWaveToLEDs(const XYMap &xymap, WaveSimulation2D &waveSim,
-                               fl::span<CRGB> leds) = 0;
+                               fl::span<CRGB> leds) FL_NO_EXCEPT = 0;
 };
 
 /// @brief Default wave-to-color mapper producing grayscale output
@@ -51,7 +52,7 @@ class WaveCrgbMapDefault : public WaveCrgbMap {
     /// @param waveSim Wave simulation containing amplitude values
     /// @param leds Output LED array to write colors to
     void mapWaveToLEDs(const XYMap &xymap, WaveSimulation2D &waveSim,
-                       fl::span<CRGB> leds) override {
+                       fl::span<CRGB> leds) FL_NO_EXCEPT override {
         const fl::u32 width = waveSim.getWidth();
         const fl::u32 height = waveSim.getHeight();
         for (fl::u32 y = 0; y < height; y++) {
@@ -75,21 +76,21 @@ class WaveCrgbGradientMap : public WaveCrgbMap {
 
     /// @brief Construct with a color palette
     /// @param palette 16-color palette defining the gradient
-    WaveCrgbGradientMap(const CRGBPalette16 &palette) : mGradient(palette) {}
+    WaveCrgbGradientMap(const CRGBPalette16 &palette) FL_NO_EXCEPT : mGradient(palette) {}
 
     /// @brief Default constructor with no initial gradient
-    WaveCrgbGradientMap() FL_NOEXCEPT = default;
+    WaveCrgbGradientMap() FL_NO_EXCEPT = default;
 
     /// @brief Map wave values to gradient-colored LEDs
     /// @param xymap Coordinate mapping from 2D grid to 1D LED array
     /// @param waveSim Wave simulation containing amplitude values
     /// @param leds Output LED array to write colors to
     void mapWaveToLEDs(const XYMap &xymap, WaveSimulation2D &waveSim,
-                       fl::span<CRGB> leds) override;
+                       fl::span<CRGB> leds) FL_NO_EXCEPT override;
 
     /// @brief Set or update the color gradient
     /// @param gradient New gradient to use for color mapping
-    void setGradient(const Gradient &gradient) { mGradient = gradient; }
+    void setGradient(const Gradient &gradient) FL_NO_EXCEPT { mGradient = gradient; }
 
   private:
     Gradient mGradient;
@@ -100,7 +101,7 @@ class WaveCrgbGradientMap : public WaveCrgbMap {
 /// Defines all the settings that control wave behavior including
 /// simulation quality, physics parameters, and color mapping.
 struct WaveFxArgs {
-    WaveFxArgs() FL_NOEXCEPT = default;
+    WaveFxArgs() FL_NO_EXCEPT = default;
 
     /// @brief Construct with all parameters
     /// @param factor Supersampling quality (higher = smoother but slower)
@@ -111,10 +112,10 @@ struct WaveFxArgs {
     /// @param crgbMap Custom color mapper (nullptr uses default grayscale)
     WaveFxArgs(SuperSample factor, bool half_duplex, bool auto_updates,
                float speed, float dampening, WaveCrgbMapPtr crgbMap)
-        : factor(factor), half_duplex(half_duplex), auto_updates(auto_updates),
+        FL_NO_EXCEPT : factor(factor), half_duplex(half_duplex), auto_updates(auto_updates),
           speed(speed), dampening(dampening), crgbMap(crgbMap) {}
-    WaveFxArgs(const WaveFxArgs &) FL_NOEXCEPT = default;
-    WaveFxArgs &operator=(const WaveFxArgs &) FL_NOEXCEPT = default;
+    WaveFxArgs(const WaveFxArgs &) FL_NO_EXCEPT = default;
+    WaveFxArgs &operator=(const WaveFxArgs &) FL_NO_EXCEPT = default;
 
     /// Supersampling quality (SUPER_SAMPLE_2X recommended for balance)
     SuperSample factor = SuperSample::SUPER_SAMPLE_2X;
@@ -130,6 +131,16 @@ struct WaveFxArgs {
     bool x_cyclical = false;
     /// Use change grid tracking for optimization (may reduce visual quality)
     bool use_change_grid = false;
+    /// Post-process Gaussian-style blur (#3122 A4 / #3112 research §A1).
+    /// Applied to the rendered CRGB output after `mapWaveToLEDs`. 0 = off.
+    /// Values 32-128 give a smoothing effect comparable to SUPER_SAMPLE_2X
+    /// at ~1.2x scalar cost vs 8-512x for true super-sampling. Recommended
+    /// as a cheaper alternative to SuperSample for ripple smoothing.
+    fl::u8 output_blur_amount = 0;
+    /// Number of blur passes (1 = single pass, 2+ = repeated smoothing).
+    /// Use 1 for typical smoothing; 2 only if you genuinely need a heavier
+    /// blur — visually subtle gain past 2 passes.
+    fl::u8 output_blur_passes = 1;
     /// Custom color mapper (nullptr uses default grayscale)
     WaveCrgbMapPtr crgbMap;
 };
@@ -171,7 +182,7 @@ class WaveFx : public Fx2d {
     /// @param xymap Coordinate mapping from 2D grid to 1D LED array
     /// @param args Configuration parameters (uses defaults if not specified)
     WaveFx(const XYMap& xymap, Args args = Args())
-        : Fx2d(xymap), mWaveSim(xymap.getWidth(), xymap.getHeight(),
+        FL_NO_EXCEPT : Fx2d(xymap), mWaveSim(xymap.getWidth(), xymap.getHeight(),
                                 args.factor, args.speed, args.dampening) {
         // Initialize the wave simulation with the given parameters.
         if (args.crgbMap == nullptr) {
@@ -184,21 +195,39 @@ class WaveFx : public Fx2d {
         setAutoUpdate(args.auto_updates);
         setXCylindrical(args.x_cyclical);
         setUseChangeGrid(args.use_change_grid);
+        setOutputBlur(args.output_blur_amount, args.output_blur_passes);
     }
+
+    /// @brief Configure the post-process output blur (#3122 A4)
+    /// @param amount Blur strength (0-255). 0 disables. 32-128 ≈ smoothing
+    ///               comparable to SUPER_SAMPLE_2X.
+    /// @param passes Number of repeated blur passes. 1 = single. >1 only
+    ///               for heavy smoothing.
+    ///
+    /// Applied to the rendered CRGB output buffer after `mapWaveToLEDs`.
+    /// ~1.2x scalar cost vs 8-512x for SuperSample with broadly
+    /// comparable visual quality on smooth fields. See #3112 research
+    /// doc §A1 for the rationale.
+    void setOutputBlur(fl::u8 amount, fl::u8 passes = 1) FL_NO_EXCEPT {
+        mOutputBlurAmount = amount;
+        mOutputBlurPasses = (passes < 1) ? 1 : passes;
+    }
+    fl::u8 getOutputBlurAmount() const FL_NO_EXCEPT { return mOutputBlurAmount; }
+    fl::u8 getOutputBlurPasses() const FL_NO_EXCEPT { return mOutputBlurPasses; }
 
     /// @brief Enable/disable cylindrical topology on x-axis
     /// @param on If true, waves wrap around from right edge to left edge
     ///
     /// When enabled, creates a seamless horizontal loop effect.
     /// Useful for LED strips arranged in a cylinder or torus.
-    void setXCylindrical(bool on) { mWaveSim.setXCylindrical(on); }
+    void setXCylindrical(bool on) FL_NO_EXCEPT { mWaveSim.setXCylindrical(on); }
 
     /// @brief Set wave propagation speed
     /// @param speed Speed value (0.0 to 1.0, typical range: 0.1-0.3)
     ///
     /// Higher values make waves propagate faster across the grid.
     /// Typical values: 0.12-0.26 for realistic water effects.
-    void setSpeed(float speed) {
+    void setSpeed(float speed) FL_NO_EXCEPT {
         // Set the speed of the wave simulation.
         mWaveSim.setSpeed(speed);
     }
@@ -209,7 +238,7 @@ class WaveFx : public Fx2d {
     /// Higher values cause waves to lose energy and dissipate faster.
     /// Lower values create longer-lasting waves.
     /// Typical values: 3.0 for slow decay, 9.0 for faster decay.
-    void setDampening(float dampening) {
+    void setDampening(float dampening) FL_NO_EXCEPT {
         // Set the dampening of the wave simulation.
         mWaveSim.setDampening(dampening);
     }
@@ -221,7 +250,7 @@ class WaveFx : public Fx2d {
     /// effects that look more like ripples on water surface.
     /// When disabled, waves can have negative values for more
     /// complex interference patterns.
-    void setHalfDuplex(bool on) {
+    void setHalfDuplex(bool on) FL_NO_EXCEPT {
         // Set whether the wave simulation is half duplex.
         mWaveSim.setHalfDuplex(on);
     }
@@ -232,7 +261,7 @@ class WaveFx : public Fx2d {
     /// Supersampling improves visual quality by simulating at higher
     /// resolution than the LED grid. Higher values = smoother but slower.
     /// Recommended: SUPER_SAMPLE_2X for good balance.
-    void setSuperSample(SuperSample factor) {
+    void setSuperSample(SuperSample factor) FL_NO_EXCEPT {
         // Set the supersampling factor of the wave simulation.
         mWaveSim.setSuperSample(factor);
     }
@@ -242,7 +271,7 @@ class WaveFx : public Fx2d {
     ///
     /// - LINEAR: Direct mapping of wave values (sharper, more digital)
     /// - SQRT: Square root mapping (softer, more natural-looking waves)
-    void setEasingMode(U8EasingFunction mode) {
+    void setEasingMode(U8EasingFunction mode) FL_NO_EXCEPT {
         // Set the easing mode for the 8-bit value.
         mWaveSim.setEasingMode(mode);
     }
@@ -258,12 +287,12 @@ class WaveFx : public Fx2d {
     /// Calling this marks the choice as user-set, so subsequent
     /// setSuperSample() calls preserve it instead of re-applying the
     /// multiplier-based default.
-    void setStencil(LaplacianStencil s) FL_NOEXCEPT {
+    void setStencil(LaplacianStencil s) FL_NO_EXCEPT {
         mWaveSim.setStencil(s);
     }
 
     /// @brief Get the currently active Laplacian stencil
-    LaplacianStencil getStencil() const FL_NOEXCEPT {
+    LaplacianStencil getStencil() const FL_NO_EXCEPT {
         return mWaveSim.getStencil();
     }
 
@@ -273,14 +302,14 @@ class WaveFx : public Fx2d {
     /// Change grid tracking preserves set points over multiple iterations
     /// for more stable results, but may reduce dramatic visual effects.
     /// Disabling saves memory but may cause more oscillation.
-    void setUseChangeGrid(bool enabled) {
+    void setUseChangeGrid(bool enabled) FL_NO_EXCEPT {
         // Set whether to use the change grid tracking optimization.
         mWaveSim.setUseChangeGrid(enabled);
     }
 
     /// @brief Get current change grid tracking setting
     /// @return True if change grid tracking is enabled
-    bool getUseChangeGrid() const {
+    bool getUseChangeGrid() const FL_NO_EXCEPT {
         // Get the current change grid tracking setting.
         return mWaveSim.getUseChangeGrid();
     }
@@ -292,7 +321,7 @@ class WaveFx : public Fx2d {
     ///
     /// Use this to create a wave disturbance at a specific point.
     /// Value of 1.0 creates maximum amplitude wave that will propagate outward.
-    void setf(size_t x, size_t y, float value) {
+    void setf(size_t x, size_t y, float value) FL_NO_EXCEPT {
         // Set the value at the given coordinates in the wave simulation.
         mWaveSim.setf(x, y, value);
     }
@@ -304,7 +333,7 @@ class WaveFx : public Fx2d {
     ///
     /// Adds to existing wave amplitude, useful for creating multiple
     /// overlapping disturbances. Result is clamped to maximum of 1.0.
-    void addf(size_t x, size_t y, float value) {
+    void addf(size_t x, size_t y, float value) FL_NO_EXCEPT {
         // Add a value at the given coordinates in the wave simulation.
         float sum = value + mWaveSim.getf(x, y);
         mWaveSim.setf(x, y, fl::min(1.0f, sum));
@@ -317,7 +346,7 @@ class WaveFx : public Fx2d {
     ///
     /// Returns the current wave amplitude at the given position,
     /// scaled and mapped to 0-255 range.
-    u8 getu8(size_t x, size_t y) const {
+    u8 getu8(size_t x, size_t y) const FL_NO_EXCEPT {
         // Get the 8-bit value at the given coordinates in the wave simulation.
         return mWaveSim.getu8(x, y);
     }
@@ -328,7 +357,7 @@ class WaveFx : public Fx2d {
     /// Replaces the current color mapper with a new one.
     /// Use WaveCrgbMapDefault for grayscale or WaveCrgbGradientMap
     /// for palette-based coloring.
-    void setCrgbMap(WaveCrgbMapPtr crgbMap) {
+    void setCrgbMap(WaveCrgbMapPtr crgbMap) FL_NO_EXCEPT {
         // Set a custom CRGB mapping function.
         mCrgbMap = crgbMap;
     }
@@ -338,13 +367,24 @@ class WaveFx : public Fx2d {
     ///
     /// Updates the wave simulation (if auto-update enabled) and
     /// maps wave values to LED colors using the current color mapper.
-    void draw(DrawContext context) override {
+    void draw(DrawContext context) FL_NO_EXCEPT override {
         // Update the wave simulation.
         if (mAutoUpdates) {
             mWaveSim.update();
         }
         // Map the wave values to the LEDs.
         mCrgbMap->mapWaveToLEDs(mXyMap, mWaveSim, context.leds);
+        // #3122 A4 — post-process output blur as a cheaper alternative
+        // to SuperSample. Skipped entirely when amount == 0.
+        if (mOutputBlurAmount > 0) {
+            const fl::u32 w = mWaveSim.getWidth();
+            const fl::u32 h = mWaveSim.getHeight();
+            for (fl::u8 pass = 0; pass < mOutputBlurPasses; ++pass) {
+                fl::blur2d(context.leds, static_cast<fl::u8>(w),
+                           static_cast<fl::u8>(h), mOutputBlurAmount,
+                           mXyMap);
+            }
+        }
     }
 
     /// @brief Enable/disable automatic simulation updates
@@ -352,7 +392,7 @@ class WaveFx : public Fx2d {
     ///
     /// When enabled, draw() automatically advances the wave simulation.
     /// Disable this if you want manual control via update() calls.
-    void setAutoUpdate(bool autoUpdate) {
+    void setAutoUpdate(bool autoUpdate) FL_NO_EXCEPT {
         // Set whether to automatically update the wave simulation.
         mAutoUpdates = autoUpdate;
     }
@@ -362,7 +402,7 @@ class WaveFx : public Fx2d {
     /// Advances the wave physics simulation by one timestep.
     /// Only needed if auto-update is disabled or you want extra
     /// simulation steps between frames.
-    void update() {
+    void update() FL_NO_EXCEPT {
         // Called automatically in draw. Only invoke this if you want extra
         // simulation updates.
         // Update the wave simulation.
@@ -371,11 +411,13 @@ class WaveFx : public Fx2d {
 
     /// @brief Get effect name
     /// @return "WaveFx"
-    fl::string fxName() const override { return "WaveFx"; }
+    fl::string fxName() const FL_NO_EXCEPT override { return "WaveFx"; }
 
     WaveSimulation2D mWaveSim;
     WaveCrgbMapPtr mCrgbMap;
     bool mAutoUpdates = true;
+    fl::u8 mOutputBlurAmount = 0;  // #3122 A4 — 0 disables
+    fl::u8 mOutputBlurPasses = 1;
 };
 
 } // namespace fl

@@ -3,26 +3,22 @@ Compilation orchestration module.
 
 This module provides high-level orchestration for compiling examples across boards.
 It handles compilation workflow, result collection, and statistics reporting.
+Every board build runs through fbuild (``ci/compiler/board_compiler.py``).
 """
 
 import time
-from concurrent.futures import Future, as_completed
+from concurrent.futures import as_completed
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
 from typeguard import typechecked
 
 from ci.boards import Board
+from ci.compiler.board_compiler import BoardCompiler
 from ci.compiler.board_example_utils import get_filtered_examples
 from ci.compiler.compiler import SketchResult
-from ci.compiler.pio import FastLEDPaths, PioCompiler
+from ci.compiler.path_manager import FastLEDPaths
 from ci.util.global_interrupt_handler import handle_keyboard_interrupt
-
-
-# Default when the caller does not pass `use_fbuild=` explicitly. The
-# ci-compile.py CLI now exposes a `--backend` flag that overrides this.
-BOARD_BUILDS_USE_FBUILD = True
 
 
 @typechecked
@@ -43,47 +39,17 @@ def compile_board_examples(
     examples: list[str],
     defines: list[str],
     verbose: bool,
-    global_cache_dir: Optional[Path] = None,
-    merged_bin: bool = False,
-    merged_bin_output: Optional[Path] = None,
     extra_packages: Optional[list[str]] = None,
     max_failures: Optional[int] = None,
     skip_filters: bool = False,
-    use_fbuild: Optional[bool] = None,
 ) -> BoardCompilationResult:
-    """Compile examples for a single board using PioCompiler.
-
-    Args:
-        use_fbuild: If None, uses BOARD_BUILDS_USE_FBUILD (default True).
-            If True, uses fbuild. If False, uses PlatformIO's `pio run`.
-    """
-    if use_fbuild is None:
-        use_fbuild = BOARD_BUILDS_USE_FBUILD
-
-    # Resolve global cache directory immediately for display
-    resolved_cache_dir = None
-    if global_cache_dir is not None:
-        # User specified a path - use it exactly as provided
-        resolved_cache_dir = global_cache_dir.resolve()
-    else:
-        # Default path ends with 'global_cache'
-        resolved_cache_dir = Path.home() / ".fastled" / "global_cache"
-
+    """Compile examples for a single board with fbuild via BoardCompiler."""
     print(f"\n{'=' * 60}")
     print(f"COMPILING BOARD: {board.board_name}")
     print(f"EXAMPLES: {', '.join(examples)}")
-    if merged_bin:
-        print("MERGED-BIN MODE: Enabled")
-        if merged_bin_output:
-            print(f"MERGED-BIN OUTPUT: {merged_bin_output}")
-
-    # Show cache directories in verbose mode only
     paths = FastLEDPaths(board.board_name)
     if verbose:
-        print(f"GLOBAL CACHE: {resolved_cache_dir}")
-        print(f"BUILD CACHE: {paths.build_cache_dir}")
-        print(f"CORE DIR: {paths.core_dir}")
-        print(f"PACKAGES DIR: {paths.packages_dir}")
+        print(f"BUILD DIR: {paths.build_dir}")
 
     # Apply filters based on @filter directives (unless skip_filters is True)
     if skip_filters:
@@ -114,50 +80,20 @@ def compile_board_examples(
             ok=True, sketch_results=[], skipped_examples=skipped_examples
         )
 
-    backend_label = "fbuild" if use_fbuild else "platformio (pio run)"
-    print(f"BUILD BACKEND: {backend_label}")
+    print("BUILD BACKEND: fbuild")
     print(f"{'=' * 60}")
 
     try:
-        # Create PioCompiler instance
-        compiler = PioCompiler(
+        # CI compile is hermetic w.r.t. the repo-root platformio.ini —
+        # per-board flags live in ci/boards.py (#3274, #3278, #3279).
+        compiler = BoardCompiler(
             board=board,
             verbose=verbose,
-            global_cache_dir=resolved_cache_dir,
             additional_defines=defines,
             additional_libs=extra_packages,
-            use_fbuild=use_fbuild,
         )
 
-        # Build all examples - use merged-bin method if requested
-        if merged_bin:
-            # Validate board supports merged binary
-            if not compiler.supports_merged_bin():
-                raise RuntimeError(
-                    f"Board {board.board_name} does not support merged binary. "
-                    f"Supported platforms: ESP32, ESP8266"
-                )
-
-            # Build with merged binary (only one example allowed in this mode)
-            if len(examples) != 1:
-                raise RuntimeError(
-                    f"Merged-bin mode requires exactly one example, got {len(examples)}"
-                )
-
-            result = compiler.build_with_merged_bin(
-                examples[0], output_path=merged_bin_output
-            )
-            futures: list[Future[SketchResult]] = []
-
-            # Wrap the result in a completed future for consistency
-            from concurrent.futures import Future as ConcurrentFuture
-
-            future: ConcurrentFuture[SketchResult] = ConcurrentFuture()
-            future.set_result(result)
-            futures.append(future)
-        else:
-            # Build all examples normally
-            futures = compiler.build(examples)
+        futures = compiler.build(examples, max_failures=max_failures)
 
         # Wait for completion and collect results
         results: list[SketchResult] = []

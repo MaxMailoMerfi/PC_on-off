@@ -20,8 +20,8 @@
 #include "platforms/memory_barrier.h"  // For FL_MEMORY_BARRIER
 
 #include "platforms/esp/32/drivers/parlio/parlio_engine.h"
-#include "fl/channels/detail/wave3.hpp"
-#include "fl/channels/detail/wave8.hpp"
+#include "fl/channels/detail/wave3.h"
+#include "fl/channels/detail/wave8.h"
 #include "platforms/esp/32/drivers/parlio/parlio_isr_context.h"
 #include "platforms/esp/32/drivers/parlio/parlio_buffer_calc.h"
 #include "platforms/esp/32/drivers/parlio/parlio_debug.h"
@@ -35,6 +35,7 @@
 #include "fl/stl/assert.h"
 #include "fl/stl/chrono.h"
 #include "fl/stl/noexcept.h"
+#include "fl/stl/new.h"
 
 #ifdef FASTLED_STUB_IMPL
 #include "platforms/esp/32/drivers/parlio/parlio_peripheral_mock.h"
@@ -55,7 +56,7 @@ FL_OPTIMIZATION_LEVEL_O3_BEGIN
 namespace {
 
 
-fl::detail::IParlioPeripheral* getParlioPeripheral() FL_NOEXCEPT {
+fl::detail::IParlioPeripheral* getParlioPeripheral() FL_NO_EXCEPT {
     // Get peripheral singleton instance
     #ifdef FASTLED_STUB_IMPL
         return &fl::detail::ParlioPeripheralMock::instance();
@@ -66,7 +67,7 @@ fl::detail::IParlioPeripheral* getParlioPeripheral() FL_NOEXCEPT {
     #endif
 }
 
-bool parlioDmaPsramAvailable() FL_NOEXCEPT {
+bool parlioDmaPsramAvailable() FL_NO_EXCEPT {
 #ifdef FASTLED_STUB_IMPL
     return false;
 #else
@@ -75,7 +76,7 @@ bool parlioDmaPsramAvailable() FL_NOEXCEPT {
 #endif
 }
 
-bool parlioCanAllocateInternalDmaRing(size_t bytes_per_buffer, size_t buffer_count) FL_NOEXCEPT {
+bool parlioCanAllocateInternalDmaRing(size_t bytes_per_buffer, size_t buffer_count) FL_NO_EXCEPT {
 #ifdef FASTLED_STUB_IMPL
     (void)bytes_per_buffer;
     (void)buffer_count;
@@ -192,7 +193,7 @@ struct BufferPopulationParams {
 /// @param params Input parameters for calculation
 /// @return Number of input bytes to process for this buffer
 FL_OPTIMIZE_FUNCTION static inline size_t FL_IRAM
-calculateBufferByteCount(const BufferPopulationParams& params) FL_NOEXCEPT {
+calculateBufferByteCount(const BufferPopulationParams& params) FL_NO_EXCEPT {
     // Calculate remaining bytes
     size_t bytes_remaining = params.totalBytes - params.nextByteOffset;
     if (bytes_remaining == 0) {
@@ -326,7 +327,7 @@ calculateBufferByteCount(const BufferPopulationParams& params) FL_NOEXCEPT {
 // ParlioEngine - Singleton Implementation
 //=============================================================================
 
-ParlioEngine::ParlioEngine() FL_NOEXCEPT
+ParlioEngine::ParlioEngine() FL_NO_EXCEPT
     : mInitialized(false),
       mDataWidth(0),
       mActualChannels(0),
@@ -417,15 +418,15 @@ ParlioEngine::~ParlioEngine() {
     mPins.clear();
 }
 
-ParlioEngine& ParlioEngine::getInstance() FL_NOEXCEPT {
+ParlioEngine& ParlioEngine::getInstance() FL_NO_EXCEPT {
     return fl::Singleton<ParlioEngine>::instance();
 }
 
-void ParlioEngine::setPollNeededCallback(IChannelDriver::PollNeededCallback callback) FL_NOEXCEPT {
+void ParlioEngine::setPollNeededCallback(IChannelDriver::PollNeededCallback callback) FL_NO_EXCEPT {
     mPollNeededCallback.set(callback);
 }
 
-void ParlioEngine::cleanup() FL_NOEXCEPT {
+void ParlioEngine::cleanup() FL_NO_EXCEPT {
 #ifdef FL_DEBUG
     // Clean up debug task only - singleton remains alive
     // This is called before DLL unload to properly join threads
@@ -455,7 +456,7 @@ void ParlioEngine::cleanup() FL_NOEXCEPT {
 ///
 /// This task runs every 500ms during transmission and prints ISR debug counters
 /// to help diagnose crashes and timing issues. Per LOOP.md iteration 5 instructions.
-void ParlioEngine::debugTaskFunction(void* arg) FL_NOEXCEPT {
+void ParlioEngine::debugTaskFunction(void* arg) FL_NO_EXCEPT {
     auto *self = static_cast<ParlioEngine *>(arg);
     if (!self || !self->mIsrContext || !self->mPeripheral) {
         // Cannot proceed without valid context - self-delete
@@ -481,19 +482,11 @@ void ParlioEngine::debugTaskFunction(void* arg) FL_NOEXCEPT {
             ctx->mHardwareIdle.load(fl::memory_order_acquire);
 
         // Print ISR debug state (using FL_LOG_PARLIO which is safe from task context)
-        FL_LOG_PARLIO("ISR_STATE:"
-               << " txDone=" << ctx->mDebugTxDoneCount
-               << " worker=" << ctx->mDebugWorkerIsrCount
-               << " ring_count=" << ctx->mRingCount
-               << " bytes_tx=" << ctx->mBytesTransmitted << "/" << ctx->mTotalBytes
-               << " transmitting=" << (transmitting ? "YES" : "NO")
-               << " complete=" << (stream_complete ? "YES" : "NO")
-               << " hw_idle=" << (hardware_idle ? "YES" : "NO"));
+        FL_LOG_PARLIO("ISR_STATE: txDone=" << ctx->mDebugTxDoneCount << " worker=" << ctx->mDebugWorkerIsrCount << " ring_count=" << ctx->mRingCount << " bytes_tx=" << ctx->mBytesTransmitted << "/" << ctx->mTotalBytes << " transmitting=" << ((transmitting ? "YES" : "NO")) << " complete=" << ((stream_complete ? "YES" : "NO")) << " hw_idle=" << ((hardware_idle ? "YES" : "NO")));
 
         // Check for ring buffer underrun (CRITICAL ERROR per LOOP.md)
         if (hardware_idle && ctx->mRingCount == 0 && transmitting) {
-            FL_ERROR("PARLIO: BUFFER UNDERRUN DETECTED - Hardware idle with empty ring during transmission"
-                    << " | bytes_tx=" << ctx->mBytesTransmitted << "/" << ctx->mTotalBytes);
+            FL_ERROR("PARLIO: BUFFER UNDERRUN DETECTED - Hardware idle with empty ring during transmission | bytes_tx=" << ctx->mBytesTransmitted << "/" << ctx->mTotalBytes);
             // DO NOT restart PARLIO - per LOOP.md this is a critical error
             // Exit task and let main thread detect the error
             break;
@@ -546,7 +539,7 @@ void ParlioEngine::debugTaskFunction(void* arg) FL_NOEXCEPT {
 // ============================================================================
 FL_OPTIMIZE_FUNCTION bool FL_IRAM
 ParlioEngine::txDoneCallback(void* tx_unit,
-                              const void *edata, void *user_ctx) FL_NOEXCEPT {
+                              const void *edata, void *user_ctx) FL_NO_EXCEPT {
     // ⚠️  ISR CONTEXT - NO LOGGING ALLOWED - SEE FUNCTION HEADER ⚠️
     (void)tx_unit;  // Opaque handle (not used in this callback)
     (void)edata;
@@ -721,7 +714,7 @@ ParlioEngine::txDoneCallback(void* tx_unit,
 //
 // ============================================================================
 FL_OPTIMIZE_FUNCTION void FL_IRAM
-ParlioEngine::workerIsrCallback(void *user_data) FL_NOEXCEPT {
+ParlioEngine::workerIsrCallback(void *user_data) FL_NO_EXCEPT {
     // ⚠️  ISR CONTEXT - NO LOGGING ALLOWED - SEE FUNCTION HEADER ⚠️
 
     // Null checks first
@@ -846,7 +839,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                                  size_t outputBufferCapacity,
                                  size_t startByte,
                                  size_t byteCount,
-                                 size_t& outputBytesWritten) FL_NOEXCEPT {
+                                 size_t& outputBytesWritten) FL_NO_EXCEPT {
     // SPI mode: delegate to SPI-specific encoding
     if (mEncodingMode == EncodingMode::SPI) {
         return populateDmaBufferSpi(outputBuffer, outputBufferCapacity,
@@ -909,7 +902,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                     : 0;
 
                 Wave3Byte wave3_output;
-                fl::detail::wave3_convert_byte_to_wave3byte(byte_value, mWave3Lut, &wave3_output);
+                fl::detail::wave3_convert_byte_to_wave3byte(byte_value, mWaveLookup.wave3, &wave3_output);
 
                 fl::memcpy(outputBuffer + outputIdx, &wave3_output, sizeof(Wave3Byte));
                 outputIdx += sizeof(Wave3Byte);
@@ -925,7 +918,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                 // #2548 L2: write transpose result directly into DMA buffer
                 // (capacity pre-validated by the `outputIdx + blockSize > outputBufferCapacity`
                 //  check at the top of this loop). Skips the 128-B stack round-trip.
-                fl::wave3Transpose_2(reinterpret_cast<const u8(&)[2]>(lanes), mWave3Lut, // ok reinterpret cast - array reference type conversion
+                fl::wave3Transpose_2(reinterpret_cast<const u8(&)[2]>(lanes), mWaveLookup.wave3, // ok reinterpret cast - array reference type conversion
                                     *reinterpret_cast<u8(*)[2 * sizeof(Wave3Byte)]>(outputBuffer + outputIdx)); // ok reinterpret cast - direct write to DMA buffer (#2548 L2)
                 outputIdx += blockSize;
             } else if (mDataWidth == 4) {
@@ -936,7 +929,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                         : 0;
                 }
 
-                fl::wave3Transpose_4(reinterpret_cast<const u8(&)[4]>(lanes), mWave3Lut, // ok reinterpret cast - array reference type conversion
+                fl::wave3Transpose_4(reinterpret_cast<const u8(&)[4]>(lanes), mWaveLookup.wave3, // ok reinterpret cast - array reference type conversion
                                     *reinterpret_cast<u8(*)[4 * sizeof(Wave3Byte)]>(outputBuffer + outputIdx)); // ok reinterpret cast - direct write to DMA buffer (#2548 L2)
                 outputIdx += blockSize;
             } else if (mDataWidth == 8) {
@@ -947,7 +940,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                         : 0;
                 }
 
-                fl::wave3Transpose_8(reinterpret_cast<const u8(&)[8]>(lanes), mWave3Lut, // ok reinterpret cast - array reference type conversion
+                fl::wave3Transpose_8(reinterpret_cast<const u8(&)[8]>(lanes), mWaveLookup.wave3, // ok reinterpret cast - array reference type conversion
                                     *reinterpret_cast<u8(*)[8 * sizeof(Wave3Byte)]>(outputBuffer + outputIdx)); // ok reinterpret cast - direct write to DMA buffer (#2548 L2)
                 outputIdx += blockSize;
             } else if (mDataWidth == 16) {
@@ -958,7 +951,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                         : 0;
                 }
 
-                fl::wave3Transpose_16(reinterpret_cast<const u8(&)[16]>(lanes), mWave3Lut, // ok reinterpret cast - array reference type conversion
+                fl::wave3Transpose_16(reinterpret_cast<const u8(&)[16]>(lanes), mWaveLookup.wave3, // ok reinterpret cast - array reference type conversion
                                      *reinterpret_cast<u8(*)[16 * sizeof(Wave3Byte)]>(outputBuffer + outputIdx)); // ok reinterpret cast - direct write to DMA buffer (#2548 L2)
                 outputIdx += blockSize;
             } else {
@@ -976,7 +969,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                     : 0;
 
                 Wave8Byte wave8_output;
-                fl::detail::wave8_expand_byte(byte_value, mWave8ByteLut, &wave8_output);
+                fl::detail::wave8_expand_byte(byte_value, mWaveLookup.wave8, &wave8_output);
 
                 // MSB bit packing: Wave8Bit stores pulses MSB-first, PARLIO MSB packing required
                 // (Hardware validation confirms MSB packing is correct for Wave8 format)
@@ -1002,7 +995,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                 // (capacity pre-validated by the `outputIdx + blockSize > outputBufferCapacity`
                 //  check at the top of this loop). Skips the 128-B stack round-trip.
                 // #2548 BF1: chipset-aware direct encode (skips byte_lut).
-                fl::wave8Transpose_2_bf1(reinterpret_cast<const u8(&)[2]>(lanes), mWave8ByteLut, // ok reinterpret cast - array reference type conversion
+                fl::wave8Transpose_2_bf1(reinterpret_cast<const u8(&)[2]>(lanes), mWaveLookup.wave8, // ok reinterpret cast - array reference type conversion
                                     *reinterpret_cast<u8(*)[2 * sizeof(Wave8Byte)]>(outputBuffer + outputIdx)); // ok reinterpret cast - direct write to DMA buffer (#2548 BF1)
                 outputIdx += blockSize;
             } else if (mDataWidth == 4) {
@@ -1014,7 +1007,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                 }
 
                 // #2548 BF1: chipset-aware direct encode (skips byte_lut).
-                fl::wave8Transpose_4_bf1(reinterpret_cast<const u8(&)[4]>(lanes), mWave8ByteLut, // ok reinterpret cast - array reference type conversion
+                fl::wave8Transpose_4_bf1(reinterpret_cast<const u8(&)[4]>(lanes), mWaveLookup.wave8, // ok reinterpret cast - array reference type conversion
                                     *reinterpret_cast<u8(*)[4 * sizeof(Wave8Byte)]>(outputBuffer + outputIdx)); // ok reinterpret cast - direct write to DMA buffer (#2548 BF1)
                 outputIdx += blockSize;
             } else if (mDataWidth == 8) {
@@ -1026,7 +1019,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                 }
 
                 // #2548 BF1: chipset-aware direct encode (skips byte_lut).
-                fl::wave8Transpose_8_bf1(reinterpret_cast<const u8(&)[8]>(lanes), mWave8ByteLut, // ok reinterpret cast - array reference type conversion
+                fl::wave8Transpose_8_bf1(reinterpret_cast<const u8(&)[8]>(lanes), mWaveLookup.wave8, // ok reinterpret cast - array reference type conversion
                                     *reinterpret_cast<u8(*)[8 * sizeof(Wave8Byte)]>(outputBuffer + outputIdx)); // ok reinterpret cast - direct write to DMA buffer (#2548 BF1)
                 outputIdx += blockSize;
             } else if (mDataWidth == 16) {
@@ -1062,7 +1055,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                         reinterpret_cast<const u8(&)[16]>(lanes_b), // ok reinterpret cast - array reference type conversion
                         reinterpret_cast<const u8(&)[16]>(lanes_c), // ok reinterpret cast - array reference type conversion
                         reinterpret_cast<const u8(&)[16]>(lanes_d), // ok reinterpret cast - array reference type conversion
-                        mWave8ByteLut,
+                        mWaveLookup.wave8,
                         *reinterpret_cast<u8(*)[16 * sizeof(Wave8Byte)]>(outputBuffer + outputIdx),                      // ok reinterpret cast - direct write to DMA buffer (#2548)
                         *reinterpret_cast<u8(*)[16 * sizeof(Wave8Byte)]>(outputBuffer + outputIdx + blockSize),          // ok reinterpret cast - direct write to DMA buffer (#2548)
                         *reinterpret_cast<u8(*)[16 * sizeof(Wave8Byte)]>(outputBuffer + outputIdx + 2 * blockSize),      // ok reinterpret cast - direct write to DMA buffer (#2548)
@@ -1071,7 +1064,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
                     byteOffset += 3;  // outer loop also does ++byteOffset → net +4
                 } else {
                     fl::wave8Transpose_16_bf1(
-                        reinterpret_cast<const u8(&)[16]>(lanes_a), mWave8ByteLut, // ok reinterpret cast - array reference type conversion
+                        reinterpret_cast<const u8(&)[16]>(lanes_a), mWaveLookup.wave8, // ok reinterpret cast - array reference type conversion
                         *reinterpret_cast<u8(*)[16 * sizeof(Wave8Byte)]>(outputBuffer + outputIdx)); // ok reinterpret cast - direct write to DMA buffer (#2548 BF1)
                     outputIdx += blockSize;
                 }
@@ -1139,7 +1132,7 @@ ParlioEngine::populateDmaBuffer(u8* outputBuffer,
 // Ring Buffer Management - Incremental Population Architecture
 //=============================================================================
 
-bool ParlioEngine::hasRingSpace() const FL_NOEXCEPT {
+bool ParlioEngine::hasRingSpace() const FL_NO_EXCEPT {
     if (!mIsrContext) {
         return false;
     }
@@ -1152,7 +1145,7 @@ bool ParlioEngine::hasRingSpace() const FL_NOEXCEPT {
 }
 
 
-bool ParlioEngine::allocateRingBuffers() FL_NOEXCEPT {
+bool ParlioEngine::allocateRingBuffers() FL_NO_EXCEPT {
     // One-time ring buffer allocation and initialization
     // Called once during initialize(), NOT per transmission
     // Buffers remain allocated, only POPULATED on-demand during transmission
@@ -1174,9 +1167,7 @@ bool ParlioEngine::allocateRingBuffers() FL_NOEXCEPT {
     if (!parlioDmaPsramAvailable() &&
         !parlioCanAllocateInternalDmaRing(mRingBufferCapacity,
                                           ParlioRingBuffer3::RING_BUFFER_COUNT)) {
-        FL_LOG_PARLIO("PARLIO: Insufficient DMA heap for "
-                      << ParlioRingBuffer3::RING_BUFFER_COUNT
-                      << " ring buffers of " << mRingBufferCapacity << " bytes");
+        FL_LOG_PARLIO("PARLIO: Insufficient DMA heap for " << (ParlioRingBuffer3::RING_BUFFER_COUNT) << " ring buffers of " << mRingBufferCapacity << " bytes");
         return false;
     }
 
@@ -1185,8 +1176,7 @@ bool ParlioEngine::allocateRingBuffers() FL_NOEXCEPT {
         buffers[i] = mPeripheral->allocateDmaBuffer(mRingBufferCapacity);
 
         if (!buffers[i]) {
-            FL_LOG_PARLIO("PARLIO: Failed to allocate ring buffer "
-                    << i << "/3 (requested " << mRingBufferCapacity << " bytes)");
+            FL_LOG_PARLIO("PARLIO: Failed to allocate ring buffer " << i << "/3 (requested " << mRingBufferCapacity << " bytes)");
 
             // Clean up any buffers we already allocated
             for (size_t j = 0; j < i; j++) {
@@ -1204,7 +1194,7 @@ bool ParlioEngine::allocateRingBuffers() FL_NOEXCEPT {
     mRingBuffer = fl::make_unique<ParlioRingBuffer3>(
         buffers[0], buffers[1], buffers[2],
         mRingBufferCapacity,
-        [peripheral](u8* ptr) FL_NOEXCEPT {
+        [peripheral](u8* ptr) FL_NO_EXCEPT {
             peripheral->freeDmaBuffer(ptr);
         }
     );
@@ -1246,7 +1236,7 @@ bool ParlioEngine::allocateRingBuffers() FL_NOEXCEPT {
 //=============================================================================
 
 FL_OPTIMIZE_FUNCTION bool FL_IRAM
-ParlioEngine::populateNextDMABuffer() FL_NOEXCEPT {
+ParlioEngine::populateNextDMABuffer() FL_NO_EXCEPT {
     // Incremental buffer population - called repeatedly to fill ring buffers
     // Returns true if more buffers need to be populated, false if all done
 
@@ -1345,7 +1335,7 @@ ParlioEngine::populateNextDMABuffer() FL_NOEXCEPT {
 bool ParlioEngine::initialize(size_t dataWidth,
                               const fl::vector<int>& pins,
                               const ChipsetTimingConfig& timing,
-                              size_t maxLedsPerChannel) FL_NOEXCEPT {
+                              size_t maxLedsPerChannel) FL_NO_EXCEPT {
     FL_LOG_PARLIO("PARLIO_INIT: initialize() called - dataWidth=" << dataWidth << " pins=" << pins.size());
 
     // Get peripheral first (needed for both initial and re-initialization)
@@ -1367,9 +1357,7 @@ bool ParlioEngine::initialize(size_t dataWidth,
     if (mInitialized && mPeripheral && mPeripheral->isInitialized() && config_matches) {
         // Config matches but check if ring buffers need reallocation for larger LED count
         if (maxLedsPerChannel > mMaxLedsPerChannel) {
-            FL_LOG_PARLIO("PARLIO_INIT: Config matches but maxLeds increased from "
-                         << mMaxLedsPerChannel << " to " << maxLedsPerChannel
-                         << " - reallocating ring buffers");
+            FL_LOG_PARLIO("PARLIO_INIT: Config matches but maxLeds increased from " << mMaxLedsPerChannel << " to " << maxLedsPerChannel << " - reallocating ring buffers");
 
             // Recalculate ring buffer capacity for larger LED count
             ParlioBufferCalculator calc(mDataWidth, mUseWave3, mClockFreqHz); // ok no noexcept
@@ -1492,8 +1480,7 @@ bool ParlioEngine::initialize(size_t dataWidth,
 
     // Validate pin count matches data width
     if (pins.size() != dataWidth) {
-        FL_LOG_PARLIO("PARLIO: Pin configuration error - expected "
-                << dataWidth << " pins, got " << pins.size());
+        FL_LOG_PARLIO("PARLIO: Pin configuration error - expected " << dataWidth << " pins, got " << pins.size());
         return false;
     }
 
@@ -1509,16 +1496,26 @@ bool ParlioEngine::initialize(size_t dataWidth,
     mUseWave3 = canUseWave3(chipsetTiming);
     if (mUseWave3) {
         mClockFreqHz = wave3ClockFrequencyHz(chipsetTiming);
-        mWave3Lut = buildWave3ExpansionLUT(chipsetTiming);
+        ::new (static_cast<void*>(&mWaveLookup.wave3)) fl::Wave3BitExpansionLut;
+        mWaveLookup.wave3 = buildWave3ExpansionLUT(chipsetTiming);
         FL_LOG_PARLIO("PARLIO_INIT: Wave3 mode selected (clock=" << mClockFreqHz << " Hz)");
     } else {
-        mClockFreqHz = FL_ESP_PARLIO_CLOCK_FREQ_HZ;
+        // FastLED#3586: derive the wave8 clock from the CHIPSET timing —
+        // 8 samples per bit → clock = 8 / bit_period. The old hardcoded
+        // 8 MHz (FL_ESP_PARLIO_CLOCK_FREQ_HZ) transmitted WS2812 with a
+        // 1.0 µs bit period instead of 1.25 µs (bench-measured 25% fast
+        // on ESP32-C6: T1H 643 ns / T1L 356 ns on the wire).
+        const u32 bit_period_ns = static_cast<u32>(mTimingT1Ns) +
+                                  static_cast<u32>(mTimingT2Ns) +
+                                  static_cast<u32>(mTimingT3Ns);
+        mClockFreqHz = (bit_period_ns > 0)
+                           ? static_cast<u32>(8000000000ULL / bit_period_ns)
+                           : FL_ESP_PARLIO_CLOCK_FREQ_HZ;
+        ::new (static_cast<void*>(&mWaveLookup.wave8)) fl::Wave8ByteExpansionLut;
+        const fl::Wave8BitExpansionLut nibble_lut = buildWave8ExpansionLUT(chipsetTiming);
+        buildWave8ByteExpansionLUT(nibble_lut, mWaveLookup.wave8);
         FL_LOG_PARLIO("PARLIO_INIT: Wave8 mode selected (clock=" << mClockFreqHz << " Hz)");
     }
-    // Always build wave8 LUT (needed as fallback and for SPI mode)
-    mWave8Lut = buildWave8ExpansionLUT(chipsetTiming);
-    // #2526: also build the byte-indexed LUT used by the hot encode path.
-    mWave8ByteLut = buildWave8ByteExpansionLUT(mWave8Lut);
     mEncodingMode = EncodingMode::CLOCKLESS;
 
     // Configure peripheral (constructor handles -1 filling for unused pins)
@@ -1626,7 +1623,7 @@ bool ParlioEngine::initialize(size_t dataWidth,
 
 bool ParlioEngine::initializeSpi(const fl::vector<int>& pins,
                                   u32 spiClockHz,
-                                  size_t maxBytesPerChannel) FL_NOEXCEPT {
+                                  size_t maxBytesPerChannel) FL_NO_EXCEPT {
     // SPI-over-PARLIO requires exactly 2 pins (clock + data)
     if (pins.size() != 2) {
         FL_WARN("PARLIO_SPI: Expected 2 pins (clock, data), got " << pins.size());
@@ -1755,7 +1752,7 @@ bool ParlioEngine::initializeSpi(const fl::vector<int>& pins,
 // ============================================================================
 // Static utility: Encode a single SPI byte into 4 DMA bytes
 // ============================================================================
-void ParlioEngine::encodeSpiByteForTest(u8 dataByte, u8 output[4]) FL_NOEXCEPT {
+void ParlioEngine::encodeSpiByteForTest(u8 dataByte, u8 output[4]) FL_NO_EXCEPT {
     // 2-bit PARLIO mode with MSB packing.
     // Each DMA byte holds 4 PARLIO ticks (2 bits per tick, MSB first).
     //
@@ -1802,7 +1799,7 @@ FL_OPTIMIZE_FUNCTION bool FL_IRAM
 ParlioEngine::populateDmaBufferSpi(
     u8* outputBuffer, size_t outputCapacity,
     size_t startByte, size_t byteCount,
-    size_t& outputBytesWritten) FL_NOEXCEPT {
+    size_t& outputBytesWritten) FL_NO_EXCEPT {
 
     size_t outputIdx = 0;
 
@@ -1829,11 +1826,11 @@ ParlioEngine::populateDmaBufferSpi(
 bool ParlioEngine::beginTransmission(const u8* scratchBuffer,
                                      size_t totalBytes,
                                      size_t numLanes,
-                                     size_t laneStride) FL_NOEXCEPT {
+                                     size_t laneStride) FL_NO_EXCEPT {
     FL_LOG_PARLIO("PARLIO_TX: beginTransmission() called - totalBytes=" << totalBytes << " numLanes=" << numLanes);
 
     if (!mInitialized || !mPeripheral || !mIsrContext) {
-        FL_LOG_PARLIO("PARLIO_TX: FAILED - not initialized (mInit=" << mInitialized << " mPeripheral=" << (mPeripheral?1:0) << " mIsr=" << (mIsrContext?1:0) << ")");
+        FL_LOG_PARLIO("PARLIO_TX: FAILED - not initialized (mInit=" << mInitialized << " mPeripheral=" << ((mPeripheral?1:0)) << " mIsr=" << ((mIsrContext?1:0)) << ")");
         return false;
     }
 
@@ -1919,7 +1916,7 @@ bool ParlioEngine::beginTransmission(const u8* scratchBuffer,
     mIsrContext->mDebugLastWorkerIsrTime = 0;
 
     // Pre-populate ring buffers (fill all buffers if possible)
-    FL_LOG_PARLIO("PARLIO_TX: Pre-populating ring buffers - mScratchBuffer=" << (void*)mScratchBuffer << " stride=" << mLaneStride);
+    FL_LOG_PARLIO("PARLIO_TX: Pre-populating ring buffers - mScratchBuffer=" << ((void*)mScratchBuffer) << " stride=" << mLaneStride);
     while (hasRingSpace() && populateNextDMABuffer()) {
         // Buffer populated into ring
     }
@@ -1929,11 +1926,7 @@ bool ParlioEngine::beginTransmission(const u8* scratchBuffer,
     FL_LOG_PARLIO("PARLIO_TX: Ring buffers populated - count=" << buffers_populated);
 
     // Debug: Log input_sizes array
-    FL_LOG_PARLIO("PARLIO: DEBUG input_sizes[0]=" << mRingBuffer->input_sizes[0]
-         << " [1]=" << mRingBuffer->input_sizes[1]
-         << " [2]=" << mRingBuffer->input_sizes[2]
-         << " buffers=" << buffers_populated
-         << " total=" << totalBytes);
+    FL_LOG_PARLIO("PARLIO: DEBUG input_sizes[0]=" << mRingBuffer->input_sizes[0] << " [1]=" << mRingBuffer->input_sizes[1] << " [2]=" << mRingBuffer->input_sizes[2] << " buffers=" << buffers_populated << " total=" << totalBytes);
 
     // Verify at least one buffer was populated
     if (buffers_populated == 0) {
@@ -1963,8 +1956,7 @@ bool ParlioEngine::beginTransmission(const u8* scratchBuffer,
     FL_LOG_PARLIO("PARLIO_TX: Peripheral enabled successfully");
 
     // Queue first buffer to start transmission
-    FL_LOG_PARLIO("PARLIO: Starting ISR-based streaming | first_buffer_size="
-           << mRingBuffer->sizes[0] << " | buffers_ready=" << buffers_populated);
+    FL_LOG_PARLIO("PARLIO: Starting ISR-based streaming | first_buffer_size=" << mRingBuffer->sizes[0] << " | buffers_ready=" << buffers_populated);
 
     size_t first_buffer_size = mRingBuffer->sizes[0];
     FL_LOG_PARLIO("PARLIO_TX: Starting transmission - first_buffer=" << first_buffer_size << " bytes, buffers_ready=" << buffers_populated);
@@ -2041,29 +2033,20 @@ bool ParlioEngine::beginTransmission(const u8* scratchBuffer,
     // - Simpler code path with lower latency
     //=========================================================================
 
-    FL_LOG_PARLIO("PARLIO: Worker function configured (one-shot mode, called from txDoneCallback)"
-           << " | buffers_ready=" << buffers_populated);
+    FL_LOG_PARLIO("PARLIO: Worker function configured (one-shot mode, called from txDoneCallback) | buffers_ready=" << buffers_populated);
 
     // For test/mock environments, block and wait for completion
     // Real hardware uses async mode where caller polls via poll() method
     #ifdef FASTLED_STUB_IMPL
     // Block until transmission completes by polling
-    FL_LOG_PARLIO("PARLIO STUB: Entering polling loop - totalBytes=" << totalBytes
-                   << " streamComplete=" << mIsrContext->mStreamComplete.load(fl::memory_order_acquire));
+    FL_LOG_PARLIO("PARLIO STUB: Entering polling loop - totalBytes=" << totalBytes << " streamComplete=" << (mIsrContext->mStreamComplete.load(fl::memory_order_acquire)));
     size_t poll_iterations = 0;
     while (!mIsrContext->mStreamComplete.load(fl::memory_order_acquire) && !mErrorOccurred) {
         ParlioEngineState state = poll();
         poll_iterations++;
 
         if (poll_iterations % 100 == 0) {
-            FL_LOG_PARLIO("PARLIO STUB: Poll iteration " << poll_iterations
-                   << " - bytesTransmitted=" << mIsrContext->mBytesTransmitted
-                   << "/" << mIsrContext->mTotalBytes
-                   << " streamComplete=" << mIsrContext->mStreamComplete.load(fl::memory_order_acquire)
-                   << " transmitting=" << mIsrContext->mTransmitting.load(fl::memory_order_acquire)
-                   << " ringCount=" << mIsrContext->mRingCount
-                   << " txDone=" << mIsrContext->mDebugTxDoneCount
-                   << " worker=" << mIsrContext->mDebugWorkerIsrCount);
+            FL_LOG_PARLIO("PARLIO STUB: Poll iteration " << poll_iterations << " - bytesTransmitted=" << mIsrContext->mBytesTransmitted << "/" << mIsrContext->mTotalBytes << " streamComplete=" << (mIsrContext->mStreamComplete.load(fl::memory_order_acquire)) << " transmitting=" << (mIsrContext->mTransmitting.load(fl::memory_order_acquire)) << " ringCount=" << mIsrContext->mRingCount << " txDone=" << mIsrContext->mDebugTxDoneCount << " worker=" << mIsrContext->mDebugWorkerIsrCount);
         }
 
         if (state == ParlioEngineState::READY || state == ParlioEngineState::ERROR) {
@@ -2099,11 +2082,7 @@ bool ParlioEngine::beginTransmission(const u8* scratchBuffer,
 
     // Debug: Print initial counter state
     // Note: read_idx and ring_count already advanced before buffer submission (Iteration 2 fix)
-    FL_LOG_PARLIO("DEBUG: Transmission started (async)"
-           << " | read_idx=" << mIsrContext->mRingReadIdx
-           << " | ring_count=" << mIsrContext->mRingCount
-           << " | txDone_count=" << mIsrContext->mDebugTxDoneCount
-           << " | worker_count=" << mIsrContext->mDebugWorkerIsrCount);
+    FL_LOG_PARLIO("DEBUG: Transmission started (async) | read_idx=" << mIsrContext->mRingReadIdx << " | ring_count=" << mIsrContext->mRingCount << " | txDone_count=" << mIsrContext->mDebugTxDoneCount << " | worker_count=" << mIsrContext->mDebugWorkerIsrCount);
 
     // PHASE 1: ASYNC MODE - Return immediately without blocking
     // ISRs will handle buffer population and hardware submission in background
@@ -2113,7 +2092,7 @@ bool ParlioEngine::beginTransmission(const u8* scratchBuffer,
     return true; // Transmission started successfully (async)
 }
 
-ParlioEngineState ParlioEngine::poll() FL_NOEXCEPT {
+ParlioEngineState ParlioEngine::poll() FL_NO_EXCEPT {
     if (!mInitialized || !mPeripheral || !mIsrContext) {
         return ParlioEngineState::READY;
     }
@@ -2167,14 +2146,14 @@ ParlioEngineState ParlioEngine::poll() FL_NOEXCEPT {
     return ParlioEngineState::DRAINING;
 }
 
-bool ParlioEngine::isTransmitting() const FL_NOEXCEPT {
+bool ParlioEngine::isTransmitting() const FL_NO_EXCEPT {
     if (!mIsrContext) {
         return false;
     }
     return mIsrContext->mTransmitting.load(fl::memory_order_acquire);
 }
 
-ParlioDebugMetrics ParlioEngine::getDebugMetrics() const FL_NOEXCEPT {
+ParlioDebugMetrics ParlioEngine::getDebugMetrics() const FL_NO_EXCEPT {
     ParlioDebugMetrics metrics = {};
 
     if (!mIsrContext) {

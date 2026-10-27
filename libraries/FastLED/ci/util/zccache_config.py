@@ -63,15 +63,6 @@ def get_zccache_wrapper_path() -> str | None:
     return None
 
 
-def clear_zccache_stats() -> None:
-    """Clear zccache statistics (no-op).
-
-    zccache 1.0.3 does not support --zero-stats.
-    Stats are per-daemon-uptime and reset automatically on daemon restart.
-    """
-    pass
-
-
 def show_zccache_stats() -> None:
     """Display zccache statistics if zccache is available."""
     zccache_path = get_zccache_wrapper_path()
@@ -89,6 +80,8 @@ def show_zccache_stats() -> None:
                 timeout=10,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             # session-stats may print to stdout or stderr
             output = (stats_result.stderr or "").strip() or (
@@ -110,6 +103,8 @@ def show_zccache_stats() -> None:
                 check=False,
                 timeout=10,
                 capture_output=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except KeyboardInterrupt as ki:
             handle_keyboard_interrupt(ki)
@@ -124,6 +119,8 @@ def show_zccache_stats() -> None:
             check=False,
             timeout=10,
             capture_output=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if result.returncode == 0:
             # Parse zccache status output format:

@@ -14,11 +14,12 @@ board = esp32-s3-devkitm-1
 framework = arduino
 build_flags =
     -DFASTLED_SUPPRESS_ARDUINO_CHIP_DEBUG_REPORT=1
-    ; FASTLED_LOG_VERBOSITY defaults to 0 in release builds (NDEBUG)
-    ; since FastLED #2890 — no explicit flag needed.
+    ; FL_LOG_LEVEL defaults to 0 (no logs) in release builds (NDEBUG,
+    ; #2890) and to 1 (FL_ERROR only, FL_WARN compiled out; #4712)
+    ; otherwise. -DFL_LOG_LEVEL=2 restores full logs.
 board_build.sdkconfig_defaults =
     sdkconfig.defaults
-    ${platformio.packages_dir}/framework-arduinoespressif32/tools/sdkconfig.defaults.esp32s3
+    <path-to-installed-framework-arduinoespressif32>/tools/sdkconfig.defaults.esp32s3
     ${PROJECT_LIBDEPS_DIR}/${PIOENV}/FastLED/tools/sdkconfig_for_smallest_fastled.defaults
 ```
 
@@ -39,9 +40,9 @@ To measure your own build: `bash bloat esp32s3 --build` then `jq '.total_flash' 
 
 | # | Lever | How to enable | Savings | Status | PR |
 |---:|---|---|---:|:---:|---|
-| 1 | `FASTLED_LOG_VERBOSITY=0` | **Default on release builds** (NDEBUG); `-DFASTLED_LOG_VERBOSITY=1` to restore | **−37,812 B from this flag alone** + post-Stage-1 cascade (see below) totalling **≈ −50,391 B** (388,380 → 337,989 B on master post-#2957) | ✅ | #2890 + cascade |
+| 1 | `FASTLED_LOG_VERBOSITY=0` | **Default on release builds** (NDEBUG); `-DFL_LOG_LEVEL=2` (or legacy `-DFASTLED_LOG_VERBOSITY=1`) to restore | **−37,812 B from this flag alone** + post-Stage-1 cascade (see below) totalling **≈ −50,391 B** (388,380 → 337,989 B on master post-#2957) | ✅ | #2890 + cascade |
 | 2 | `tools/sdkconfig_for_smallest_fastled.defaults` | `board_build.sdkconfig_defaults` in `platformio.ini`. **Includes `CONFIG_NEWLIB_NANO_FORMAT=y`** which drops the standard newlib printf cluster — see Stage 3 detail below. | **−59,224 B measured** (339,962 → 280,738 B on `f43f76701a`) | ✅ | #2896 + #2915 |
-| 3 | `-DFASTLED_RMT_STATIC_ALLOCATION=1` | `build_flags`; for sketches that init LEDs in `setup()` and never `removeLeds()` | **−908 B measured** (339,962 → 339,054 B; well below projection) | ✅ | #2846 |
+| 3 | `-DFL_RMT_STATIC_ALLOCATION=1` | `build_flags`; one fixed FastLED TX strip initialized in `setup()`, with no late add/remove, pin/timing reconfiguration, or RMT5 RX allocation | **−4,395 B symbol flash, −108 B RAM** versus the default dynamic Blink build; see the isolated before/after audit below | ✅ | PR #2846; issue #4567 |
 | 4 | `-DFASTLED_SUPPRESS_ARDUINO_CHIP_DEBUG_REPORT=1` | `build_flags`; strong-overrides the Arduino-ESP32 boot-banner gate | ~3 KB | 📊 | #2894 |
 | 5 | `CONFIG_BT_ENABLED=n` | uncomment the situational block in `tools/sdkconfig_for_smallest_fastled.defaults` | ~15 KB (if currently on) | 📊 | — |
 | 6 | `-DFASTLED_DISABLE_SPI_CHIPSETS=1` | `build_flags`; drops the SPI dispatch branch in `Channel::showPixels`. **Constraint:** clockless-only sketches; calling `FastLED.addLeds<APA102, ...>` (or any SPI chipset) under this flag silently emits nothing. | ~1.0-1.2 KB | 📊 | #2913 |
@@ -65,14 +66,14 @@ Row 1 is empirically confirmed by the 2026-06-06 audit (see the [#2886 audit com
 
 ### 1. `FASTLED_LOG_VERBOSITY=0` (the big one)
 
-**Mechanism:** `src/fl/log/log.h:66-92`. The unset default resolves as `FASTLED_TESTING` → 1, `NDEBUG` → 0, otherwise → 1. At level 0 the `FL_WARN` / `FL_INFO` / `FL_ERROR` / `FL_PRINT` / `FL_DBG` macros expand to `do {} while(0)`, so the optimizer drops the formatted-stream operator chain and the linker drops every literal carried with it.
+**Mechanism:** `src/fl/log/log.h` resolves `FL_LOG_LEVEL` (0 = off, 1 = errors only, 2 = full) as `FASTLED_TESTING` → 2, explicit `FL_LOG_LEVEL`, legacy `FASTLED_LOG_VERBOSITY` (0 → 0, ≥1 → 2), `NDEBUG` → 0, otherwise → 1. Since #4712 the non-release default (1) already compiles out `FL_WARN` / `FL_INFO` / `FL_DBG`, so most of the pool below is gone without any flag; level 0 additionally drops `FL_ERROR` / `FL_PRINT`. At level 0 the `FL_WARN` / `FL_INFO` / `FL_ERROR` / `FL_PRINT` / `FL_DBG` macros expand to `do {} while(0)`, so the optimizer drops the formatted-stream operator chain and the linker drops every literal carried with it.
 
 **Where the savings come from (per #2886 top-25):**
 
 - ~58 KB from the `ClocklessIdf5` ctor's transitive `FL_WARN` rodata pool (75 sites in `channel_driver_rmt.cpp.hpp`, 59 in `rmt_memory_manager.cpp.hpp`, 6 in `manager.cpp.hpp`, 5 in `channel.cpp.hpp`).
 - Additional ~5-10 KB scattered across smaller call sites (`createChannel`, `reconfigureForNetwork`, `handleAllocateTxFailure`, `Rmt5EncoderImpl::initialize`).
 
-**To restore on a release build** (e.g. for field debugging): add `-DFASTLED_LOG_VERBOSITY=1` to `build_flags`.
+**To restore full logs** (e.g. for field debugging): add `-DFL_LOG_LEVEL=2` (or the legacy `-DFASTLED_LOG_VERBOSITY=1`) to `build_flags`.
 
 **To force off on a non-release build** (e.g. measuring savings without an NDEBUG rebuild): add `-DFASTLED_LOG_VERBOSITY=0` to `build_flags`.
 
@@ -94,11 +95,26 @@ The overlay file at [`../tools/sdkconfig_for_smallest_fastled.defaults`](../tool
 
 **`CONFIG_BT_ENABLED=n`** is shipped as a commented-out situational block — uncomment only if your sketch doesn't use BLE/BT (another ~15 KB).
 
-### 3. `FASTLED_RMT_STATIC_ALLOCATION=1`
+### 3. `FL_RMT_STATIC_ALLOCATION=1`
 
-**Mechanism:** Selects the `ChannelEngineRMTImpl<kStatic=true>` specialization at boot. Sketches that init their LEDs in `setup()` and never call `removeLeds()` or late `addLeds()` get a smaller `allocateTx` + `createChannel` path. Pre-existing knob from FastLED #2846; included here so it's discoverable from the same reference.
+**Mechanism:** Compile-time static mode removes adaptive network planning and channel reconfiguration paths, and uses a one-record `fl::vector_fixed` allocation ledger. This mode is for exactly one FastLED TX strip, initialized in `setup()`; do not use it with late `addLeds()`, `removeLeds()`, runtime pin/timing reconfiguration, or RMT5 RX allocation through the manager. The preferred spelling is `FL_RMT_STATIC_ALLOCATION`; `FASTLED_RMT_STATIC_ALLOCATION` remains a compatibility alias.
 
-**Safety:** flips a thread-local `kIsStaticInit` after `setup()` returns. Dynamic add/remove after that point is unsafe under the static path. If your sketch reconfigures LEDs at runtime, don't set this flag.
+**Safety:** This flag is a contract, not a runtime guard. If the sketch adds or removes LEDs after setup, uses more than one RMT TX channel, or needs RMT5 RX accounting, keep static mode disabled.
+
+**Isolated before/after audit:** ESP32-S3 `Blink`, `xtensa-esp-elf-gcc 14.2.0`, same fbuild setup, measured 2026-09-24. The base is the pre-ledger source at `origin/master` (`e9266b5`; the measurement worktree differs only in the unrelated bloat-baseline data file). `bash bloat esp32s3 --no-summary` totals are symbol-attributed sizes; firmware bytes are the built `firmware.bin` file size.
+
+| Mode | Metric | Before | After | Delta |
+|---|---|---:|---:|---:|
+| Dynamic (default) | Symbol flash | 374,098 B | 374,044 B | −54 B |
+| Dynamic (default) | Symbol RAM | 41,339 B | 41,339 B | 0 B |
+| Dynamic (default) | Symbol count | 4,137 | 4,137 | 0 |
+| Dynamic (default) | `firmware.bin` | 424,800 B | 424,736 B | −64 B |
+| Static (`FL_RMT_STATIC_ALLOCATION=1`) | Symbol flash | 369,723 B | 369,649 B | −74 B |
+| Static (`FL_RMT_STATIC_ALLOCATION=1`) | Symbol RAM | 41,339 B | 41,231 B | −108 B |
+| Static (`FL_RMT_STATIC_ALLOCATION=1`) | Symbol count | 4,121 | 4,127 | +6 |
+| Static (`FL_RMT_STATIC_ALLOCATION=1`) | `firmware.bin` | 419,904 B | 420,096 B | +192 B |
+
+The ledger change saves 108 B of symbol RAM in static mode; symbol flash falls by 74 B, but the whole `firmware.bin` grows by 192 B, so this is not a firmware-file flash reduction. Per-symbol, `ChannelEngineRMTImpl::configureChannel` (378 B) disappears and the `ClocklessIdf5` constructor shrinks by 76 B. The static rollback path adds a 102 B `RmtMemoryManager::rollbackAllocation` symbol plus fixed-vector helpers, accounting for most of the offsetting code. The `RmtMemoryManager` singleton's RAM symbol falls from 176 B to 68 B. Dynamic mode has no RAM or symbol-count regression, and its whole firmware is 64 B smaller.
 
 ### 4. `FASTLED_SUPPRESS_ARDUINO_CHIP_DEBUG_REPORT=1`
 
@@ -108,9 +124,9 @@ The overlay file at [`../tools/sdkconfig_for_smallest_fastled.defaults`](../tool
 
 ## Situational notes
 
-- **Stages 1+2 stack with `FASTLED_RMT_STATIC_ALLOCATION`** — they target different parts of the binary (the FL_WARN string pool vs. the dynamic RMT scaffolding). Combining all three is the smallest-build path.
+- **Stages 1+2 stack with `FL_RMT_STATIC_ALLOCATION`** — they target different parts of the binary (the FL_WARN string pool vs. the dynamic RMT scaffolding). Combining all three is the smallest-build path.
 - **The sdkconfig overlay only fires if your project's `sdkconfig_defaults` references it.** Adding the overlay file to your library install is not enough; you have to list it under `board_build.sdkconfig_defaults`.
-- **`PROJECT_LIBDEPS_DIR` resolution varies by PIO project layout.** If the substitution above doesn't resolve, fall back to the absolute path to the installed FastLED package.
+- **`PROJECT_LIBDEPS_DIR` resolution varies by project layout.** If the substitution above doesn't resolve, fall back to the absolute path to the installed FastLED package.
 
 ## Measuring your build
 
@@ -123,6 +139,17 @@ bash bloat esp32s3 --top 25
 This emits:
 - `.build/symbols/esp32s3/report.json` — per-symbol attribution.
 - `.build/symbols/esp32s3/report.md` — human-readable top-N table.
+
+### Reproducible slim profile
+
+```bash
+bash bloat esp32s3 --build --profile slim   # log-off + smallest sdkconfig overlay
+bash bloat esp32s3 --build --compare        # default vs. slim, side by side
+```
+
+**Note:** the default `bash bloat esp32s3` image is built **without** `-DNDEBUG` / `FASTLED_LOG_VERBOSITY=0`, so `FL_LOG_LEVEL` resolves to 1 (errors only since #4712; see `src/fl/log/log.h`). It is not the log-off release config described above. For reference, default Blink at `0811ca88af` measured 374,588 B attributed / 459,560 B `firmware.bin` (#4564).
+
+The slim profile applies `FASTLED_LOG_VERBOSITY=0` plus `tools/sdkconfig_for_smallest_fastled.defaults`, and fails if `libespcoredump.a` or `diag_log_add` remain linked. It writes `.build/symbols/esp32s3-slim/` (`report.json`, `report.md`, and `provenance.json` recording the applied flags and overlay). Because slim disables field-debug logs and coredumps it is opt-in; the ordinary ratchet baseline `tests/data/esp32s3_bloat_baseline.txt` still tracks the default image and is unchanged.
 
 Compare two builds with `uv run python .claude/symbolaudit/diff.py <old.json> <new.json>` (added / removed / grew / shrunk symbols per archive). The full tooling reference is in [`agents/docs/binary-size-analysis.md`](../agents/docs/binary-size-analysis.md).
 
@@ -140,7 +167,7 @@ Status of every Stage on the multi-stage plan tracked in [#2886](https://github.
 
 ### Next round of structural savings — see [#2856](https://github.com/FastLED/FastLED/issues/2856)
 
-The #2886 stages have squeezed every release-build flash-saver knob and audit target available from the current architecture. The next round of *real* (multi-KB) savings is structural and tracked separately in [#2856 "Meta: ESP32-S3 binary-size reduction — Batch 3"](https://github.com/FastLED/FastLED/issues/2856), covering items 3.1–3.6 (template-trait static dispatch for `Channel::showPixels`, printf-style log backend, `ChannelManager` static-bind path, RMT5 encoder dedup, `fl::result<T,E>` → status code for internal APIs, fixed-size allocation ledger under `FASTLED_RMT_STATIC_ALLOCATION`). Several of those items are already shipped or in flight on `master`.
+The #2886 stages have squeezed every release-build flash-saver knob and audit target available from the current architecture. The next round of *real* (multi-KB) savings is structural and tracked separately in [#2856 "Meta: ESP32-S3 binary-size reduction — Batch 3"](https://github.com/FastLED/FastLED/issues/2856), covering items 3.1–3.6 (template-trait static dispatch for `Channel::showPixels`, printf-style log backend, `ChannelManager` static-bind path, RMT5 encoder dedup, `fl::result<T,E>` → status code for internal APIs, fixed-size allocation ledger under `FL_RMT_STATIC_ALLOCATION`). Several of those items are already shipped or in flight on `master`.
 
 ## Related
 
@@ -149,6 +176,6 @@ The #2886 stages have squeezed every release-build flash-saver knob and audit ta
 - **[FastLED #2890](https://github.com/FastLED/FastLED/pull/2890)** — Stage 1 (FASTLED_LOG_VERBOSITY default flip).
 - **[FastLED #2894](https://github.com/FastLED/FastLED/pull/2894)** — Stage 2 (Arduino-ESP32 boot-banner shim).
 - **[FastLED #2896](https://github.com/FastLED/FastLED/pull/2896)** — Stage 3 (sdkconfig overlay).
-- **[FastLED #2846](https://github.com/FastLED/FastLED/pull/2846)** — `FASTLED_RMT_STATIC_ALLOCATION` opt-in (pre-existing).
+- **[FastLED #2846](https://github.com/FastLED/FastLED/pull/2846)** — original RMT static-allocation opt-in (the legacy `FASTLED_RMT_STATIC_ALLOCATION` spelling remains supported).
 - **[FastLED #2856](https://github.com/FastLED/FastLED/issues/2856)** — Batch 3 structural meta (the next round of multi-KB savings, beyond the knob/audit work of #2886).
 - **[FastLED #2773](https://github.com/FastLED/FastLED/issues/2773)** — original binary-size meta (closed, predecessor to #2886).

@@ -141,6 +141,73 @@ class TestParseOnelineFilterShortcuts:
 class TestParseOnelineFilterCompound:
     """Test compound filters with and/or logic."""
 
+    def test_or_across_distinct_properties(self) -> None:
+        """Either branch may admit a board, even when keys differ."""
+        sketch_filter = parse_oneline_filter("(platform is teensy) or (board is uno)")
+        assert sketch_filter is not None
+
+        uno = Board(board_name="uno", platform="avr", framework="arduino")
+        teensy = Board(board_name="teensy41", platform="teensy", framework="arduino")
+        other = Board(board_name="mega", platform="avr", framework="arduino")
+
+        assert should_skip_sketch(uno, sketch_filter)[0] is False
+        assert should_skip_sketch(teensy, sketch_filter)[0] is False
+        assert should_skip_sketch(other, sketch_filter)[0] is True
+
+    def test_parenthesized_or_keeps_and_scoped_to_its_branch(self) -> None:
+        """An OR branch must not inherit requirements from its sibling."""
+        sketch_filter = parse_oneline_filter(
+            "((platform is avr) and (board is uno)) or (platform is teensy)"
+        )
+        assert sketch_filter is not None
+
+        uno = Board(board_name="uno", platform="avr", framework="arduino")
+        teensy = Board(board_name="teensy41", platform="teensy", framework="arduino")
+        other_avr = Board(board_name="mega", platform="avr", framework="arduino")
+
+        assert should_skip_sketch(uno, sketch_filter)[0] is False
+        assert should_skip_sketch(teensy, sketch_filter)[0] is False
+        assert should_skip_sketch(other_avr, sketch_filter)[0] is True
+
+    @pytest.mark.parametrize(
+        "expression",
+        ["(memory is not low)", "not (memory is low)"],
+    )
+    def test_negated_memory_still_uses_exact_tier(self, expression: str) -> None:
+        """Negation excludes only the named tier, as the YAML form does."""
+        sketch_filter = parse_oneline_filter(expression)
+        assert sketch_filter is not None
+
+        low = Board(board_name="uno", platform="avr", framework="arduino")
+        huge = Board(board_name="esp32dev", platform="esp32", framework="arduino")
+        assert should_skip_sketch(low, sketch_filter)[0] is True
+        assert should_skip_sketch(huge, sketch_filter)[0] is False
+
+    @pytest.mark.parametrize("connector", ["and", "or"])
+    def test_unknown_property_keeps_known_restriction(self, connector: str) -> None:
+        """Unsupported conditions must not disable supported conditions."""
+        sketch_filter = parse_oneline_filter(
+            f"(platform is esp32) {connector} (framework is arduino)"
+        )
+        assert sketch_filter is not None
+
+        esp32 = Board(board_name="esp32dev", platform="esp32", framework="arduino")
+        uno = Board(board_name="uno", platform="avr", framework="arduino")
+        assert should_skip_sketch(esp32, sketch_filter)[0] is False
+        assert should_skip_sketch(uno, sketch_filter)[0] is True
+
+    def test_unknown_property_under_group_not_keeps_known_polarity(self) -> None:
+        """Dropping an unknown clause must not negate its known sibling."""
+        sketch_filter = parse_oneline_filter(
+            "not ((framework is arduino) or (platform is esp32))"
+        )
+        assert sketch_filter is not None
+
+        esp32 = Board(board_name="esp32dev", platform="esp32", framework="arduino")
+        uno = Board(board_name="uno", platform="avr", framework="arduino")
+        assert should_skip_sketch(esp32, sketch_filter)[0] is False
+        assert should_skip_sketch(uno, sketch_filter)[0] is True
+
     def test_and_logic(self) -> None:
         """Test 'and' operator combining multiple conditions."""
         result = parse_oneline_filter("(mem is large) and (plat is esp32)")
@@ -645,6 +712,49 @@ class TestPintestFilter:
         assert "atmega8" in reason.lower() or "board" in reason.lower()
 
 
+class TestAnalogOutputFilter:
+    """AnalogOutput needs more flash than the ATmega8A provides."""
+
+    def test_analog_output_skips_atmega8a(self) -> None:
+        from pathlib import Path
+
+        from ci.boards import ATMEGA8A, UNO
+
+        analog_output_path = (
+            Path(__file__).parent.parent.parent
+            / "examples"
+            / "AnalogOutput"
+            / "AnalogOutput.ino"
+        )
+        sketch_filter = parse_filter_from_sketch(analog_output_path)
+
+        assert sketch_filter is not None, "AnalogOutput should have a @filter directive"
+        should_skip, reason = should_skip_sketch(ATMEGA8A, sketch_filter)
+
+        assert should_skip is True, (
+            f"atmega8a should be skipped for AnalogOutput (reason: {reason})"
+        )
+        assert "atmega8" in reason.lower() or "board" in reason.lower()
+
+        should_skip, reason = should_skip_sketch(UNO, sketch_filter)
+        assert should_skip is False, (
+            f"uno should compile AnalogOutput (reason: {reason})"
+        )
+
+
+def test_atmega8a_tiny_memory_skips_perfdisc() -> None:
+    from ci.boards import ATMEGA8A
+
+    assert ATMEGA8A.memory_class == "tiny"
+    perfdisc = (
+        Path(__file__).parent.parent.parent / "examples" / "PerfDisc" / "PerfDisc.ino"
+    )
+    sketch_filter = parse_filter_from_sketch(perfdisc)
+    assert sketch_filter is not None
+    should_skip, _ = should_skip_sketch(ATMEGA8A, sketch_filter)
+    assert should_skip
+
+
 class TestAudioInputFilter:
     """Test AudioInput example filter behavior."""
 
@@ -735,13 +845,35 @@ class TestAutoResearchFilter:
 
         assert sketch_filter is not None, "AutoResearch should have a @filter directive"
         assert sketch_filter.require == {
-            "board": ["esp32s3", "esp32c6", "esp32p4", "teensy41", "teensy40"]
+            "board": [
+                "esp32s3",
+                "esp32c6",
+                "esp32p4",
+                "teensy41",
+                "teensy40",
+                "rp2350",
+                "rp2350w",
+                "lpc845",
+                "lpc845brk",
+                "lpcxpresso845max",
+                "lpcxpresso804",
+            ]
         }
-        assert sketch_filter.exclude == {"memory": ["low"]}
+        assert sketch_filter.exclude == {}
 
     @pytest.mark.parametrize(
         "board_name",
-        ["esp32s3", "esp32c6", "esp32p4", "teensy40", "teensy41"],
+        [
+            "esp32s3",
+            "esp32c6",
+            "esp32p4",
+            "teensy40",
+            "teensy41",
+            "lpc845",
+            "lpc845brk",
+            "lpcxpresso845max",
+            "lpcxpresso804",
+        ],
     )
     def test_autoresearch_supported_boards_compile(self, board_name: str) -> None:
         from ci.boards import create_board
@@ -952,5 +1084,53 @@ class TestMemoryTierMatching:
         assert not skip, "huge memory board should pass large memory filter"
 
 
+def test_multiple_esp32_spi_buses_is_filtered_to_esp32() -> None:
+    """Host and non-ESP32 discovery must skip the ESP32-only example."""
+    sketch = (
+        Path(__file__).parents[2]
+        / "examples"
+        / "MultipleEsp32SpiBuses"
+        / "MultipleEsp32SpiBuses.ino"
+    )
+    sketch_filter = parse_filter_from_sketch(sketch)
+
+    assert sketch_filter is not None
+    assert sketch_filter.require == {"platform": ["esp32"]}
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestExampleFiltersMatchSomeBoard:
+    """Every example @filter must admit at least one known board (#4627)."""
+
+    def test_rp_parallel_io_matches_rp2040_and_rp2350(self) -> None:
+        from ci.boards import create_board
+
+        ino = (
+            Path(__file__).resolve().parents[2]
+            / "examples/SpecialDrivers/RP/Parallel_IO/Parallel_IO.ino"
+        )
+        sketch_filter = parse_filter_from_sketch(ino)
+        assert sketch_filter is not None and not sketch_filter.is_empty()
+        for board_name in ("rp2040", "rp2350"):
+            skip, reason = should_skip_sketch(create_board(board_name), sketch_filter)
+            assert not skip, f"{board_name}: {reason}"
+
+    def test_every_filtered_example_admits_a_board(self) -> None:
+        from ci.boards import ALL
+
+        examples = Path(__file__).resolve().parents[2] / "examples"
+        orphans: list[str] = []
+        for ino in sorted(examples.rglob("*.ino")):
+            sketch_filter = parse_filter_from_sketch(ino)
+            if sketch_filter is None or sketch_filter.is_empty():
+                continue
+            if "nonexistent_disable" in sketch_filter.source:
+                continue  # intentionally disabled sketch
+            if sketch_filter.source == "(platform is native)":
+                continue  # host-only sketches are built by the native runner
+            if all(should_skip_sketch(b, sketch_filter)[0] for b in ALL):
+                orphans.append(f"{ino.relative_to(examples)}: {sketch_filter.source}")
+        assert not orphans, "Filters matching no board:\n" + "\n".join(orphans)

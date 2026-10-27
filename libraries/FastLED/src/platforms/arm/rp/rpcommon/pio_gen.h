@@ -27,7 +27,7 @@
 // we have 4 bits to store delay in instruction encoding with one sideset bit, but we can accept up to 16 because 1 is always subtracted first
 #define CLOCKLESS_PIO_MAX_TIME_PERIOD (1 << (5 - CLOCKLESS_PIO_SIDESET_COUNT))
 
-static inline int add_clockless_pio_program(PIO pio, int T1, int T2, int T3) FL_NOEXCEPT {
+static inline int add_clockless_pio_program(PIO pio, int T1, int T2, int T3) FL_NO_EXCEPT {
     pio_instr clockless_pio_instr[] = {
         // wrap_target
         // out x, 1; read next bit to x
@@ -75,7 +75,25 @@ static inline int add_clockless_pio_program(PIO pio, int T1, int T2, int T3) FL_
     return (int)pio_add_program(pio, &clockless_pio_program);
 }
 
-static inline pio_sm_config clockless_pio_program_get_default_config(uint offset) FL_NOEXCEPT {
+// Release the instruction memory that add_clockless_pio_program() reserved.
+// pio_remove_program only reads `length` off the descriptor, so the
+// instruction buffer does not have to be reconstructed here.
+static inline void remove_clockless_pio_program(PIO pio, uint offset) FL_NO_EXCEPT {
+    struct pio_program clockless_pio_program = {
+        .instructions = nullptr,
+        .length = CLOCKLESS_PIO_WRAP + 1,
+        .origin = -1,
+#if defined(PICO_SDK_VERSION_MAJOR) && PICO_SDK_VERSION_MAJOR >= 2
+        .pio_version = 0,
+    #if defined(PICO_PIO_VERSION) && PICO_PIO_VERSION > 0
+        .used_gpio_ranges = 0,
+    #endif
+#endif
+    };
+    pio_remove_program(pio, &clockless_pio_program, offset);
+}
+
+static inline pio_sm_config clockless_pio_program_get_default_config(uint offset) FL_NO_EXCEPT {
     pio_sm_config c = pio_get_default_sm_config();
     sm_config_set_wrap(&c, offset + CLOCKLESS_PIO_WRAP_TARGET, offset + CLOCKLESS_PIO_WRAP);
     sm_config_set_sideset(&c, CLOCKLESS_PIO_SIDESET_COUNT, false, false);

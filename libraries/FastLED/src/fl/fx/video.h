@@ -7,9 +7,12 @@
 #include "fl/stl/string.h"
 #include "fl/stl/detail/memory_file_handle.h"
 #include "fl/fx/fx1d.h"
+#include "fl/video/pixel_sample.h"
 #include "fl/stl/noexcept.h"
 
 namespace fl {
+
+struct SourceProfile;  // fl/gfx/color_profile.h
 
 struct CRGB;
 using CRGB = fl::CRGB;  // CRGB is now a typedef
@@ -27,12 +30,17 @@ class VideoImpl;
 using VideoImpl = video::VideoImpl;
 using VideoImplPtr = fl::shared_ptr<VideoImpl>;
 
+enum class FledPlaybackMode : fl::u8 {
+    Strict,
+    BestEffort,
+};
+
 // Video represents a video file that can be played back on a LED strip.
 // The video file is expected to be a sequence of frames. Pass any filebuf
 // to begin() — streaming vs seekable is auto-detected.
 class Video : public Fx1d { // Fx1d because video can be irregular.
   public:
-    static size_t DefaultFrameHistoryCount() {
+    static size_t DefaultFrameHistoryCount() FL_NO_EXCEPT {
 #ifdef FL_IS_AVR
         return 1;
 #else
@@ -45,48 +53,74 @@ class Video : public Fx1d { // Fx1d because video can be irregular.
     // just leave this as the default. For streaming byte streams you may want
     // to increase this number to allow momentary re-wind. If you'd like to use
     // a Video as a buffer for an fx effect then please see VideoFxWrapper.
-    Video() FL_NOEXCEPT;
+    Video() FL_NO_EXCEPT;
     Video(size_t pixelsPerFrame, float fps = 30.0f,
           size_t frameHistoryCount =
-              DefaultFrameHistoryCount()); // Please use FileSytem to construct
+              DefaultFrameHistoryCount()) FL_NO_EXCEPT; // Please use FileSytem to construct
                                            // a Video.
-    ~Video() FL_NOEXCEPT;
-    Video(const Video &) FL_NOEXCEPT;
-    Video &operator=(const Video &) FL_NOEXCEPT;
+    ~Video() FL_NO_EXCEPT;
+    Video(const Video &) FL_NO_EXCEPT;
+    Video &operator=(const Video &) FL_NO_EXCEPT;
 
     // Fx Api
-    void draw(DrawContext context) override;
-    string fxName() const override;
+    void draw(DrawContext context) FL_NO_EXCEPT override;
+    string fxName() const FL_NO_EXCEPT override;
 
     // Api
-    bool begin(fl::filebuf_ptr h);
-    bool draw(fl::u32 now, fl::span<CRGB> leds);
-    bool draw(fl::u32 now, Frame *frame);
-    void end();
-    bool finished();
-    bool rewind();
-    void setTimeScale(float timeScale);
-    float timeScale() const;
-    string error() const;
-    void setError(const string &error) { mError = error; }
-    size_t pixelsPerFrame() const;
+    bool begin(fl::filebuf_ptr h) FL_NO_EXCEPT;
+    bool draw(fl::u32 now, fl::span<CRGB> leds) FL_NO_EXCEPT;
+    bool draw(fl::u32 now, Frame *frame) FL_NO_EXCEPT;
+    void end() FL_NO_EXCEPT;
+    bool finished() FL_NO_EXCEPT;
+    bool rewind() FL_NO_EXCEPT;
+    void setTimeScale(float timeScale) FL_NO_EXCEPT;
+    float timeScale() const FL_NO_EXCEPT;
+    string error() const FL_NO_EXCEPT;
+    // A caller-supplied error is persistent: it blocks admission until the
+    // caller clears it. Admission errors recorded by begin() are not -- see
+    // mAdmissionError.
+    void setError(const string &error) FL_NO_EXCEPT {
+        mError = error;
+        mAdmissionError = false;
+    }
+    size_t pixelsPerFrame() const FL_NO_EXCEPT;
 
     // FLED v1 container (issue #3072): true / non-empty only when begin()
     // opened a FLED-formatted file (12-byte "FLED" magic header). Legacy
     // headerless `.rgb` files return false / empty string.
     // Spec: https://github.com/zackees/ledmapper/blob/main/docs/fled-format.md
-    bool hasEmbeddedScreenMap() const FL_NOEXCEPT;
-    const fl::string &embeddedScreenMapJson() const FL_NOEXCEPT;
-    void pause(fl::u32 now) override;
-    void resume(fl::u32 now) override;
-    void setFade(fl::u32 fadeInTime, fl::u32 fadeOutTime);
-    i32 durationMicros() const; // -1 if this is a stream.
+    bool hasEmbeddedScreenMap() const FL_NO_EXCEPT;
+    const fl::string &embeddedScreenMapJson() const FL_NO_EXCEPT;
+    bool videoColor(fled::VideoColor *out) const FL_NO_EXCEPT;
+    /// The colour-pipeline source profile the file declares (or the default
+    /// tuple of its pixel format). False when no FLED file is open or its
+    /// colour does not resolve. Bind it to play the file colour-accurately
+    /// on a colour-managed channel (#4460):
+    ///     fl::SourceProfile source;
+    ///     if (video.sourceProfile(&source)) FastLED.setDefaultSourceProfile(source);
+    bool sourceProfile(SourceProfile *out) const FL_NO_EXCEPT;
+    bool pixelStorage(fled::PixelStorage *out) const FL_NO_EXCEPT;
+    bool readSample(video::PixelSample *out) FL_NO_EXCEPT;
+    void setFledPlaybackMode(FledPlaybackMode mode) FL_NO_EXCEPT;
+    void pause(fl::u32 now) FL_NO_EXCEPT override;
+    void resume(fl::u32 now) FL_NO_EXCEPT override;
+    void setFade(fl::u32 fadeInTime, fl::u32 fadeOutTime) FL_NO_EXCEPT;
+    i32 durationMicros() const FL_NO_EXCEPT; // -1 if this is a stream.
 
     // make compatible with if statements
-    operator bool() const { return mImpl.get(); }
+    operator bool() const FL_NO_EXCEPT { return mImpl.get(); }
 
   private:
+    // True when mError was recorded by a failed begin() rather than by
+    // setError(). Such a failure describes one rejected source, not a dead
+    // object, so the next begin() clears it and admits a new handle.
+    void setAdmissionError(const string &error) FL_NO_EXCEPT {
+        mError = error;
+        mAdmissionError = true;
+    }
+
     bool mFinished = false;
+    bool mAdmissionError = false;
     VideoImplPtr mImpl;
     string mError;
     string mName;
@@ -99,11 +133,11 @@ class Video : public Fx1d { // Fx1d because video can be irregular.
 // for example NoisePalette.
 class VideoFxWrapper : public Fx1d {
   public:
-    VideoFxWrapper(FxPtr fx);
-    ~VideoFxWrapper() FL_NOEXCEPT override;
-    void draw(DrawContext context) override;
-    string fxName() const override;
-    void setFade(fl::u32 fadeInTime, fl::u32 fadeOutTime);
+    VideoFxWrapper(FxPtr fx) FL_NO_EXCEPT;
+    ~VideoFxWrapper() FL_NO_EXCEPT override;
+    void draw(DrawContext context) FL_NO_EXCEPT override;
+    string fxName() const FL_NO_EXCEPT override;
+    void setFade(fl::u32 fadeInTime, fl::u32 fadeOutTime) FL_NO_EXCEPT;
 
   private:
     FxPtr mFx;

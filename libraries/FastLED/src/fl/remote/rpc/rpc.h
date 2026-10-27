@@ -75,6 +75,9 @@
 #include "fl/remote/rpc/rpc_handle.h"
 #include "fl/remote/rpc/rpc_registry.h"
 #include "fl/remote/rpc/rpc_mode.h"
+#include "fl/remote/rpc/response_stream.h"
+#include "fl/remote/rpc/runtime_rpc_binding.h"  // RuntimeRpcBinding (low-memory dispatch, #3246)
+#include "fl/system/sketch_macros.h"             // FL_PLATFORM_HAS_LARGE_MEMORY
 
 // STL headers required for public API
 #include "fl/stl/stdint.h"
@@ -140,29 +143,29 @@ struct BindResult<R(Args...)> {
     fl::expected<RpcFn<R(Args...)>, BindError> inner;
 
     /// Construct from expected
-    BindResult(fl::expected<RpcFn<R(Args...)>, BindError> exp) : inner(fl::move(exp)) {}
+    BindResult(fl::expected<RpcFn<R(Args...)>, BindError> exp) FL_NO_EXCEPT : inner(fl::move(exp)) {}
 
     /// Construct from RpcFn (success case)
-    BindResult(RpcFn<R(Args...)> fn) : inner(fl::expected<RpcFn<R(Args...)>, BindError>::success(fl::move(fn))) {}
+    BindResult(RpcFn<R(Args...)> fn) FL_NO_EXCEPT : inner(fl::expected<RpcFn<R(Args...)>, BindError>::success(fl::move(fn))) {}
 
     /// Check if binding succeeded
-    bool has_value() const { return inner.has_value(); }
-    bool ok() const { return inner.has_value(); }
-    explicit operator bool() const { return inner.has_value(); }
+    bool has_value() const FL_NO_EXCEPT { return inner.has_value(); }
+    bool ok() const FL_NO_EXCEPT { return inner.has_value(); }
+    explicit operator bool() const FL_NO_EXCEPT { return inner.has_value(); }
 
-    /// Get the callable (throws if error)
-    RpcFn<R(Args...)> value() const { return inner.value(); }
-    RpcFn<R(Args...)>& value() { return inner.value(); }
+    /// Get the callable (requires has_value())
+    RpcFn<R(Args...)> value() const FL_NO_EXCEPT { return inner.value(); }
+    RpcFn<R(Args...)>& value() FL_NO_EXCEPT { return inner.value(); }
 
     /// Get the error (undefined if has_value())
-    BindError error() const { return inner.error(); }
+    BindError error() const FL_NO_EXCEPT { return inner.error(); }
 
     /// Access the underlying expected
-    const fl::expected<RpcFn<R(Args...)>, BindError>& get() const { return inner; }
+    const fl::expected<RpcFn<R(Args...)>, BindError>& get() const FL_NO_EXCEPT { return inner; }
 
     /// Call the bound function directly (undefined behavior if binding failed)
     /// Always check ok() or has_value() before calling!
-    R operator()(Args... args) const {
+    R operator()(Args... args) const FL_NO_EXCEPT {
         return inner.value()(fl::forward<Args>(args)...);
     }
 };
@@ -190,11 +193,11 @@ public:
 
         /// Constructor requiring name and function (metadata is optional)
         Config(fl::string n, Callable f, fl::RpcMode m = fl::RpcMode::SYNC)
-            : name(fl::move(n)), fn(fl::move(f)), mode(m) {}
+            FL_NO_EXCEPT : name(fl::move(n)), fn(fl::move(f)), mode(m) {}
 
         /// Constructor with params
         Config(fl::string n, Callable f, fl::vector<fl::string> p, fl::RpcMode m = fl::RpcMode::SYNC)
-            : name(fl::move(n)), fn(fl::move(f)), mode(m), params(fl::move(p)) {}
+            FL_NO_EXCEPT : name(fl::move(n)), fn(fl::move(f)), mode(m), params(fl::move(p)) {}
 
         /// Constructor with all fields
         Config(fl::string n,
@@ -203,25 +206,28 @@ public:
                fl::string desc,
                fl::vector<fl::string> t = {},
                fl::RpcMode m = fl::RpcMode::SYNC)
-            : name(fl::move(n)), fn(fl::move(f)), mode(m), params(fl::move(p)),
+            FL_NO_EXCEPT : name(fl::move(n)), fn(fl::move(f)), mode(m), params(fl::move(p)),
               description(fl::move(desc)), tags(fl::move(t)) {}
     };
 
-    Rpc() FL_NOEXCEPT = default;
-    ~Rpc() FL_NOEXCEPT = default;
+    Rpc() FL_NO_EXCEPT = default;
+    ~Rpc() FL_NO_EXCEPT = default;
 
     // Non-copyable but movable
-    Rpc(const Rpc&) FL_NOEXCEPT = delete;
-    Rpc& operator=(const Rpc&) FL_NOEXCEPT = delete;
-    Rpc(Rpc&&) FL_NOEXCEPT = default;
-    Rpc& operator=(Rpc&&) FL_NOEXCEPT = default;
+    Rpc(const Rpc&) FL_NO_EXCEPT = delete;
+    Rpc& operator=(const Rpc&) FL_NO_EXCEPT = delete;
+    Rpc(Rpc&&) FL_NO_EXCEPT = default;
+    Rpc& operator=(Rpc&&) FL_NO_EXCEPT = default;
 
     // =========================================================================
     // Response Sink for Async ACKs
     // =========================================================================
 
     /// Set response sink for sending ACK responses (used by async functions)
-    void setResponseSink(fl::function<void(const fl::json&)> sink);
+    void setResponseSink(fl::function<void(const fl::json&)> sink) FL_NO_EXCEPT;
+
+    /// Set response stream sink for methods registered with bindStreaming().
+    void setResponseStreamSink(fl::ResponseStreamSink sink) FL_NO_EXCEPT;
 
     // =========================================================================
     // Method Registration (Binding)
@@ -231,7 +237,7 @@ public:
     /// Supports dot notation for namespacing: "led.setBrightness", "system.status"
     /// Use get() to retrieve a callable if you need to invoke the method from C++ code.
     template<typename Callable>
-    void bind(const Config<Callable>& config) {
+    void bind(const Config<Callable>& config) FL_NO_EXCEPT {
         using Sig = typename callable_traits<typename decay<Callable>::type>::signature;
         RpcFn<Sig> wrapped(config.fn);
         registerMethod<Sig>(config.name.c_str(), wrapped, config.params, config.description, config.tags, config.mode);
@@ -239,7 +245,7 @@ public:
 
     /// Convenience overload: bind method by name, function, and optional mode
     template<typename Callable>
-    void bind(const char* name, Callable fn, fl::RpcMode mode = fl::RpcMode::SYNC) {
+    void bind(const char* name, Callable fn, fl::RpcMode mode = fl::RpcMode::SYNC) FL_NO_EXCEPT {
         bind(Config<Callable>{name, fl::move(fn), mode});
     }
 
@@ -256,7 +262,12 @@ public:
     ///   });
     void bindAsync(const char* name,
                    fl::function<void(ResponseSend&, const json&)> fn,
-                   fl::RpcMode mode = fl::RpcMode::ASYNC);
+                   fl::RpcMode mode = fl::RpcMode::ASYNC) FL_NO_EXCEPT;
+
+    /// Bind a method that streams its JSON-RPC result directly to the transport.
+    /// The callback writes only the `result` payload; the RPC layer writes the
+    /// JSON-RPC envelope and request id.
+    void bindStreaming(const char* name, fl::StreamingRpcHandler fn) FL_NO_EXCEPT;
 
     // =========================================================================
     // Method Retrieval
@@ -265,7 +276,7 @@ public:
     /// Get a registered method by name.
     /// Returns BindResult containing typed callable, or error if not found or signature mismatch.
     template<class Sig>
-    BindResult<Sig> get(const char* name) const {
+    BindResult<Sig> get(const char* name) const FL_NO_EXCEPT {
         fl::string key(name);
         auto it = mRegistry.find(key);
         if (it == mRegistry.end()) {
@@ -283,13 +294,13 @@ public:
     }
 
     /// Check if a method is registered (regardless of signature).
-    bool has(const char* name) const {
+    bool has(const char* name) const FL_NO_EXCEPT {
         return mRegistry.find(fl::string(name)) != mRegistry.end();
     }
 
     /// Unbind (unregister) a previously registered method.
     /// Returns true if method was found and removed, false otherwise.
-    bool unbind(const char* name) {
+    bool unbind(const char* name) FL_NO_EXCEPT {
         fl::string key(name);
         auto it = mRegistry.find(key);
         if (it != mRegistry.end()) {
@@ -300,7 +311,7 @@ public:
     }
 
     /// Clear all registered methods.
-    void clear() {
+    void clear() FL_NO_EXCEPT {
         mRegistry.clear();
     }
 
@@ -311,10 +322,10 @@ public:
     /// Process a JSON-RPC request.
     /// Request format: {"method": "name", "params": [...], "id": ...}
     /// Response format: {"result": ..., "id": ...} or {"error": {...}, "id": ...}
-    json handle(const json& request);
+    json handle(const json& request) FL_NO_EXCEPT;
 
     /// For notifications (no id), returns nullopt.
-    fl::optional<json> handle_maybe(const json& request);
+    fl::optional<json> handle_maybe(const json& request) FL_NO_EXCEPT;
 
     // =========================================================================
     // Schema and Discovery
@@ -323,20 +334,20 @@ public:
     /// Returns flat method array: [["name", "returnType", [["param1", "type1"], ...]], ...]
     /// Format: Array of method tuples optimized for low-memory devices.
     /// Each method is represented as: ["methodName", "returnType", [["param1", "type1"], ...]]
-    json methods() const;
+    json methods() const FL_NO_EXCEPT;
 
     /// Returns flat schema document.
     /// Format: {"schema": [["methodName", "returnType", [["param1", "type1"], ...]], ...]}
     /// The built-in "rpc.discover" method returns this schema.
-    json schema() const;
+    json schema() const FL_NO_EXCEPT;
 
     /// Returns number of registered methods.
-    fl::size count() const {
+    fl::size count() const FL_NO_EXCEPT {
         return mRegistry.size();
     }
 
     /// Returns list of unique tags used across all methods.
-    fl::vector<fl::string> tags() const;
+    fl::vector<fl::string> tags() const FL_NO_EXCEPT;
 
     // =========================================================================
     // Internal Registration (used by MethodBuilder)
@@ -347,7 +358,7 @@ public:
                         const fl::vector<fl::string>& paramNames,
                         const fl::string& description,
                         const fl::vector<fl::string>& tags,
-                        fl::RpcMode mode = fl::RpcMode::SYNC) {
+                        fl::RpcMode mode = fl::RpcMode::SYNC) FL_NO_EXCEPT {
         fl::string key(name);
         auto it = mRegistry.find(key);
         if (it != mRegistry.end()) {
@@ -358,7 +369,15 @@ public:
 
         detail::RpcEntry entry;
         entry.mTypeTag = detail::TypeTag<Sig>::id();
+        // Per-Sig dispatch fork (FastLED #3246). Low-memory targets pay only
+        // a ~50-150 B trampoline per signature via RuntimeRpcBinding instead
+        // of the ~2.1 KB TypedRpcBinding<Sig>::invokeWithReturn instantiation.
+        // Large-memory targets keep the existing fast inline-dispatch path.
+#if FL_PLATFORM_HAS_LARGE_MEMORY
         entry.mInvoker = fl::make_shared<detail::TypedInvoker<Sig>>(fn);
+#else
+        entry.mInvoker = detail::makeRuntimeRpcBinding(fn);
+#endif
         entry.mTypedCallable = fl::make_shared<detail::TypedCallableHolder<Sig>>(fn);
 #if FL_PLATFORM_HAS_LARGE_MEMORY
         // Schema generator construction gated on Low-memory targets per
@@ -386,6 +405,9 @@ public:
 private:
     fl::unordered_map<fl::string, detail::RpcEntry> mRegistry;
     fl::function<void(const fl::json&)> mResponseSink;  // For sending ACK responses
+#if FL_PLATFORM_HAS_LARGE_MEMORY
+    fl::ResponseStreamSink mResponseStreamSink;
+#endif
 };
 
 // RpcFactory is kept as an alias for backwards compatibility

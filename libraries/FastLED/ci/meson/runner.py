@@ -16,7 +16,6 @@ This file owns the entry point ``run_meson_build_and_test`` and the CLI.
 
 import argparse
 import glob
-import os
 import sys
 import time
 from pathlib import Path
@@ -31,6 +30,7 @@ from ci.meson.build_timer import BuildTimer
 from ci.meson.compiler import check_meson_installed
 from ci.meson.phase_tracker import PhaseTracker
 from ci.meson.runner_helpers import _safe_rmtree, _start_zccache_session
+from ci.meson.sanitizer_env import setup_sanitizer_env
 from ci.meson.sequential_runner import (
     DirectTestContext,
     SequentialCompileContext,
@@ -41,34 +41,6 @@ from ci.meson.streaming_runner import StreamingContext, run_streaming_path
 from ci.meson.test_execution import MesonTestResult, run_meson_test
 from ci.util.build_lock import libfastled_build_lock
 from ci.util.timestamp_print import ts_print as _ts_print
-
-
-def _setup_sanitizer_env(source_dir: Path, verbose: bool) -> None:
-    """Configure ASan/LSan options for debug builds via clang-tool-chain."""
-    from clang_tool_chain import (
-        prepare_sanitizer_environment,  # noqa: PLC0415 - lazy: ~60ms on non-debug
-    )
-
-    sanitizer_flags = ["-fsanitize=address"]
-    sanitizer_env = prepare_sanitizer_environment(
-        base_env=os.environ.copy(),
-        compiler_flags=sanitizer_flags,
-    )
-    os.environ.update(sanitizer_env)
-
-    lsan_suppressions = source_dir / "tests" / "lsan_suppressions.txt"
-    if lsan_suppressions.exists():
-        existing_lsan = os.environ.get("LSAN_OPTIONS", "")
-        suppression_opt = f"suppressions={lsan_suppressions}"
-        if existing_lsan:
-            os.environ["LSAN_OPTIONS"] = f"{existing_lsan}:{suppression_opt}"
-        else:
-            os.environ["LSAN_OPTIONS"] = suppression_opt
-
-    if verbose:
-        symbolizer_path = sanitizer_env.get("ASAN_SYMBOLIZER_PATH")
-        if symbolizer_path:
-            _ts_print(f"[MESON] Set ASAN_SYMBOLIZER_PATH={symbolizer_path}")
 
 
 def _resolve_test_name_candidates(
@@ -124,7 +96,7 @@ def run_meson_build_and_test(
         clean: Clean build directory before setup
         verbose: Enable verbose output
         debug: Enable debug mode with full symbols and sanitizers (default: False)
-        build_mode: Build mode override ("quick", "debug", "release"). If None, uses debug parameter.
+        build_mode: Build mode override (quick, debug, debug-thin, release, profile).
         check: Enable IWYU static analysis (default: False)
         exclude_suites: Optional list of test suites to exclude (e.g., ['examples'])
         test_file_filter: Optional .hpp filename to filter test execution (e.g., "backbeat.hpp")
@@ -140,9 +112,9 @@ def run_meson_build_and_test(
     if build_mode is None:
         build_mode = "debug" if debug else "quick"
 
-    if build_mode not in ["quick", "debug", "release", "profile"]:
+    if build_mode not in ["quick", "debug", "debug-thin", "release", "profile"]:
         _ts_print(
-            f"[MESON] Error: Invalid build_mode '{build_mode}'. Must be 'quick', 'debug', 'release', or 'profile'",
+            f"[MESON] Error: Invalid build_mode '{build_mode}'. Must be 'quick', 'debug', 'debug-thin', 'release', or 'profile'",
             file=sys.stderr,
         )
         return MesonTestResult(
@@ -172,12 +144,12 @@ def run_meson_build_and_test(
         _ts_print(f"[MESON] Cleaning build directory: {build_dir}")
         _safe_rmtree(build_dir)
 
-    use_debug = build_mode == "debug"
+    use_debug = build_mode in ("debug", "debug-thin")
     if use_debug:
-        _setup_sanitizer_env(source_dir, verbose)
+        setup_sanitizer_env(source_dir, verbose)
 
     _ts_print(f"Preparing build ({build_mode} mode)...")
-    _start_zccache_session(build_dir)
+    _start_zccache_session(build_dir, build_mode)
 
     phase_tracker = PhaseTracker(build_dir, build_mode)
     phase_tracker.set_phase("CONFIGURE")
@@ -223,7 +195,7 @@ def run_meson_build_and_test(
     build_optimizer = make_build_optimizer(build_dir) if use_streaming else None
 
     try:
-        with libfastled_build_lock():
+        with libfastled_build_lock(build_dir=build_dir):
             if use_streaming:
                 ctx = StreamingContext(
                     source_dir=source_dir,
@@ -318,8 +290,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--build-mode",
-        choices=["quick", "debug", "release", "profile"],
-        help="Build mode (quick, debug, release, profile)",
+        choices=["quick", "debug", "debug-thin", "release", "profile"],
+        help="Build mode (quick, debug, debug-thin, release, profile)",
     )
     parser.add_argument(
         "--check", action="store_true", help="Enable IWYU static analysis"

@@ -49,32 +49,31 @@ class NetworkDetector {
     // WiFi Detection
     //=========================================================================
 
-    /// @brief Check if WiFi is currently active (any mode except NULL)
+    /// @brief Check if WiFi has been brought up
     ///
-    /// Detects if WiFi is in any active mode:
-    /// - WIFI_MODE_STA (Station mode - connecting to AP)
-    /// - WIFI_MODE_AP (Access Point mode)
-    /// - WIFI_MODE_APSTA (Both Station and AP mode)
+    /// Detected through esp_netif (weak-linked), never esp_wifi_*, so sketches
+    /// without networking link no Wi-Fi code (#4791). Returns true when the
+    /// default Wi-Fi STA or AP netif exists (Arduino WiFi, fl::wifi and IDF
+    /// default handlers all create one) or any non-Ethernet netif exists
+    /// (custom Wi-Fi netifs; PPP/Thread also count, which is harmless).
     ///
-    /// @return true if WiFi mode is not NULL, false otherwise
-    /// @return false if WiFi component not linked (weak symbol fallback)
-    /// @return false if WiFi not initialized or failed to query
+    /// @return false if esp_netif is not linked or no such interface exists
+    /// @note Limitation: raw esp_wifi_start() with no netif at all (bare-IDF
+    ///       ESP-NOW) is not detected.
     ///
     /// **Platform Support:** ESP32, S2, S3, C3, C6, H2 (not C2)
-    static bool isWiFiActive() FL_NOEXCEPT;
+    static bool isWiFiActive() FL_NO_EXCEPT;
 
     /// @brief Check if WiFi is connected to an access point
     ///
-    /// Specifically detects if the device is connected to a WiFi access point
-    /// (in Station mode).
+    /// True when the default STA netif is up and has a non-zero IPv4 address.
     ///
-    /// @return true if connected to AP, false otherwise
-    /// @return false if WiFi component not linked
-    /// @return false if not in Station mode or connection failed
+    /// @return false if esp_netif is not linked, no STA netif exists, or it
+    ///         has no address yet
     ///
     /// **Use Case:** More precise detection than isWiFiActive() - only
     /// triggers adaptive behavior when WiFi is actively transmitting.
-    static bool isWiFiConnected() FL_NOEXCEPT;
+    static bool isWiFiConnected() FL_NO_EXCEPT;
 
     //=========================================================================
     // Ethernet Detection
@@ -90,7 +89,7 @@ class NetworkDetector {
     /// @return false if no Ethernet interface found
     ///
     /// **Platform Support:** ESP32 (with external PHY like LAN8720), ESP32-C6
-    static bool isEthernetActive() FL_NOEXCEPT;
+    static bool isEthernetActive() FL_NO_EXCEPT;
 
     /// @brief Check if Ethernet has a valid IP address
     ///
@@ -102,7 +101,7 @@ class NetworkDetector {
     ///
     /// **Use Case:** More precise than isEthernetActive() - confirms actual
     /// network connectivity, not just link status.
-    static bool isEthernetConnected() FL_NOEXCEPT;
+    static bool isEthernetConnected() FL_NO_EXCEPT;
 
     //=========================================================================
     // Bluetooth Detection
@@ -122,7 +121,7 @@ class NetworkDetector {
     /// **Note:** This detects both Classic Bluetooth and BLE (they share
     /// the same controller). If you need to distinguish between them, use
     /// additional ESP-IDF APIs.
-    static bool isBluetoothActive() FL_NOEXCEPT;
+    static bool isBluetoothActive() FL_NO_EXCEPT;
 
     //=========================================================================
     // Convenience Methods (Shorthand)
@@ -139,7 +138,7 @@ class NetworkDetector {
     /// @code
     /// isWiFiActive() || isEthernetActive() || isBluetoothActive()
     /// @endcode
-    static bool isAnyNetworkActive() FL_NOEXCEPT;
+    static bool isAnyNetworkActive() FL_NO_EXCEPT;
 
     /// @brief Check if any network type is connected
     ///
@@ -155,7 +154,7 @@ class NetworkDetector {
     ///
     /// **Note:** Bluetooth is not included because it doesn't have a
     /// "connected" state in the same sense (no IP address).
-    static bool isAnyNetworkConnected() FL_NOEXCEPT;
+    static bool isAnyNetworkConnected() FL_NO_EXCEPT;
 
   private:
     // No instances - static API only

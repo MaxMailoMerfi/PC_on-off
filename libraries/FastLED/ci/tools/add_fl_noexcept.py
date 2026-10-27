@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Add FL_NOEXCEPT to function declarations/definitions in C++ files.
+"""Add FL_NO_EXCEPT to function declarations/definitions in C++ files.
 
 Uses clang-query (AST analysis) to find the exact file:line of every function
-missing noexcept, then inserts FL_NOEXCEPT at the correct position.
+missing noexcept, then inserts FL_NO_EXCEPT at the correct position.
 
 Usage:
     uv run python ci/tools/add_fl_noexcept.py --scope fl/stl            # dry-run
@@ -12,9 +12,10 @@ Usage:
 
 import argparse
 import re
-import subprocess
 import sys
 from pathlib import Path
+
+from running_process import PIPE, RunningProcess
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -57,6 +58,8 @@ def run_clang_query(scope: str) -> list[tuple[str, int]]:
     # Pick translation unit based on scope
     if "platforms" in scope:
         tu = "ci/tools/_noexcept_check_platforms_tu.cpp"
+    elif "third_party" in scope:
+        tu = "ci/tools/_noexcept_check_third_party_tu.cpp"
     else:
         tu = "src/fl/build/fl.system+.cpp"
 
@@ -83,7 +86,7 @@ def run_clang_query(scope: str) -> list[tuple[str, int]]:
         "-DFASTLED_TESTING",
         "-DFASTLED_NO_AUTO_NAMESPACE",
         "-fno-exceptions",
-        # Make FL_NOEXCEPT expand to noexcept under stub mode
+        # Make FL_NO_EXCEPT expand to noexcept under stub mode
         "-DFL_NOEXCEPT=noexcept",
     ]
 
@@ -91,16 +94,19 @@ def run_clang_query(scope: str) -> list[tuple[str, int]]:
         print(f"ERROR: clang-query not found at {CLANG_QUERY}")
         sys.exit(1)
 
-    result = subprocess.run(
+    result = RunningProcess.run(
         [str(CLANG_QUERY), tu, "--"] + compiler_args,
         input=query,
-        capture_output=True,
+        stdout=PIPE,
+        stderr=PIPE,
         text=True,
         cwd=str(PROJECT_ROOT),
         timeout=300,
+        encoding="utf-8",
+        errors="replace",
     )
 
-    output = result.stdout + result.stderr
+    output = result.stdout + "\n" + result.stderr
 
     # Parse "file:line:col: note: "root" binds here" lines
     pattern = re.compile(r"(src[\\/]\S+):(\d+):\d+: note: .root. binds here")
@@ -119,16 +125,16 @@ def run_clang_query(scope: str) -> list[tuple[str, int]]:
 
 
 # ============================================================================
-# Step 2: Insert FL_NOEXCEPT at the correct position
+# Step 2: Insert FL_NO_EXCEPT at the correct position
 # ============================================================================
 
 
 def insert_fl_noexcept_in_line(line: str) -> str | None:
-    """Insert FL_NOEXCEPT into a function signature line.
+    """Insert FL_NO_EXCEPT into a function signature line.
 
     Returns modified line, or None if can't insert.
     """
-    if "FL_NOEXCEPT" in line or "noexcept" in line:
+    if "FL_NO_EXCEPT" in line or "noexcept" in line:
         return None
 
     code = line.rstrip()
@@ -194,17 +200,17 @@ def insert_fl_noexcept_in_line(line: str) -> str | None:
 
     # Build the new line
     if not after:
-        return before + " FL_NOEXCEPT"
+        return before + " FL_NO_EXCEPT"
     elif after[0] == ";":
-        return before + " FL_NOEXCEPT;" + after[1:]
+        return before + " FL_NO_EXCEPT;" + after[1:]
     elif after[0] == "{":
-        return before + " FL_NOEXCEPT {" + after[1:]
+        return before + " FL_NO_EXCEPT {" + after[1:]
     elif after.startswith("override") or after.startswith("final"):
-        return before + " FL_NOEXCEPT " + after
+        return before + " FL_NO_EXCEPT " + after
     elif after.startswith("__attribute__"):
-        return before + " FL_NOEXCEPT " + after
+        return before + " FL_NO_EXCEPT " + after
     else:
-        return before + " FL_NOEXCEPT " + after
+        return before + " FL_NO_EXCEPT " + after
 
 
 def ensure_include(lines: list[str]) -> bool:
@@ -239,7 +245,7 @@ def ensure_include(lines: list[str]) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Add FL_NOEXCEPT to functions using clang-query AST analysis"
+        description="Add FL_NO_EXCEPT to functions using clang-query AST analysis"
     )
     parser.add_argument(
         "--scope",
@@ -253,7 +259,7 @@ def main() -> int:
 
     print(
         f"{'APPLYING' if args.apply else 'DRY RUN'}: "
-        f"Adding FL_NOEXCEPT to functions in {args.scope}"
+        f"Adding FL_NO_EXCEPT to functions in {args.scope}"
     )
     print()
 

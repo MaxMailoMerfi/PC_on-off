@@ -8,10 +8,10 @@
 #    - Targets: ninja -C builddir examples-host, example-Blink, etc.
 #    - See: examples/host/meson.build
 #
-# 2. HARDWARE BOARD COMPILATION (PlatformIO-based):
+# 2. HARDWARE BOARD COMPILATION (fbuild-based):
 #    - Compiles examples for actual Arduino boards
 #    - Targets: example-blink-uno, examples-all-uno, etc.
-#    - Uses PlatformIO for cross-compilation
+#    - Uses fbuild for cross-compilation
 #
 # Meson targets:
 #   ninja -C builddir examples-host           - Compile ALL examples for host (fast!)
@@ -130,6 +130,21 @@ foreach line : example_metadata_output.split('\n')
     endif
 endforeach
 
+# The explicit manifest classifies every sketch directory. Resolve groups by
+# path, since sketch names alone need not be unique across nested folders.
+group_metadata = run_command(
+    'python', project_root / 'ci' / 'examples' / 'example_groups.py',
+    '--meson-metadata', check: true
+).stdout().strip()
+example_group_by_root = {}
+foreach line : group_metadata.split('\n')
+    parts = line.split('|')
+    if parts.length() != 3 or parts[0] != 'GROUP'
+        error('Invalid example group metadata: ' + line)
+    endif
+    example_group_by_root += {parts[1]: parts[2]}
+endforeach
+
 # ============================================================================
 # BUILD EXAMPLE RUNNER (DLL LOADER)
 # ============================================================================
@@ -156,7 +171,7 @@ example_runner_exe = executable('example_runner',
   files('../tests/shared/example_runner.cpp'),
   cpp_args: runner_cpp_args + [path_norm_I_src, path_norm_I_stub, path_norm_I_tests],
   link_args: runner_link_args,
-  link_with: [crash_handler_lib],  # Shared crash handler from root meson.build
+  link_with: [crash_handler_lib] + apple_runner_watchdog_libs,
   implicit_include_directories: false,
   install: false
 )
@@ -185,6 +200,7 @@ example_executables = []
 # DLL-only list for the all-with-examples alias (avoids building runner copies
 # which each take ~1.5s of file-copy overhead on Windows, saving ~10s total)
 example_dlls = []
+example_group_targets = {}
 
 # Create executable target for each discovered example
 foreach example_name : example_paths.keys()
@@ -195,6 +211,12 @@ foreach example_name : example_paths.keys()
 
     # Get the example's root directory path (sketch directory)
     example_root = example_paths[example_name]
+    example_root_key = example_root.replace('\\', '/')
+    if not example_group_by_root.has_key(example_root_key)
+        error('Example missing from group manifest: ' + example_root_key)
+    endif
+    example_group_name = example_group_by_root[example_root_key]
+    example_group_suite = 'examples-' + example_group_name.to_lower()
 
     # Get include directories for this example
     example_include_dirs = example_includes.get(example_name, [])
@@ -203,12 +225,12 @@ foreach example_name : example_paths.keys()
     # (issue #2328). DO NOT use include_directories() — Meson emits these as
     # backslash + relative paths on Windows, which defeats #pragma once dedup.
     # inc_dir is project-relative (e.g. "examples/Blink" or "examples\\Blink");
-    # normalize to path_norm_root / <rest> via forward-slash '/' operator.
+    # normalize to path_norm_root + '/' + <rest> with literal separators.
     per_example_I_args = []
     foreach inc_dir : example_include_dirs
         # Canonicalize any backslashes the discovery script may have emitted
         inc_dir_fwd = inc_dir.replace('\\', '/')
-        per_example_I_args += ['-I' + path_norm_root / inc_dir_fwd]
+        per_example_I_args += ['-I' + path_norm_root + '/' + inc_dir_fwd]
     endforeach
 
     # Construct proper path: <example_root>/<example_name>.ino
@@ -258,10 +280,17 @@ foreach example_name : example_paths.keys()
         example_specific_cpp_args += [
             '-DEXAMPLE_PLATFORM_FILTER="' + example_filter_str + '"'
         ]
-        # Check if this filter indicates the example should NOT run on stub/native
-        # If it contains "platform is X" where X is not "native", mark as stub-incompatible
-        # This is a defense-in-depth guard - normally these are filtered at configure time
-        if example_filter_str.contains('platform is') and not example_filter_str.contains('platform is native')
+        # Check if this normalized filter indicates the example should NOT run
+        # on stub/native. This is a defense-in-depth guard - normally these are
+        # filtered at configure time via SKIP metadata.
+        if (
+            (
+                example_filter_str.contains('require:platform=') or
+                example_filter_str.contains('require:board=') or
+                example_filter_str.contains('require:target=') or
+                example_filter_str.contains('platform is')
+            ) and not example_filter_str.contains('native')
+        )
             example_specific_cpp_args += ['-DEXAMPLE_STUB_INCOMPATIBLE=1']
         endif
     endif
@@ -310,14 +339,11 @@ foreach example_name : example_paths.keys()
     # Environment ensures fastled.dll and runtime DLLs (ASan, MinGW) are discoverable
     example_test_env = environment()
     example_test_env.prepend('PATH', fastled_lib_dir)
-    # Add clang-tool-chain runtime dirs so ASan/MinGW DLLs are found even when
-    # zccache caches the link and skips ctc-clang++'s post-link deployment.
-    foreach _rtdll_dir : runtime_dll_paths
-      example_test_env.prepend('PATH', _rtdll_dir)
-    endforeach
+    # Windows GNU runtime DLLs are copied beside link outputs by the zccache
+    # deploy hook. Linux/macOS use their linked runtime search paths instead.
     test('example-' + example_name, example_runner_exe,
         args: [example_dll.full_path()],
-        suite: 'examples',
+        suite: ['examples', example_group_suite],
         timeout: 60,
         env: example_test_env,
     )
@@ -325,12 +351,19 @@ foreach example_name : example_paths.keys()
     # Track both DLL and runner for alias target
     example_executables += [example_dll, example_runner_copy]
     example_dlls += [example_dll]
+    example_group_targets += {
+        example_group_suite: example_group_targets.get(example_group_suite, []) +
+            [example_dll, example_runner_copy]
+    }
 endforeach
 
 # Create alias target to build all examples (only if we have examples)
 if example_executables.length() > 0
     alias_target('examples-host', example_executables)
 endif
+foreach group_suite, group_targets : example_group_targets
+    alias_target(group_suite, group_targets)
+endforeach
 
 example_count = example_executables.length()
 total_discovered = example_paths.keys().length()
@@ -338,13 +371,13 @@ skipped_count = stub_incompatible_examples.length()
 message('Host-based example compilation: ' + example_count.to_string() + '/' + total_discovered.to_string() + ' examples (' + skipped_count.to_string() + ' platform-specific examples skipped)')
 
 # ============================================================================
-# HARDWARE BOARD COMPILATION (PlatformIO-based)
+# HARDWARE BOARD COMPILATION (fbuild-based)
 # ============================================================================
 
 # Find uv executable
 uv_exe = find_program('uv', required: false)
 if not uv_exe.found()
-    warning('uv not found - PlatformIO example compilation targets will not be available. Install with: pip install uv')
+    warning('uv not found - board example compilation targets will not be available. Install with: pip install uv')
     subdir_done()
 endif
 
@@ -397,7 +430,7 @@ foreach example : common_examples
     )
 endforeach
 
-message('PlatformIO example compilation targets configured:')
+message('Board example compilation targets configured:')
 message('  - Individual: example-<name>-<board> (e.g., example-blink-uno)')
 message('  - All examples: examples-all-<board> (e.g., examples-all-uno)')
 message('  - Single example, all boards: examples-<name>-all-boards (e.g., examples-blink-all-boards)')

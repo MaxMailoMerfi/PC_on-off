@@ -17,14 +17,17 @@ ESP32_IDF_5_3_PIOARDUINO = "https://github.com/pioarduino/platform-espressif32/r
 ESP32_IDF_5_4_PIOARDUINO = "https://github.com/pioarduino/platform-espressif32/releases/download/54.03.20/platform-espressif32.zip"
 ESP32_IDF_5_5_PIOARDUINO = "https://github.com/pioarduino/platform-espressif32/releases/download/55.03.34/platform-espressif32.zip"
 ESP32_IDF_5_5_1_PIOARDUINO = "https://github.com/pioarduino/platform-espressif32/releases/download/55.03.35/platform-espressif32.zip"
+ESP32_IDF_5_5_5_PIOARDUINO = "https://github.com/pioarduino/platform-espressif32/releases/download/55.03.311/platform-espressif32.zip"
+# Arduino 4 on ESP-IDF 6: pioarduino 61.04.00-RC1 release (FastLED#4827,
+# FastLED#3516). Bump to the final 61.04.x tag when pioarduino cuts it.
+ESP32_IDF_6_PIOARDUINO = "https://github.com/pioarduino/platform-espressif32/releases/download/61.04.00-RC1/platform-espressif32.zip"
 ESP32_IDF_LATEST_PIOARDUINO = ESP32_IDF_5_5_1_PIOARDUINO
 
 ESP32_IDF_LATEST_PIOARDUINO = (
     "https://github.com/pioarduino/platform-espressif32.git#develop"
 )
-ESP32_IDF_4_4_LATEST = (
-    "https://github.com/platformio/platform-espressif32/archive/refs/tags/v4.4.0.zip"
-)
+# Registry spec for the upstream espressif32 platform release 4.4.0 (IDF 4.4).
+ESP32_IDF_4_4_LATEST = "espressif32@4.4.0"
 APOLLO3_2_2_0 = "https://github.com/nigelb/platform-apollo3blue"
 # Top of trunk.
 # ESP32_IDF_5_1_PIOARDUINO = "https://github.com/pioarduino/platform-espressif32"
@@ -32,8 +35,54 @@ APOLLO3_2_2_0 = "https://github.com/nigelb/platform-apollo3blue"
 # Old fork that we were using
 # ESP32_IDF_5_1_PIOARDUINO = "https://github.com/zackees/platform-espressif32#Arduino/IDF5"
 
-# ALL will be auto populated in the Board constructor whenever a
-# board is defined.
+# ALL is auto-populated by Board.__post_init__ for every board declared with
+# add_board_to_all left at its default. Clones, create_board()'s unknown-board
+# fallbacks and test fixtures pass False and stay out.
+# Memory-tier board names (see Board.memory_class). Every name must be a
+# registered Board or a host pseudo-board (ci/tests/test_board_memory_tiers.py).
+TINY_MEMORY_BOARDS: frozenset[str] = frozenset(
+    {
+        "attiny85",  # 512B RAM
+        "attiny88",  # 512B RAM
+        "attiny4313",  # 256B RAM
+        "attiny1604",  # 1KB RAM (ATtinyxy4)
+        "digispark-tiny",  # 512B RAM
+        "atmega8a",  # 1KB RAM
+    }
+)
+
+LOW_MEMORY_BOARDS: frozenset[str] = frozenset(
+    {
+        "uno",
+        "nano",
+        "nano_every",
+        "leonardo",
+        "attiny1616",  # 2KB RAM (ATtinyxy6) — has room for standard sketches
+        "teensylc",
+        "teensy30",
+        "teensy31",
+        "teensy32",
+        "stm32f103c8",
+        "stm32f103cb",
+        "stm32f103tb",
+        "esp8266",
+        "uno_r4_wifi",
+        # uno_r4_minima: no Board yet (fbuild's Renesas core lacks its bsp_api.h);
+        # its renesas-ra platform already classifies it as low memory.
+    }
+)
+
+HUGE_MEMORY_BOARDS: frozenset[str] = frozenset(
+    {
+        "teensy35",
+        "teensy36",
+        "teensy40",
+        "teensy41",
+        "native",
+        "web",
+    }
+)
+
 ALL: list["Board"] = []
 
 
@@ -46,23 +95,27 @@ class Board:
     board_name: str
     real_board_name: str | None = None
     platform: str | None = None
-    platform_needs_install: bool = False
-    use_pio_run: bool = (
-        False  # some platforms like esp32-c2-devkitm-1 will only work with pio run
-    )
     platform_packages: str | None = None
     framework: str | None = None
     board_build_mcu: str | None = None
     board_build_core: str | None = None
+    # Size of the LittleFS/SPIFFS partition (e.g. "1.5m"), emitted as
+    # `board_build.filesystem_size`. Wired through both ini emitters; no board
+    # sets it yet.
     board_build_filesystem_size: str | None = None
     board_build_flash_size: str | None = (
         None  # Flash size for ESP32 boards (e.g., '4MB')
     )
+    board_build_options: dict[str, str] | None = None
+    lib_deps: list[str] | None = None
     build_flags: list[str] | None = None  # Reserved for future use.
     build_unflags: list[str] | None = None  # New: unflag options
     defines: list[str] | None = None
     customsdk: str | None = None
-    board_partitions: str | None = None  # Reserved for future use.
+    # ESP32 partition-table CSV name (e.g. "huge_app.csv"), emitted as
+    # `board_build.partitions`. Set by several boards whose app exceeds the
+    # default 1.25MB app partition.
+    board_partitions: str | None = None
     no_board_spec: bool = (
         False  # For platforms like 'native' that don't need a board specification
     )
@@ -79,6 +132,11 @@ class Board:
     extra_scripts: list[str] | None = (
         None  # Custom build scripts to run (e.g., ['pre:script.py'] for pre-build hooks)
     )
+    # Serial monitor filters (e.g., ["default", "esp32_exception_decoder"]).
+    # ESP32-family boards auto-default to ["default", "esp32_exception_decoder"]
+    # in to_project_ini() when this is left None — see #3274 Phase 1. Set to
+    # [] to suppress the auto-default; set to a custom list to override.
+    monitor_filters: list[str] | None = None
     # Opt-in for GCC -fopt-info-all -> optimization_report.txt. Default OFF
     # because the file accumulates across every example in the matrix and can
     # exceed 100 MB on no-LTO boards with a large sketch set (nrf52840 with
@@ -86,6 +144,13 @@ class Board:
     # down — see PR #2658). Set True when the board's workflow genuinely
     # needs the optimization-info dump for size/perf debugging.
     generate_optimization_report: bool = False
+    # Set True on chips where Espressif's `SOC_PARLIO_SUPPORTED=1` (per
+    # `components/soc/<chip>/include/soc/soc_caps.h`). The canonical chip
+    # family list lives in `src/platforms/esp/32/drivers/parlio/bus_traits.h:6`
+    # — keep these two lists in sync. When True, `to_project_ini()`
+    # auto-prepends `_ESP32_PARLIO_BUILD_FLAGS` to `build_flags` so the PARLIO
+    # TX ISR is pinned in IRAM and cache-safe (see #3271, #3304).
+    parlio_capable: bool = False
 
     def __post_init__(self) -> None:
         # Check if framework is set, warn and auto-set to arduino if missing (except for native/stub platforms)
@@ -95,7 +160,17 @@ class Board:
         # Auto-detect and exclude problematic libraries based on environmental signals
         self._auto_detect_library_exclusions()
 
-        ALL.append(self)
+        # Honour the flag. This used to append unconditionally, which made
+        # `add_board_to_all=False` mean nothing: `clone()` sets it, and
+        # `create_board()` returns `board.clone()`, so every create_board call
+        # anywhere in CI permanently appended one more entry to ALL. The
+        # unknown-board fallback in create_board sets it too, so those ad-hoc
+        # placeholders accumulated as well -- and the reverse-lookup loops in
+        # create_board scan ALL, so a later lookup could match a placeholder
+        # left behind by an earlier one. Registration is for boards declared in
+        # this module.
+        if self.add_board_to_all:
+            ALL.append(self)
 
     def _is_native_or_stub_platform(self) -> bool:
         """Check if this is a native or stub platform that doesn't need a framework"""
@@ -181,8 +256,6 @@ class Board:
         if self.platform:
             options.append(f"platform={self.platform}")
 
-        if self.platform_needs_install:
-            options.append("platform_needs_install=true")
         if self.platform_packages:
             options.append(f"platform_packages={self.platform_packages}")
         if self.framework:
@@ -197,6 +270,11 @@ class Board:
             )
         if self.board_build_flash_size:
             options.append(f"board_build.flash_size={self.board_build_flash_size}")
+        if self.board_build_options:
+            for key, value in sorted(self.board_build_options.items()):
+                options.append(f"board_build.{key}={value}")
+        if self.lib_deps:
+            options.append(f"lib_deps={','.join(self.lib_deps)}")
         if self.defines:
             for define in self.defines:
                 options.append(f"build_flags=-D{define}")
@@ -213,13 +291,6 @@ class Board:
 
         if self.customsdk:
             options.append(f"custom_sdkconfig={self.customsdk}")
-
-        # Add board-specific build cache directory pointing via symlink directive
-        # here = Path(__file__).parent
-        # project_root = here.parent.parent  # Move from ci/util/ to project root
-        # cache_dir = project_root / ".pio_cache" / self.board_name
-        # absolute_cache_dir = cache_dir.resolve()
-        # options.append(f"build_cache_dir=symlink://{absolute_cache_dir}")
 
         return out
 
@@ -243,36 +314,12 @@ class Board:
         """
         # Tiny-memory board list: <= 1KB SRAM. These cannot fit many standard
         # FastLED example sketches. Matches sketch_macros.h SKETCH_HAS_TINY_MEMORY.
-        # Case-insensitive match — PlatformIO board names vary in casing (e.g.
+        # Case-insensitive match — board names vary in casing (e.g.
         # "attiny85" vs "ATtiny1604").
-        tiny_memory_boards = {
-            "attiny85",  # 512B RAM
-            "attiny88",  # 512B RAM
-            "attiny4313",  # 256B RAM
-            "attiny1604",  # 1KB RAM (ATtinyxy4)
-            "digispark-tiny",  # 512B RAM
-        }
-        if self.board_name.lower() in tiny_memory_boards:
+        if self.board_name.lower() in TINY_MEMORY_BOARDS:
             return "tiny"
 
         # Low-memory board list (matches sketch_macros.h)
-        low_memory_boards = {
-            "uno",
-            "nano",
-            "nano_every",
-            "leonardo",
-            "attiny1616",  # 2KB RAM (ATtinyxy6) — has room for standard sketches
-            "teensylc",
-            "teensy30",
-            "teensy31",
-            "teensy32",
-            "stm32f103c8",
-            "stm32f103cb",
-            "stm32f103tb",
-            "esp8266",
-            "uno_r4_wifi",
-            "uno_r4_minima",
-        }
 
         # Low-memory platform families
         low_memory_platforms = {
@@ -282,23 +329,15 @@ class Board:
         }
 
         # Check low-memory first
-        if self.board_name in low_memory_boards:
+        if self.board_name in LOW_MEMORY_BOARDS:
             return "low"
         if self.platform and self.platform in low_memory_platforms:
             return "low"
 
         # Huge-memory boards (>= 256KB RAM, >= 512KB flash)
         # Matches sketch_macros.h SKETCH_HAS_HUGE_MEMORY=1 platforms
-        huge_memory_boards = {
-            "teensy35",
-            "teensy36",
-            "teensy40",
-            "teensy41",
-            "native",
-            "web",
-        }
 
-        if self.board_name in huge_memory_boards:
+        if self.board_name in HUGE_MEMORY_BOARDS:
             return "huge"
 
         # Huge-memory platform families
@@ -329,7 +368,7 @@ class Board:
     def platform_family(self) -> str:
         """Return simplified platform family name for filtering.
 
-        Maps PlatformIO platform names to simplified family names like 'avr', 'esp32', 'teensy'.
+        Maps platform names to simplified family names like 'avr', 'esp32', 'teensy'.
         """
         if not self.platform:
             return "unknown"
@@ -463,49 +502,28 @@ class Board:
         # Return None if we can't determine the target
         return None
 
-    def to_platformio_ini(
+    def to_project_ini(
         self,
         additional_defines: list[str] | None = None,
         additional_include_dirs: list[str] | None = None,
         additional_libs: list[str] | None = None,
-        include_platformio_section: bool = False,
-        core_dir: str | None = None,
-        packages_dir: str | None = None,
         project_root: str | None = None,
-        build_cache_dir: str | None = None,
         extra_scripts: list[str] | None = None,
     ) -> str:
-        """Return a `platformio.ini` snippet representing this board.
+        """Return the ``[env:<board>]`` ini section fbuild builds this board from.
 
-        The output is suitable for directly appending to a *platformio.ini* file
-        and follows the same semantics used by the PlatformIO CLI.  Only
-        parameters understood by PlatformIO are emitted – internal helper
-        fields like ``platform_needs_install`` and ``use_pio_run`` are **not**
-        included because they are consumed exclusively by the build helpers in
-        the *ci/* folder and would be ignored (or flagged as errors) by
-        PlatformIO itself.
+        Only options fbuild's project-ini format understands are emitted;
+        helper fields consumed by the *ci/* build code are left out.
 
         Args:
-            example: Example name for dynamic build flags (currently unused)
             additional_defines: Additional defines to merge with board defines
             additional_include_dirs: Additional include directories to merge with build flags
-            include_platformio_section: Whether to include [platformio] section with core_dir/packages_dir
-            core_dir: PlatformIO core directory path
-            packages_dir: PlatformIO packages directory path
-            project_root: FastLED project root for lib_deps symlink
+            additional_libs: Extra ``lib_deps`` entries
+            project_root: FastLED project root; when given, adds the
+                FastLED-specific ``lib_ldf_mode``/``lib_archive`` defaults
+            extra_scripts: Extra ``extra_scripts`` entries
         """
         lines: list[str] = []
-
-        # Optional [platformio] section
-        if include_platformio_section:
-            lines.append("[platformio]")
-            if build_cache_dir:
-                lines.append(f"build_cache_dir = {build_cache_dir}")
-            if core_dir:
-                lines.append(f"core_dir = {core_dir}")
-            if packages_dir:
-                lines.append(f"packages_dir = {packages_dir}")
-            lines.append("")
 
         # Section header
         lines.append(f"[env:{self.board_name}]")
@@ -548,6 +566,10 @@ class Board:
             lines.append(f"board_build.flash_size = {self.board_build_flash_size}")
             # Also set upload flash size to override board defaults
             lines.append(f"board_upload.flash_size = {self.board_build_flash_size}")
+
+        if self.board_build_options:
+            for key, value in sorted(self.board_build_options.items()):
+                lines.append(f"board_build.{key} = {value}")
 
         # Force DIO flash mode ONLY for QEMU builds
         # QEMU doesn't support QIO flash mode which requires setting the QIE bit
@@ -602,6 +624,14 @@ class Board:
         if additional_defines:
             build_flags_elements.extend(f"-D{define}" for define in additional_defines)
 
+        # Auto-emit PARLIO IRAM flags on chips with SOC_PARLIO_SUPPORTED=1
+        # (capability declared via `parlio_capable=True` on the Board). Mirrors
+        # the auto-default pattern used above for ESP32-family `monitor_filters`
+        # — moves the flag list off a hand-maintained allowlist of board names
+        # and onto the per-chip capability bit. See #3304.
+        if self.parlio_capable:
+            build_flags_elements.extend(_ESP32_PARLIO_BUILD_FLAGS)
+
         # Use static build flags
         if self.build_flags:
             build_flags_elements.extend(self.build_flags)
@@ -627,8 +657,7 @@ class Board:
         if qemu_build_unflags:
             all_build_unflags.extend(qemu_build_unflags)
         if all_build_unflags:
-            # PlatformIO accepts multiple *build_unflags* separated by spaces.
-            # Emit a single line for readability.
+            # Multiple *build_unflags* are separated by spaces on one line.
             lines.append(f"build_unflags = {' '.join(all_build_unflags)}")
 
         # Custom ESP-IDF sdkconfig override (ESP32-family boards)
@@ -652,6 +681,24 @@ class Board:
                 for lib in self.lib_ignore:
                     lines.append(f"    {lib}")
 
+        # Serial monitor filters. ESP32-family boards auto-default to
+        # ["default", "esp32_exception_decoder"] so that crash backtraces
+        # decode to file:line under `bash debug` / the fbuild monitor
+        # without depending on the root platformio.ini merge (see #3274
+        # Phase 1). An explicit `monitor_filters=[]` on a Board suppresses
+        # the auto-default; any non-None value overrides it.
+        is_esp32_family = self.board_name.startswith("esp32") or (
+            self.real_board_name is not None
+            and self.real_board_name.startswith("esp32")
+        )
+        effective_monitor_filters = self.monitor_filters
+        if effective_monitor_filters is None and is_esp32_family:
+            effective_monitor_filters = ["default", "esp32_exception_decoder"]
+        if effective_monitor_filters:
+            lines.append("monitor_filters =")
+            for mf in effective_monitor_filters:
+                lines.append(f"    {mf}")
+
         # Add FastLED-specific configurations if project_root is provided
         if project_root:
             # Only add default lib_ldf_mode if board doesn't specify its own
@@ -660,16 +707,14 @@ class Board:
                 lines.append("lib_ldf_mode = chain")
             lines.append("lib_archive = true")
 
-            # Build lib_deps with additional libs only (FastLED is copied to lib/FastLED)
-            # PlatformIO supports multiple lib_deps entries on separate lines
-            if additional_libs:
-                # Format as multi-line lib_deps for proper PlatformIO parsing
-                if len(additional_libs) == 1:
-                    lines.append(f"lib_deps = {additional_libs[0]}")
-                else:
-                    lines.append("lib_deps =")
-                    for entry in additional_libs:
-                        lines.append(f"    {entry}")
+        # Repeated lib_deps options replace rather than merge, so combine
+        # board requirements and caller-supplied requirements before emitting
+        # the single environment option.
+        lib_deps: list[str] = list(self.lib_deps or [])
+        if additional_libs:
+            lib_deps.extend(additional_libs)
+        if lib_deps:
+            lines.append(f"lib_deps = {','.join(lib_deps)}")
 
         return "\n".join(lines) + "\n"
 
@@ -695,29 +740,64 @@ SAM3X8E_DUE = Board(
 SPARKFUN_XRP_CONTROLLER_2350B = Board(
     board_name="sparkfun_xrp_controller",
     platform="https://github.com/maxgerhardt/platform-raspberrypi",
-    platform_needs_install=True,
+    platform_packages="framework-arduinopico@https://github.com/earlephilhower/arduino-pico/releases/download/5.7.0/rp2040-5.7.0.zip",
+    board_build_core="earlephilhower",
+    # PicoOTA stages the incoming image in the filesystem. The board's default
+    # 16 MB/no-FS layout fails PicoOTA's 128 KiB minimum at compile time;
+    # its 16 MB/2 MB menu option leaves room for full firmware images.
+    board_build_filesystem_size="2m",
 )
 
 APOLLO3_RED_BOARD = Board(
     board_name="apollo3_red",
     real_board_name="SparkFun_RedBoard_Artemis_ATP",
     platform=APOLLO3_2_2_0,
-    platform_packages="framework-arduinoapollo3@https://github.com/sparkfun/Arduino_Apollo3#v2.2.0",
-    platform_needs_install=True,
+    platform_packages="framework-arduinoapollo3@https://github.com/sparkfun/Arduino_Apollo3/releases/download/v2.2.0/Arduino_Apollo3.tar.gz",
 )
 
 APOLLO3_SPARKFUN_THING_PLUS_EXPLORABLE = Board(
     board_name="apollo3_thing_explorable",
     real_board_name="SparkFun_Thing_Plus_expLoRaBLE",
     platform=APOLLO3_2_2_0,
-    platform_packages="framework-arduinoapollo3@https://github.com/sparkfun/Arduino_Apollo3#v2.2.0",
-    platform_needs_install=True,
+    platform_packages="framework-arduinoapollo3@https://github.com/sparkfun/Arduino_Apollo3/releases/download/v2.2.0/Arduino_Apollo3.tar.gz",
 )
 
 ESP32DEV = Board(
     board_name="esp32dev",
-    platform=ESP32_IDF_5_3_PIOARDUINO,
+    # Keep the size reference on Arduino-ESP32 3.3.11. The 5.3 platform
+    # resolved 3.1.0 and put both Blink and Apa102 over their frozen caps;
+    # the 5.5.5 platform restores the documented framework baseline (#4690).
+    platform=ESP32_IDF_5_5_5_PIOARDUINO,
     board_partitions="huge_app.csv",
+    # Size-strip flags for the CI binary-size reference target
+    # (check_esp32_size.yml — 330 KB ceiling). Previously these lived in
+    # root platformio.ini as PR #3268 "band-aid" overrides; #3279 Phase 4
+    # ports them to ci/boards.py so CI can shrink the binary without
+    # depending on root (which CI no longer reads — see #3274). The root
+    # esp32dev section is kept minimal for `bash debug` (it still extends
+    # generic-esp for debug output).
+    #
+    # build_unflags strips the default pioarduino debug profile (-Og -g)
+    # that would otherwise blow the 330 KB ceiling on Blink; build_flags
+    # then forces a size-optimised release build matching #3268's intent.
+    build_unflags=[
+        "-Og",
+        "-g",
+    ],
+    build_flags=[
+        "-Os",
+        "-fno-exceptions",
+        "-fno-rtti",
+        "-fno-unwind-tables",
+        "-fno-asynchronous-unwind-tables",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-DNDEBUG",
+        "-UDEBUG",
+        "-UFASTLED_DEBUG",
+        "-DCORE_DEBUG_LEVEL=0",
+        "-DLOG_LOCAL_LEVEL=ESP_LOG_NONE",
+    ],
 )
 
 # TODO: esp32dev_qemu remove when possible, we don't want an extra board definition unless we need it
@@ -753,6 +833,63 @@ ESP32DEV_IDF4_4 = Board(
     platform=ESP32_IDF_4_4_LATEST,
 )
 
+# IDF 6.0 target for the classic-ESP32 I2S parallel-out driver bring-up
+# (FastLED#3515). Uses the pioarduino 61.04.00-RC1 release (Arduino core
+# 4.0.0-RC1 on ESP-IDF 6.1, FastLED#4827). No FASTLED_ESP32_I2S selector — the driver auto-compiles via
+# FASTLED_ESP32_HAS_I2S (feature flag) and gc-sections elides it when
+# unused. Users select the I2S driver at runtime via
+# `FastLED.enableDriver<fl::Bus::FLEX_IO, 0>()` or
+# `FastLED.add<Channel::create<fl::Bus::FLEX_IO, 0>()>`.
+ESP32DEV_IDF6 = Board(
+    board_name="esp32dev_idf6",
+    real_board_name="esp32dev",
+    platform=ESP32_IDF_6_PIOARDUINO,
+)
+
+# ESP-IDF component-build smoke test (FastLED#3724, part of #3715).
+#
+# framework="arduino, espidf" makes the build go through ESP-IDF's
+# CMake/idf.py component system (CONFIG_AUTOSTART_ARDUINO=y runs the .ino
+# sketch's setup()/loop() from within an IDF app_main — see
+# ci/compiler/board_compiler.py's sdkconfig.defaults handling). This is NOT
+# the same as a pure bare-IDF app_main() project, but it does exercise the
+# real idf_component_register()/CMakeLists.txt path (see root CMakeLists.txt)
+# instead of the Arduino-only source-discovery build — the actual
+# distribution mechanism #2121 (idf component registry) depends on.
+#
+# Combined with #3715's other changes (which made the IDF-native code path
+# the *default*, not something gated behind "Arduino absent"), this leg
+# already exercises nearly all of the same code as a true bare-IDF build:
+# ARDUINO is still defined here (Arduino runs as an IDF component), so this
+# does NOT prove behavior with <Arduino.h> completely unavailable — that
+# residual gap needs a genuine app_main()-only harness project, which is
+# out of scope for this pass; see FastLED#3724 for the follow-up plan.
+#
+# Scope note (#3724 / see the ESP32_C2_DEVKITM_1 comment above): the dual
+# "arduino, espidf" component build does not auto-discover example .cpp
+# files in subdirectories (examples/Codec/, examples/Downscale/, etc.) —
+# only single-file .ino examples like Blink are safe to compile with this
+# board until that LDF gap is fixed.
+ESP32DEV_IDF5_COMPONENT = Board(
+    board_name="esp32dev_idf5_component",
+    real_board_name="esp32dev",
+    platform=ESP32_IDF_5_3_PIOARDUINO,
+    framework="arduino, espidf",
+    board_partitions="huge_app.csv",
+)
+
+# Heap-poisoning debug variant (FastLED#3588): same pioarduino platform
+# as esp32dev but with custom_sdkconfig, which makes pioarduino rebuild
+# the IDF libs from source with comprehensive heap poisoning + end-of-
+# stack watchpoints. The poisoning integrity check names the corrupter
+# on first touch — the tool the #3588 investigation needs.
+ESP32DEV_HEAPDBG = Board(
+    board_name="esp32dev_heapdbg",
+    real_board_name="esp32dev",
+    platform=ESP32_IDF_5_3_PIOARDUINO,
+    customsdk="CONFIG_HEAP_POISONING_COMPREHENSIVE=y",
+)
+
 STM32H747XI_GIGA = Board(
     board_name="stm32h747xi",
     platform="ststm32",
@@ -765,12 +902,25 @@ STM32H747XI_GIGA = Board(
 #     platform=ESP32_IDF_5_1_PIOARDUINO,
 # )
 
+# Required on every PARLIO-capable ESP32 target (C5/C6/H2/P4/S3). Without these,
+# the PARLIO TX ISR is placed in flash and may take cache-miss stalls during
+# execution — long enough to violate LED protocol timing. The driver emits a
+# #warning at compile time when CONFIG_PARLIO_TX_ISR_HANDLER_IN_IRAM is missing
+# (src/platforms/esp/32/drivers/parlio/parlio_peripheral_esp.cpp.hpp:46-48).
+# Historically these lived only in root platformio.ini under [env:esp32c6] and
+# reached CI only via the implicit root-merge — leaving every other PARLIO
+# board (S3, H2, P4, C5) compiling without them. See #3271.
+_ESP32_PARLIO_BUILD_FLAGS = [
+    "-DCONFIG_PARLIO_TX_ISR_HANDLER_IN_IRAM=1",
+    "-DCONFIG_PARLIO_TX_ISR_CACHE_SAFE=1",
+]
+
 # ESP32-C2: Use Arduino framework only (not "arduino, espidf")
-# The dual framework mode causes PlatformIO to use ESP-IDF's component-based build system,
+# The dual framework mode uses ESP-IDF's component-based build system,
 # which does not automatically discover and compile .cpp files in example subdirectories
 # (e.g., examples/Codec/codec_processor.cpp, examples/Downscale/src/xypaths.cpp).
 # This resulted in linking errors with "undefined reference" to functions defined in those files.
-# Arduino-only mode uses PlatformIO's standard source discovery which correctly compiles
+# Arduino-only mode uses the standard Arduino source discovery which correctly compiles
 # all .cpp files copied to the build directory.
 # See: GitHub Actions run 18448215424 - ESP32-C2 linking failures for Codec, Downscale, FxWave2d
 ESP32_C2_DEVKITM_1 = Board(
@@ -778,8 +928,7 @@ ESP32_C2_DEVKITM_1 = Board(
     real_board_name="esp32-c2-devkitm-1",
     # Pinned to 54.03.20 (IDF 5.4) — matches the constant used by most other
     # ESP32 boards here. Previously tracked the floating `stable` tag, which
-    # upstream bumped to 55.03.38 requiring PlatformIO Core >=6.1.19; CI ships
-    # 6.1.18, so `stable` now fails with IncompatiblePlatform.
+    # upstream kept bumping underneath CI.
     platform=ESP32_IDF_5_4_PIOARDUINO,
     framework="arduino",  # IMPORTANT: Do not add "espidf" - see comment above
     board_partitions="huge_app.csv",  # Default partition only allows 1.25MB app; Validation needs ~1.6MB
@@ -796,6 +945,7 @@ ESP32_C5_DEVKITC_1 = Board(
     board_name="esp32c5",
     real_board_name="esp32-c5-devkitc-1",
     platform=ESP32_IDF_5_5_1_PIOARDUINO,
+    parlio_capable=True,  # SOC_PARLIO_SUPPORTED=1 — flags auto-emitted by to_project_ini()
 )
 
 ESP32_C6_DEVKITC_1 = Board(
@@ -804,6 +954,7 @@ ESP32_C6_DEVKITC_1 = Board(
     platform=ESP32_IDF_5_5_1_PIOARDUINO,
     board_build_flash_size="4MB",  # ESP32-C6FH4 actual flash size confirmed by esptool
     board_partitions="huge_app.csv",
+    parlio_capable=True,  # SOC_PARLIO_SUPPORTED=1 — flags auto-emitted by to_project_ini()
     build_flags=[
         "-funwind-tables",  # Better stack traces for RISC-V crash decoding
         "-DARDUINO_USB_MODE=1",  # Select HWCDC (USB-Serial/JTAG) over OTG
@@ -815,11 +966,18 @@ ESP32_C6_DEVKITC_1 = Board(
 ESP32_S3_DEVKITC_1 = Board(
     board_name="esp32s3",
     real_board_name="esp32-s3-devkitc-1",
-    platform=ESP32_IDF_5_4_PIOARDUINO,
+    platform=ESP32_IDF_5_5_5_PIOARDUINO,
     framework="arduino",
     board_build_flash_size="4MB",  # Set to 4MB for QEMU compatibility (default is 8MB)
     board_partitions="huge_app.csv",  # 3MB app partition (default.csv only has 1.25MB, too small for Validation)
+    # AutoResearchOta.cpp directly uses LittleFS, whose public header includes
+    # FS.h. Declare both bundled libraries so fbuild adds their headers and
+    # archives before compiling examples.
+    lib_deps=["FS", "LittleFS"],
     build_unflags=["-DFASTLED_RMT5=0", "-DFASTLED_RMT5"],
+    # NOTE: esp32s3 has NO PARLIO peripheral (SOC_PARLIO_SUPPORTED is unset in
+    # soc_caps.h). Do NOT set parlio_capable=True here — PR #3276 historically
+    # had this wrong; #3304 fixes it.
     build_flags=[
         "-DARDUINO_USB_MODE=1",  # Route Serial over native USB for AutoResearch RPC on the upload port
         "-DARDUINO_USB_CDC_ON_BOOT=1",
@@ -843,8 +1001,8 @@ ESP32_UPESY_WROOM = Board(
 ESP32H2 = Board(
     board_name="esp32h2",
     real_board_name="esp32-h2-devkitm-1",
-    platform_needs_install=True,  # Install platform package to get the boards
     platform=ESP32_IDF_5_3_PIOARDUINO,
+    parlio_capable=True,  # SOC_PARLIO_SUPPORTED=1 — flags auto-emitted by to_project_ini()
 )
 
 ESP32_P4 = Board(
@@ -852,6 +1010,7 @@ ESP32_P4 = Board(
     real_board_name="esp32-p4-evboard",
     platform=ESP32_IDF_5_5_1_PIOARDUINO,
     board_partitions="huge_app.csv",
+    parlio_capable=True,  # SOC_PARLIO_SUPPORTED=1 — flags auto-emitted by to_project_ini()
     # Route Serial → USB-Serial-JTAG (HWCDCSerial) instead of UART0 (pins 37/38).
     # Without these the AutoResearch firmware listens on UART0 while the host
     # tool talks to the USB-Serial-JTAG COM port — every RPC write times out.
@@ -938,7 +1097,7 @@ XIAOBLESENSE_NRF52 = Board(
 )
 
 # Correct nRF52840 DK board definition
-# The Nordic nRF52840 DK is directly supported by the default PlatformIO
+# The Nordic nRF52840 DK is directly supported by the stock
 # `nordicnrf52` platform under the board name `nrf52840_dk`, so we don't
 # need a custom platform package or extra installation steps.  Point the
 # Board definition at the stock platform and use the canonical board name.
@@ -949,7 +1108,6 @@ NRF52840 = Board(
     real_board_name="nrf52840_dk_adafruit",  # Use Adafruit BSP variant which includes full Nordic SDK headers
     platform="nordicnrf52",
     framework="arduino",
-    platform_needs_install=False,
     platform_packages="framework-arduinoadafruitnrf52@^1.10601.0",
     defines=[
         "FASTLED_USE_COMPILE_TESTS=0",
@@ -962,7 +1120,7 @@ NRF52840 = Board(
 
 # SuperMini nRF52840 -- community board (issue #2422)
 # Variant header: https://github.com/pdcook/nRFMicro-Arduino-Core/blob/main/variants/SuperMini_nRF52840/variant.h
-# No first-party PlatformIO board package exists for this variant; we reuse
+# No first-party board package exists for this variant; we reuse
 # the nrf52840 Adafruit BSP and rely on the TARGET_SUPERMINI_NRF52840 define
 # to select the correct fastpin variant block in FastLED.
 SUPERMINI_NRF52840 = Board(
@@ -1017,8 +1175,7 @@ RPI_PICO = Board(
     board_name="rp2040",
     real_board_name="rpipico",
     platform="https://github.com/maxgerhardt/platform-raspberrypi.git",
-    platform_needs_install=True,  # Install platform package to get the boards
-    platform_packages="framework-arduinopico@https://github.com/earlephilhower/arduino-pico.git",
+    platform_packages="framework-arduinopico@https://github.com/earlephilhower/arduino-pico/releases/download/5.7.0/rp2040-5.7.0.zip",
     framework="arduino",
     board_build_core="earlephilhower",
     board_build_filesystem_size="0.5m",
@@ -1028,11 +1185,106 @@ RPI_PICO2 = Board(
     board_name="rp2350",
     real_board_name="rpipico2",
     platform="https://github.com/maxgerhardt/platform-raspberrypi.git",
-    platform_needs_install=True,  # Install platform package to get the boards
-    platform_packages="framework-arduinopico@https://github.com/earlephilhower/arduino-pico.git",
+    platform_packages="framework-arduinopico@https://github.com/earlephilhower/arduino-pico/releases/download/5.7.0/rp2040-5.7.0.zip",
     framework="arduino",
     board_build_core="earlephilhower",
     board_build_filesystem_size="0.5m",
+)
+
+RPI_PICO2_W = Board(
+    board_name="rp2350w",
+    real_board_name="rpipico2w",
+    platform="https://github.com/maxgerhardt/platform-raspberrypi.git",
+    platform_packages="framework-arduinopico@https://github.com/earlephilhower/arduino-pico/releases/download/5.7.0/rp2040-5.7.0.zip",
+    framework="arduino",
+    board_build_core="earlephilhower",
+    # Sized by the OTA image, not by filesystem need. Arduino-Pico stages an
+    # incoming OTA firmware *into the filesystem region* -- Updater.cpp:101
+    # rejects with UPDATE_ERROR_SPACE when `&_FS_start + size > &_FS_end`,
+    # and Updater.cpp:121 sets `updateStartAddress = &_FS_start`. So the
+    # region has to be at least as large as the whole image, not merely large
+    # enough for whatever the sketch stores.
+    #
+    # At the 0.5m this used to carry, the peer OTA flow reached the RP and
+    # died there with `Update error: ERROR[4]: Not Enough Space`: the image is
+    # 1,030,348 B against a 524,288 B region. Nothing in the log said so --
+    # the C6 reported `servedRequests: 0`, and the reason only surfaced once
+    # `rpOtaUpdateStatus` existed to carry it back.
+    #
+    # Only the sizes rpipico2w declares in boards.txt are selectable -- 0,
+    # 64K, 128K, 256K, 512K, 1M, 2M, 3M -- because fbuild matches this string
+    # against `menu.flash.<flash>_<fs>` and takes the geometry from the
+    # matching entry. A value that matches nothing does not fail: it yields
+    # fs_start == fs_end, and the build dies much later and much less
+    # obviously in PicoOTA.cpp with `the comparison reduces to (0 > 130048)`.
+    # 1.5m is such a value; do not "split the difference" here.
+    #
+    # 2m over 1m: 1M is 1,048,576 B against a 1,030,348 B image, an 18 KB
+    # margin that the next commit to this sketch would erase. 2m keeps ~2x
+    # headroom and still leaves 2,097,152 B for a sketch using 1,030,348.
+    # See FastLED#3956.
+    board_build_filesystem_size="2m",
+    # Arduino-Pico's default IPv4 profile excludes BTstack. Enable the Pico W
+    # BLE-capable archive so FastLED's RP2350W transport can link.
+    board_build_options={"ipbtstack": "ipv4btcble"},
+    # BTstackLib is required for FastLED BLE. HTTPUpdate is required by the
+    # device-to-device OTA AutoResearch flow and must be explicit for fbuild
+    # to compile/link the Arduino-Pico core library.
+    lib_deps=["BTstackLib", "HTTPUpdate"],
+)
+
+# NXP LPC8xx family. There is no upstream Arduino-capable nxplpc platform,
+# so use the FastLED fork (transferred from zackees/ in 2026-06-28) that
+# layers framework-arduino-lpc8xx on top of the upstream platform-nxplpc.
+#
+# The `nxplpc@` prefix is a compatibility workaround for fbuild 2.3.15
+# whose platform matcher only substring-matches `nxplpc` (no separator)
+# and rejects the hyphenated `nxp-lpc` in the raw GitHub URL. The
+# matcher fix landed as FastLED/fbuild#900 but was cut AFTER 2.3.15 was
+# released (fbuild 2.3.15 released 20:09 UTC, matcher merge 21:47 UTC).
+# Once fbuild 2.3.16 ships with #900 the `nxplpc@` prefix becomes
+# redundant but stays valid project-ini syntax (name @ source URI).
+_NXPLPC_PLATFORM = "nxplpc@https://github.com/FastLED/platform-nxp-lpc8xx.git#4b6d395cbbfb9faf97a53af3733ad802dc160f1d"
+
+# Preferred name for the LPC845 canary board target (FastLED #3220).
+# `LPC845` is the canonical entry — `bash compile lpc845 …` and
+# `bash autoresearch lpc845 …` are the documented spellings in
+# `agents/docs/hardware-autoresearch.md`. `LPC845BRK` below is retained
+# as a deprecated alias so pre-#3220 scripts and CI matrices keep
+# working; it slates for removal one release / CI cycle after this
+# lands (see #3220 acceptance).
+LPC845 = Board(
+    board_name="lpc845",
+    platform=_NXPLPC_PLATFORM,
+    framework="arduino",
+)
+
+# Deprecated alias — prefer `LPC845` above. Same platform + framework;
+# named for the LPC845-BRK breakout board specifically. Kept working
+# so `bash compile lpc845brk …` still resolves during the transition.
+# FastLED #3220 tracks removal.
+LPC845BRK = Board(
+    board_name="lpc845brk",
+    platform=_NXPLPC_PLATFORM,
+    framework="arduino",
+)
+
+LPC804 = Board(
+    board_name="lpc804",
+    platform=_NXPLPC_PLATFORM,
+    framework="arduino",
+)
+
+LPCXPRESSO845MAX = Board(
+    board_name="lpcxpresso845max",
+    platform=_NXPLPC_PLATFORM,
+    framework="arduino",
+)
+
+LPCXPRESSO804 = Board(
+    board_name="lpcxpresso804",
+    platform=_NXPLPC_PLATFORM,
+    framework="arduino",
 )
 
 STM32F103C8_BLUEPILL = Board(
@@ -1096,7 +1348,6 @@ ESP32DEV_I2S = Board(
 ESP32S3_RMT51 = Board(
     board_name="esp32rmt_51",
     real_board_name="esp32-s3-devkitc-1",
-    platform_needs_install=True,
     platform=ESP32_IDF_5_3_PIOARDUINO,
     defines=[
         "FASTLED_RMT5=1",
@@ -1124,7 +1375,7 @@ TEENSY31 = Board(
 
 TEENSY32 = Board(
     board_name="teensy32",
-    real_board_name="teensy31",  # Teensy 3.2 uses teensy31 board ID in PlatformIO
+    real_board_name="teensy31",  # Teensy 3.2 uses the teensy31 board ID
     platform="teensy",
     framework="arduino",
 )
@@ -1160,6 +1411,20 @@ UNO = Board(
     framework="arduino",
 )
 
+NANO = Board(
+    board_name="nano",
+    real_board_name="nanoatmega328",
+    platform="atmelavr",
+    framework="arduino",
+)
+
+ATMEGA2560_MEGA = Board(
+    board_name="mega",
+    real_board_name="megaatmega2560",
+    platform="atmelavr",
+    framework="arduino",
+)
+
 ATMEGA32U4_LEONARDO = Board(
     board_name="leonardo",
     real_board_name="leonardo",
@@ -1169,7 +1434,7 @@ ATMEGA32U4_LEONARDO = Board(
 
 ATMEGA8A = Board(
     board_name="atmega8a",
-    real_board_name="ATmega8",  # PlatformIO board ID (supports ATmega8/A)
+    real_board_name="ATmega8",  # board ID (supports ATmega8/A)
     platform="atmelavr",
     framework="arduino",
     board_build_mcu="atmega8a",  # Override to specifically target ATmega8A
@@ -1196,7 +1461,7 @@ ATTINY85 = Board(
 DIGISPARK_TINY = Board(
     board_name="digispark-tiny",
     board_build_mcu="attiny85",
-    # PlatformIO only publishes Digistump core 1.7.2 and avr-gcc 5.4/7.3
+    # The registry only publishes Digistump core 1.7.2 and avr-gcc 5.4/7.3
     # packages, so the Arduino IDE 1.6.7 + avr-g++ 4.8.1 issue environment
     # cannot be pinned through platform_packages here.
     platform="atmelavr",
@@ -1236,10 +1501,18 @@ NUCLEO_F439ZI = Board(
     platform="ststm32",
 )
 
+# Nucleo board for STM32G070
+NUCLEO_G070RB = Board(
+    board_name="nucleo_g070rb",
+    platform="ststm32",
+)
+
 # Arduino UNO Q board support.
-# PlatformIO does not yet ship an ArduinoCore-zephyr UNO Q platform, so CI uses
-# the STM32duino STM32U585ZITxQ toolchain as a compile target while preserving
-# the UNO Q board macro that selects FastLED's board pin map.
+# This fbuild target is not ArduinoCore-zephyr: it uses the STM32duino
+# STM32U585ZITxQ toolchain as a compile surrogate while preserving the UNO Q
+# board macro that selects FastLED's board pin map. The core users actually
+# have (arduino:zephyr:unoq) is compile-checked separately by
+# .github/workflows/build_arduino_uno_q_zephyr.yml.
 ARDUINO_UNO_Q = Board(
     board_name="arduino_uno_q",
     real_board_name="arduino_uno_q",
@@ -1255,7 +1528,6 @@ MGM240S = Board(
     board_name="mgm240",
     real_board_name="sparkfun_thingplusmatter",
     platform="https://github.com/maxgerhardt/platform-siliconlabsefm32/archive/refs/heads/silabs-arduino.zip",
-    platform_needs_install=True,
     framework="arduino",
 )
 
@@ -1280,10 +1552,6 @@ SAMD51J19A_FEATHER_M4 = Board(
     real_board_name="adafruit_feather_m4",
     platform="atmelsam",
     framework="arduino",
-    lib_ignore=["I2S"],  # I2S library has SAMD51 compatibility issues
-    defines=[
-        "FASTLED_USES_ARDUINO_AUDIO_INPUT=0",  # Disable Arduino audio (I2S not available)
-    ],
 )
 
 SAMD51P20A_GRANDCENTRAL = Board(
@@ -1291,9 +1559,25 @@ SAMD51P20A_GRANDCENTRAL = Board(
     real_board_name="adafruit_grand_central_m4",
     platform="atmelsam",
     framework="arduino",
-    lib_ignore=["I2S"],  # I2S library has SAMD51 compatibility issues
+)
+
+# Builds with ADAFRUIT_METRO_M4_EXPRESS defined, which is the only SAMD51 board
+# define that exercises the Metro M4 Express branch of fastpin_arm_d51.h.
+SAMD51J19A_METRO_M4 = Board(
+    board_name="metro_m4",
+    real_board_name="adafruit_metro_m4",
+    platform="atmelsam",
+    framework="arduino",
+)
+
+# Teknic ClearCore (Microchip SAME53N19A, Cortex-M4F @ 120 MHz).
+# This is an fbuild-native board; its vendor Arduino core is pinned by fbuild.
+CLEARCORE_SAME53 = Board(
+    board_name="clearcore",
+    platform="atmelsam",
+    framework="arduino",
     defines=[
-        "FASTLED_USES_ARDUINO_AUDIO_INPUT=0",  # Disable Arduino audio (I2S not available)
+        "FASTLED_USES_ARDUINO_AUDIO_INPUT=0",  # ClearCore core has no I2S.h
     ],
 )
 
@@ -1331,7 +1615,7 @@ def create_board(board_name: str, no_project_options: bool = False) -> Board:
         # use camelCase (`ATtiny1604`, `ATtiny1616`) while CI workflows and
         # docs frequently spell them lowercase. Resolving by lowercase
         # before falling through to a generic Board avoids
-        # `UndefinedEnvPlatformError` at PlatformIO env-resolution time
+        # an undefined-env error at fbuild env-resolution time
         # (FastLED #2779).
         if board is None:
             target = board_name.lower()
@@ -1342,7 +1626,7 @@ def create_board(board_name: str, no_project_options: bool = False) -> Board:
 
         if board is None:
             # No match found - create generic board without special overrides
-            # Assume platformio will know what to do with it
+            # Assume fbuild will know what to do with it
             board = Board(board_name=board_name, add_board_to_all=False)
 
     assert board is not None

@@ -7,10 +7,13 @@
 #include "fl/channels/bus.h"
 #include "fl/channels/bus_traits.h"
 #include "fl/channels/channel.h"
+#include "fl/channels/channel_events.h"
 #include "fl/channels/data.h"
 #include "fl/channels/driver.h"
 #include "fl/channels/manager.h"
+#include "fl/channels/options.h"
 #include "fl/chipsets/chipset_timing_config.h"
+#include "fl/chipsets/spi.h"
 #include "fl/gfx/fill.h"
 #include "fl/math/screenmap.h"
 #include "fl/math/xymap.h"
@@ -20,10 +23,18 @@
 #include "fl/stl/span.h"
 #include "fl/stl/string.h"
 #include "fl/stl/vector.h"
-#include "fl/test/fltest.h"
+#include "test.h"
 #include "platforms/stub/bus_traits.h"
 
 using namespace fl;
+
+FL_TEST_CASE("Legacy controller does not carry Channels configuration") {
+    // An independent ceiling prevents future ChannelOptions additions from
+    // weakening this ownership regression. The old host controller was 168 B.
+    FL_CHECK_LE(sizeof(CLEDController), 128u);
+}
+
+FL_TEST_FILE(FL_FILEPATH) {
 
 // ============ Channel + Addressing Integration Tests ============
 // End-to-end byte capture tests for Channel API with XYMap addressing
@@ -88,7 +99,7 @@ FL_TEST_CASE("Serpentine 2x2 with APA102 encodes pixels in expected byte order")
     SpiChipsetConfig spiConfig{5, 6, encoder};
     ChannelOptions options;
 
-    ChannelConfig config(spiConfig, fl::span<CRGB>(workspace, NUM_LEDS), RGB, options);
+    ChannelConfig config(spiConfig, fl::span<CRGB>(workspace, NUM_LEDS), BGR, options);
     auto channel = Channel::create(config);
     FL_CHECK(channel != nullptr);
 
@@ -252,6 +263,52 @@ FL_TEST_CASE("Serpentine 2x2 with WS2812 GRB encodes pixels in expected byte ord
     }
 }
 
+FL_TEST_CASE("[#1009] Channels sharing one CRGB array keep independent color orders") {
+    CRGB leds[] = {
+        CRGB(0x11, 0x22, 0x33),
+        CRGB(0x44, 0x55, 0x66),
+        CRGB(0x77, 0x88, 0x99),
+        CRGB(0xaa, 0xbb, 0xcc),
+    };
+
+    auto mockEngine = fl::make_shared<ByteCapturingMockEngine>("MIXED_ORDER_CAPTURE");
+    ChannelManager& manager = ChannelManager::instance();
+    manager.addDriver(2002, mockEngine);
+    auto driverCleanup = fl::make_scope_exit([&]() {
+        manager.removeDriver(mockEngine);
+    });
+
+    const auto timing = makeTimingConfig<TIMING_WS2812_800KHZ>();
+    ChannelOptions options;
+    auto rgbChannel = Channel::create(
+        ChannelConfig(13, timing, fl::span<CRGB>(leds, 2), RGB, options));
+    auto grbChannel = Channel::create(
+        ChannelConfig(14, timing, fl::span<CRGB>(leds + 2, 2), GRB, options));
+    FL_REQUIRE_TRUE(rgbChannel != nullptr);
+    FL_REQUIRE_TRUE(grbChannel != nullptr);
+
+    auto channelCleanup = fl::make_scope_exit([&]() {
+        FastLED.remove(rgbChannel);
+        FastLED.remove(grbChannel);
+    });
+
+    FastLED.add(rgbChannel);
+    FastLED.add(grbChannel);
+    mockEngine->mCapturedChannels.clear();
+    FastLED.show();
+
+    FL_REQUIRE_EQ(mockEngine->mCapturedChannels.size(), 2);
+    const ChannelDataPtr& rgbData = mockEngine->mCapturedChannels[0];
+    const ChannelDataPtr& grbData = mockEngine->mCapturedChannels[1];
+    FL_REQUIRE_EQ(rgbData->getPin(), 13);
+    FL_REQUIRE_EQ(grbData->getPin(), 14);
+
+    FL_CHECK_EQ(rgbData->getData(),
+                fl::vector<u8>({0x11, 0x22, 0x33, 0x44, 0x55, 0x66}));
+    FL_CHECK_EQ(grbData->getData(),
+                fl::vector<u8>({0x88, 0x77, 0x99, 0xbb, 0xaa, 0xcc}));
+}
+
 FL_TEST_CASE("XMap reverse addressing with APA102 encodes pixels in reverse order") {
     const int NUM_LEDS = 4;
 
@@ -272,7 +329,7 @@ FL_TEST_CASE("XMap reverse addressing with APA102 encodes pixels in reverse orde
     SpiChipsetConfig spiConfig{5, 6, encoder};
     ChannelOptions options;
 
-    ChannelConfig config(spiConfig, fl::span<CRGB>(workspace, NUM_LEDS), RGB, options);
+    ChannelConfig config(spiConfig, fl::span<CRGB>(workspace, NUM_LEDS), BGR, options);
     auto channel = Channel::create(config);
     FL_CHECK(channel != nullptr);
 
@@ -343,8 +400,8 @@ FL_TEST_CASE("XMap reverse addressing with APA102 encodes pixels in reverse orde
 }
 
 // ============ Bus-template API tests (#2428 / #2167) ============
-// Verify Channel::create<Bus::STUB>(cfg) and FastLED.add<Bus::STUB>(cfg)
-// on the host build (FL_IS_STUB).  Tests run against the real STUB driver —
+// Verify Channel::create<Bus::BIT_BANG>(cfg) and FastLED.add<Bus::BIT_BANG>(cfg)
+// on the host build (FL_IS_STUB).  Tests run against the real BIT_BANG driver —
 // no mocks needed.
 
 namespace {
@@ -371,7 +428,7 @@ ChannelConfig makeBusTestConfig(fl::span<CRGB> leds) {
 // to `busName(mBus)`. `Bus::AUTO` (the default) falls through to the
 // string-affinity escape hatch / priority dispatch.
 
-FL_TEST_CASE("cfg.options.mBus = Bus::STUB binds the STUB driver on host") {
+FL_TEST_CASE("cfg.options.mBus = Bus::BIT_BANG binds the BIT_BANG driver on host") {
     auto& mgr = freshBusTestManager();
     FL_REQUIRE(mgr.getDriverCount() == 0);
 
@@ -380,20 +437,46 @@ FL_TEST_CASE("cfg.options.mBus = Bus::STUB binds the STUB driver on host") {
 
     CRGB leds[8] = {};
     ChannelConfig cfg = makeBusTestConfig(fl::span<CRGB>(leds, 8));
-    cfg.options.mBus = Bus::STUB;
+    cfg.options.mBus = Bus::BIT_BANG;
 
     auto channel = Channel::create(cfg);
     FL_REQUIRE(channel != nullptr);
     channel->addToDrawList();
     channel->showLeds(0);
 
-    FL_CHECK_EQ(channel->getEngineName(), fl::string::from_literal("STUB"));
+    FL_CHECK_EQ(channel->getEngineName(), fl::string::from_literal("BIT_BANG"));
 
-    auto stubDriver = mgr.getDriverByName(fl::string::from_literal("STUB"));
-    FL_REQUIRE(stubDriver != nullptr);
-    FL_CHECK_EQ(stubDriver.get(), &BusTraits<Bus::STUB>::instance());
+    auto bitbangDriver = mgr.getDriverByName(fl::string::from_literal("BIT_BANG"));
+    FL_REQUIRE(bitbangDriver != nullptr);
 
     channel->removeFromDrawList();
+}
+
+// `registerWithManager()` must register the BusTraits singleton itself, not a
+// freshly constructed driver of the same type -- a copy would collect state
+// nothing ever transmits.
+//
+// Asserted against a registration *this* translation unit performs. The
+// obvious form, comparing the driver `fl::enableAllDrivers()` registered
+// against `&BusTraits<Bus::BIT_BANG>::instance()`, is not portable:
+// `instancePtr()` keeps its singleton in a function-local static inside a
+// header, and `enableAllDrivers()` lives in the FastLED library image while
+// the expression above is evaluated in the test image. Where those are
+// separate modules the loader does not merge -- `fastled_lib` is a
+// `shared_library` and every test is another, so that is every Windows DLL
+// build -- each module holds its own copy and the pointers differ by
+// construction. That compares the harness's linkage, not the registration.
+FL_TEST_CASE("BusTraits::registerWithManager registers the singleton itself") {
+    auto& mgr = freshBusTestManager();
+    FL_REQUIRE(mgr.getDriverCount() == 0);
+
+    BusTraits<Bus::BIT_BANG>::registerWithManager();
+
+    auto cleanup = fl::make_scope_exit([&]() { mgr.clearAllDrivers(); });
+
+    auto registered = mgr.getDriverByName(fl::string::from_literal("BIT_BANG"));
+    FL_REQUIRE(registered != nullptr);
+    FL_CHECK_EQ(registered.get(), &BusTraits<Bus::BIT_BANG>::instance());
 }
 
 FL_TEST_CASE("mBus = Bus::AUTO falls back to priority dispatch") {
@@ -645,3 +728,769 @@ FL_TEST_CASE("[#2517] Re-enabling the driver resumes enqueue and re-arms the lat
     channel->showLeds(0);
     FL_CHECK_EQ(fakeDriver->enqueueCount, 2);
 }
+
+
+// ============ UCS7604 through the Channels encode path (#4326) ============
+// `tests/fl/chipsets/ucs7604.cpp` drives `testUCS7604Controller`, the legacy
+// `CLEDController` path. `fl::Channel`'s own `writeUCS7604` sits in an
+// anonymous namespace in `channel.cpp.hpp` and is reachable only through
+// `showPixels()`, so nothing observed what it puts on the wire.
+
+namespace {
+
+/// Records the encoded bytes of the last frame enqueued.
+class CapturingDriver : public IChannelDriver {
+public:
+    fl::vector<u8> last;
+    int frames = 0;
+
+    bool canHandle(const ChannelDataPtr& data) const override {
+        (void)data;
+        return true;
+    }
+    void enqueue(ChannelDataPtr channelData) override {
+        ++frames;
+        last.clear();
+        if (channelData) {
+            const auto& d = channelData->getData();
+            for (fl::size i = 0; i < d.size(); ++i) {
+                last.push_back(d[i]);
+            }
+        }
+    }
+    void show() override {}
+    DriverState poll() override { return DriverState::READY; }
+    fl::string getName() const override {
+        return fl::string::from_literal("UCS_CAPTURE");
+    }
+    Capabilities getCapabilities() const override { return Capabilities(true, true); }
+};
+
+constexpr EmitterProfile kProfile = EmitterProfile::rgb(
+    "fixture/ucs-4326",
+    Chromaticity(0.640f, 0.330f), Chromaticity(0.300f, 0.600f),
+    Chromaticity(0.150f, 0.060f), 1.0f, 1.0f, 1.0f);
+
+ClocklessChipset ucs16(int pin) {
+    auto timing = ChipsetTimingConfig(800, 450, 450, 50, "UCS7604");
+    return ClocklessChipset(pin, timing,
+                            ClocklessEncoder::CLOCKLESS_ENCODER_UCS7604_16BIT);
+}
+
+/// Encode one frame and hand back the bytes the driver saw.
+fl::vector<u8> encodeOnce(CRGB colour, bool bindProfile, float gamma, int pin) {
+    // Reset first: registrations leak across calls otherwise, and with several
+    // same-priority drivers alive the frame can land on one this call does not
+    // hold, which silently makes every comparison below meaningless.
+    auto& mgr = ChannelManager::instance();
+    mgr.clearAllDrivers();
+    auto driver = fl::make_shared<CapturingDriver>();
+    mgr.addDriver(9100, driver);
+    // And take it back out on the way home. Leaving UCS_CAPTURE registered
+    // lets a later test select it, or trip a zero-driver precondition, in a
+    // way that depends on case order -- which is how the gamma assertion in
+    // this block first went wrong.
+    auto cleanup = fl::make_scope_exit([&mgr]() { mgr.clearAllDrivers(); });
+
+    CRGB leds[1] = {colour};
+    ChannelOptions options;
+    // Dither off explicitly. With it on, a temporal step can carry 127 to 128
+    // and the gamma assertion below moves with the frame -- which is exactly
+    // what happened when these cases were first written in a file of their
+    // own and then moved next to neighbours that leave dithering enabled.
+    options.mDitherMode = DISABLE_DITHER;
+    options.mGamma = gamma;
+    if (bindProfile) {
+        // Note this also resets mGamma, mCorrection, mTemperature and
+        // mDitherMode -- see the gamma case below.
+        options.setColorProfile(kProfile, SourceProfile::linearSrgb());
+    }
+    ChannelConfig config(ucs16(pin), fl::span<CRGB>(leds, 1), RGB, options);
+    ChannelPtr channel = Channel::create(config);
+    if (channel) {
+        channel->showLeds(255);
+    }
+    return driver->last;
+}
+
+}  // namespace
+
+FL_TEST_CASE("[#4326] the Channels UCS7604 path encodes a frame at all") {
+    // The floor this file exists to lay down. `tests/fl/chipsets/ucs7604.cpp`
+    // drives the legacy CLEDController; `fl::Channel`'s writeUCS7604 lives in
+    // an anonymous namespace and is reachable only through showPixels(), so
+    // nothing observed it. If this stops producing bytes the cases below stop
+    // meaning anything.
+    fl::vector<u8> out = encodeOnce(CRGB(127, 0, 0), false, 2.8f, 11);
+    FL_REQUIRE_GT((int)out.size(), 0);
+
+    // 15-byte preamble, then RGB16 big-endian. Gamma 2.8 of 127 is the value
+    // the legacy path produces too, so this pins the whole chain rather than
+    // just "some bytes came out".
+    FL_REQUIRE_GT((int)out.size(), 16);
+    const int r16 = (out[15] << 8) | out[16];
+    FL_CHECK_EQ(r16, (int)fl::gamma_2_8(127));
+}
+
+FL_TEST_CASE("[#4326] gamma reaches the encoder when no profile is bound") {
+    // Legacy behaviour, and correct: an unmanaged channel is meant to be
+    // shaped by mGamma. This is also the positive control for the case below
+    // -- without it, "gamma does not vary the output once a profile binds"
+    // could be satisfied by an encoder that ignores gamma entirely.
+    fl::vector<u8> a = encodeOnce(CRGB(127, 0, 0), false, 2.8f, 12);
+    fl::vector<u8> b = encodeOnce(CRGB(127, 0, 0), false, 1.6f, 13);
+
+    FL_REQUIRE_GT((int)a.size(), 16);
+    FL_REQUIRE_EQ((int)a.size(), (int)b.size());
+    FL_CHECK_NE((int)((a[15] << 8) | a[16]), (int)((b[15] << 8) | b[16]));
+}
+
+FL_TEST_CASE("[#4326] binding a profile clears the caller's gamma") {
+    // ChannelOptions::setColorProfile() resets mGamma alongside mCorrection,
+    // mTemperature and mDitherMode (options.h). Pinned here because it is the
+    // half of the managed-mode exclusion policy that #4156 R9 asked for and
+    // it had no test: two channels that differ only in the gamma they asked
+    // for produce identical bytes once a profile is bound.
+    fl::vector<u8> a = encodeOnce(CRGB(127, 0, 0), true, 2.8f, 14);
+    fl::vector<u8> b = encodeOnce(CRGB(127, 0, 0), true, 1.6f, 15);
+
+    FL_REQUIRE_GT((int)a.size(), 0);
+    FL_REQUIRE_EQ((int)a.size(), (int)b.size());
+    for (fl::size i = 0; i < a.size(); ++i) {
+        FL_CHECK_EQ((int)a[i], (int)b[i]);
+    }
+}
+
+FL_TEST_CASE("[#4326] a bound profile reaches the encode path") {
+    // The name has to be earned: this encodes, rather than only checking that
+    // the channel owns a profile. What it pins is that the binding changes
+    // what goes on the wire -- the same pixel through the same encoder, bound
+    // and unbound, does not produce the same bytes.
+    //
+    // Whether the 2.8 that `mGamma.value_or(2.8f)` falls back to should give
+    // way to identity once the device solve runs is #4326's remaining half.
+    fl::vector<u8> bound = encodeOnce(CRGB(127, 0, 0), true, 2.8f, 16);
+    fl::vector<u8> unbound = encodeOnce(CRGB(127, 0, 0), false, 2.8f, 17);
+
+    FL_REQUIRE_GT((int)bound.size(), 16);
+    FL_REQUIRE_EQ((int)bound.size(), (int)unbound.size());
+
+    bool differs = false;
+    for (fl::size k = 0; k < bound.size(); ++k) {
+        if (bound[k] != unbound[k]) { differs = true; }
+    }
+    FL_CHECK(differs);
+
+    // And specifically in the payload rather than only in the preamble, so a
+    // difference in current-control bytes could not satisfy it.
+    FL_CHECK_NE((int)((bound[15] << 8) | bound[16]),
+                (int)((unbound[15] << 8) | unbound[16]));
+
+    // Deliberately no isColorManaged() assertion. That accessor was a
+    // hardcoded constant when this file was written; #4328/#4329 give it real
+    // semantics, and pinning its old value here would only have made
+    // whichever of the two landed second fail.
+}
+
+
+FL_TEST_CASE("[#4326] the managed path puts the device drive on the wire") {
+    // This case used to assert the defect. It read 849 and said so, and said
+    // it was written to fail when #4326 was fixed. This is that failure,
+    // turned into the statement of the fix.
+    //
+    // `kProfile` gives all three emitters luminance 1.0 at sRGB
+    // chromaticities, and the source is linear sRGB. Full red is therefore a
+    // target of Y = 0.2126 -- sRGB red's luminance share -- against an emitter
+    // making Y = 1.0 at full drive, so the device solve's answer is a red
+    // drive of 0.2126. That is where the pipeline's job ends, and a 16-bit
+    // encoder should put 0.2126 * 65535 = 13933 on the wire.
+    //
+    // It used to put 849: the drive narrowed to 8 bits (0.2126 * 255 = 54)
+    // and then widened by the gamma-2.8 LUT, (54/255)^2.8 * 65535 = 849.
+    // Both halves of #4326 in one number -- the 8-bit round trip, and the
+    // second shaping stage B1/§6 forbid after the device solve.
+    fl::vector<u8> bound = encodeOnce(CRGB(255, 0, 0), true, 2.8f, 20);
+    FL_REQUIRE_EQ((int)bound.size(), 21);
+
+    const int red16 = (bound[15] << 8) | bound[16];
+
+    // Within rounding of the drive itself. Two counts of 65535, which is the
+    // s16.16 drive and `quantize16` each rounding once -- a single
+    // quantization, which is what B3 asks for.
+    FL_CHECK_GT(red16, 13900);
+    FL_CHECK_LT(red16, 13970);
+
+    // And specifically not the old value, so a regression that restored the
+    // gamma stage could not pass the bounds above by coincidence.
+    FL_CHECK_NE(red16, 849);
+
+    // Black still encodes to black.
+    fl::vector<u8> black = encodeOnce(CRGB(0, 0, 0), true, 2.8f, 20);
+    FL_REQUIRE_EQ((int)black.size(), 21);
+    FL_CHECK_EQ((int)((black[15] << 8) | black[16]), 0);
+
+    // The unbound path is untouched: it has no device drive to carry, its
+    // pixels are 8-bit, and the gamma there is the legacy behaviour rather
+    // than a second stage. The resolution case below measures what that
+    // costs; this one is only about the managed path.
+    fl::vector<u8> unbound = encodeOnce(CRGB(255, 0, 0), false, 2.8f, 20);
+    FL_REQUIRE_EQ((int)unbound.size(), 21);
+    FL_CHECK_EQ((int)((unbound[15] << 8) | unbound[16]), 65535);
+}
+
+FL_TEST_CASE("[#4326] the 16-bit encoder reaches 252 of 65536 levels") {
+    // P8 also owns "encoders consume wide output directly -- no RGB8
+    // correction round-trip". #4326 states the consequence without a number:
+    // the native 16-bit chipsets "reach at most 256 distinct levels per
+    // channel out of 65536".
+    //
+    // Measured on the unbound path, where the 8-bit-plus-gamma chain is the
+    // legacy behaviour and correct, so this is the resolution the encoder
+    // itself has rather than a managed-mode defect: 252 distinct values from
+    // the 256 source codes -- four pairs collide in the gamma LUT -- and the
+    // widest step between neighbours is 717 counts.
+    fl::vector<int> seen;
+    int previous = -1;
+    int widest_step = 0;
+    int top = -1;
+    for (int code = 0; code < 256; ++code) {
+        fl::vector<u8> out = encodeOnce(CRGB(code, 0, 0), false, 2.8f, 20);
+        FL_REQUIRE_EQ((int)out.size(), 21);
+        const int value = (out[15] << 8) | out[16];
+        bool found = false;
+        for (fl::size j = 0; j < seen.size(); ++j) {
+            if (seen[j] == value) { found = true; }
+        }
+        if (!found) { seen.push_back(value); }
+        if (previous >= 0 && value - previous > widest_step) {
+            widest_step = value - previous;
+        }
+        previous = value;
+        top = value;
+    }
+
+    FL_CHECK_EQ((int)seen.size(), 252);
+
+    // The endpoints are reached, so the range is used -- the loss is
+    // resolution inside it, not a squeezed scale.
+    FL_CHECK_EQ(top, 65535);
+
+    // And the coarseness, which is what "256 of 65536" costs in practice:
+    // near full scale, neighbouring source codes are 717 counts apart, so
+    // 716 of every 717 representable values are unreachable there.
+    FL_CHECK_EQ(widest_step, 717);
+}
+
+FL_TEST_CASE("[#4042] the wide path is monotonic and keeps its low-light levels") {
+    // P8 owns "native 16-bit encoders consume wide output; monotonic;
+    // low-light resolution". #4368 did the first clause; this measures the
+    // other two, on the UCS7604-16 path, against the legacy path beside it.
+    //
+    // Both are swept over all 256 source codes. What differs is what reaches
+    // the encoder: the managed path carries the device drive at 16 bits, the
+    // unbound one carries an 8-bit pixel that a gamma LUT widens.
+    int previous_managed = -1;
+    int previous_legacy = -1;
+    int backwards_managed = 0;
+    int backwards_legacy = 0;
+    fl::vector<int> managed_low;
+    fl::vector<int> legacy_low;
+    fl::vector<int> managed_all;
+    fl::vector<int> legacy_all;
+
+    for (int code = 0; code < 256; ++code) {
+        fl::vector<u8> managed = encodeOnce(CRGB(code, 0, 0), true, 2.8f, 40);
+        fl::vector<u8> legacy = encodeOnce(CRGB(code, 0, 0), false, 2.8f, 40);
+        FL_REQUIRE_EQ((int)managed.size(), 21);
+        FL_REQUIRE_EQ((int)legacy.size(), 21);
+        const int m = (managed[15] << 8) | managed[16];
+        const int l = (legacy[15] << 8) | legacy[16];
+
+        if (previous_managed >= 0 && m < previous_managed) { ++backwards_managed; }
+        if (previous_legacy >= 0 && l < previous_legacy) { ++backwards_legacy; }
+        previous_managed = m;
+        previous_legacy = l;
+
+        bool seen_m = false;
+        for (fl::size j = 0; j < managed_all.size(); ++j) {
+            if (managed_all[j] == m) { seen_m = true; }
+        }
+        if (!seen_m) { managed_all.push_back(m); }
+        bool seen_l = false;
+        for (fl::size j = 0; j < legacy_all.size(); ++j) {
+            if (legacy_all[j] == l) { seen_l = true; }
+        }
+        if (!seen_l) { legacy_all.push_back(l); }
+
+        if (code < 32) {
+            bool low_m = false;
+            for (fl::size j = 0; j < managed_low.size(); ++j) {
+                if (managed_low[j] == m) { low_m = true; }
+            }
+            if (!low_m) { managed_low.push_back(m); }
+            bool low_l = false;
+            for (fl::size j = 0; j < legacy_low.size(); ++j) {
+                if (legacy_low[j] == l) { low_l = true; }
+            }
+            if (!low_l) { legacy_low.push_back(l); }
+        }
+    }
+
+    // Monotonic, on both paths. A rising source code must never lower the
+    // emitted value -- that is the property, and neither path violates it.
+    FL_CHECK_EQ(backwards_managed, 0);
+    FL_CHECK_EQ(backwards_legacy, 0);
+
+    // Low-light resolution, which is where the two part company. In the
+    // bottom 32 codes the managed path keeps every one distinguishable;
+    // the gamma LUT collapses four pairs, so four inputs that differ produce
+    // bytes that do not.
+    FL_CHECK_EQ((int)managed_low.size(), 32);
+    FL_CHECK_EQ((int)legacy_low.size(), 28);
+
+    // Across the whole range the same gap: 256 against 252. Worth stating
+    // plainly -- this is not more *reachable* levels, since an 8-bit CRGB can
+    // only ask for 256 things. It is that none of them are lost on the way
+    // out. A wide source (.fled rgb16_linear) is what turns the 16-bit wire
+    // into more than 256 levels; this is the half that stops throwing them
+    // away first.
+    FL_CHECK_EQ((int)managed_all.size(), 256);
+    FL_CHECK_EQ((int)legacy_all.size(), 252);
+}
+
+// ============ HD108 through the Channels encode path (#4326 / #4042) ============
+// The other native 16-bit chipset. #4326 called it "the same shape and worse":
+// `hd108GammaCorrect` is a hardcoded 2.8 inside the encoder, so unlike
+// UCS7604's `mGamma.value_or(2.8f)` no caller could ever have chosen
+// otherwise, and `writeHD108` took no settings at all -- the information
+// needed to suppress it was not in scope.
+
+namespace {
+
+/// Encode one HD108 frame through `fl::Channel` and hand back the bytes.
+fl::vector<u8> encodeHd108Once(CRGB colour, bool bindProfile, int pin) {
+    auto& mgr = ChannelManager::instance();
+    mgr.clearAllDrivers();
+    auto engine = fl::make_shared<ByteCapturingMockEngine>("HD108_CAPTURE");
+    mgr.addDriver(9200, engine);
+    auto cleanup = fl::make_scope_exit([&mgr]() { mgr.clearAllDrivers(); });
+
+    CRGB leds[1] = {colour};
+    ChannelOptions options;
+    options.mDitherMode = DISABLE_DITHER;
+    if (bindProfile) {
+        options.setColorProfile(kProfile, SourceProfile::linearSrgb());
+    }
+    SpiChipsetConfig spiConfig{pin, pin + 1, SpiEncoder::hd108()};
+    ChannelConfig config(spiConfig, fl::span<CRGB>(leds, 1), RGB, options);
+    ChannelPtr channel = Channel::create(config);
+    fl::vector<u8> out;
+    if (channel) {
+        channel->showLeds(255);
+        if (!engine->mCapturedChannels.empty()) {
+            ChannelDataPtr data = engine->mCapturedChannels[0];
+            if (data) {
+                for (fl::size i = 0; i < data->getData().size(); ++i) {
+                    out.push_back(data->getData()[i]);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+FL_TEST_CASE("[#4326] HD108 puts the device drive on the wire when managed") {
+    // Same fixture and reasoning as the UCS7604 case above: all three emitters
+    // at luminance 1.0 with sRGB chromaticities and a linear sRGB source, so
+    // full red is a target of Y = 0.2126 against an emitter making Y = 1.0 at
+    // full drive, and the solve's answer is a red drive of 0.2126. A 16-bit
+    // encoder consuming that should put 0.2126 * 65535 = 13933 on the wire.
+    fl::vector<u8> bound = encodeHd108Once(CRGB(255, 0, 0), true, 30);
+    fl::vector<u8> unbound = encodeHd108Once(CRGB(255, 0, 0), false, 32);
+
+    // 8 start bytes, then 2 brightness header bytes, then RGB16 big-endian.
+    FL_REQUIRE_GT((int)bound.size(), 16);
+    FL_REQUIRE_EQ((int)bound.size(), (int)unbound.size());
+
+    const int bound_red = (bound[10] << 8) | bound[11];
+    const int unbound_red = (unbound[10] << 8) | unbound[11];
+
+    // Managed: the drive itself, within rounding.
+    FL_CHECK_GT(bound_red, 13900);
+    FL_CHECK_LT(bound_red, 13970);
+
+    // Unbound is the legacy path and must be untouched by this change: the
+    // hardcoded 2.8 curve still widens its 8-bit pixel, which at full scale
+    // saturates.
+    FL_CHECK_EQ(unbound_red, 65535);
+
+    // And the two differ, so the branch is actually taken.
+    FL_CHECK_NE(bound_red, unbound_red);
+}
+
+FL_TEST_CASE("[#4326] HD108 black stays black on both paths") {
+    // The gamma curve maps 0 to 0, and so does the drive, so this is the
+    // control: a difference above can only be shaping, not an offset.
+    fl::vector<u8> bound = encodeHd108Once(CRGB(0, 0, 0), true, 34);
+    fl::vector<u8> unbound = encodeHd108Once(CRGB(0, 0, 0), false, 36);
+    FL_REQUIRE_GT((int)bound.size(), 16);
+    FL_REQUIRE_GT((int)unbound.size(), 16);
+    FL_CHECK_EQ((int)((bound[10] << 8) | bound[11]), 0);
+    FL_CHECK_EQ((int)((unbound[10] << 8) | unbound[11]), 0);
+}
+
+// ============ Legacy output with colour management disabled (#4034) ============
+// The tracker lists "Legacy output byte-identical with CM disabled" as an
+// acceptance criterion and nothing verified it. The colour pipeline reaches
+// into `showPixels` and into how the pixel iterator is built, so a change
+// there can alter output for every sketch that never asked for colour
+// management -- silently, because no managed test would notice.
+//
+// The observable form of "byte-identical" in one build is that an unbound
+// channel emits exactly the legacy arithmetic: colour order applied, each
+// channel scaled by brightness, and nothing else. Literals rather than a
+// recomputation, so this compares against a recorded answer instead of
+// against the same code that produced it.
+
+FL_TEST_CASE("[#4034] an unbound channel emits the legacy bytes exactly") {
+    struct Case {
+        const char* name;
+        EOrder order;
+        u8 brightness;
+        int expect[3];
+    };
+    // Source is CRGB(200, 100, 50) throughout.
+    const Case cases[] = {
+        {"full brightness is the identity",   RGB, 255, {200, 100, 50}},
+        {"half",                              RGB, 128, {100,  50, 25}},
+        {"quarter",                           RGB,  64, { 50,  25, 12}},
+        // scale8 with FASTLED_SCALE8_FIXED is (v * (b + 1)) >> 8, so the
+        // lowest brightness keeps a non-zero channel alive rather than
+        // rounding the whole pixel to black.
+        {"lowest brightness keeps red lit",   RGB,   1, {  1,   0,  0}},
+        // Colour order moves bytes and must not touch values.
+        {"GRB reorders without rescaling",    GRB, 255, {100, 200, 50}},
+        {"BGR reorders and scales",           BGR, 128, { 25,  50, 100}},
+    };
+
+    for (fl::size i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        FL_SUBCASE(cases[i].name) {
+            auto& mgr = ChannelManager::instance();
+            mgr.clearAllDrivers();
+            auto driver = fl::make_shared<CapturingDriver>();
+            mgr.addDriver(9300, driver);
+            auto cleanup = fl::make_scope_exit([&mgr]() { mgr.clearAllDrivers(); });
+
+            CRGB leds[1] = {CRGB(200, 100, 50)};
+            ChannelOptions options;
+            options.mDitherMode = DISABLE_DITHER;
+            auto timing = makeTimingConfig<TIMING_WS2812_800KHZ>();
+            ChannelConfig config(120 + (int)i, timing, fl::span<CRGB>(leds, 1),
+                                 cases[i].order, options);
+            ChannelPtr ch = Channel::create(config);
+            FL_REQUIRE(ch != nullptr);
+            FL_CHECK_FALSE(ch->hasColorProfile());
+            ch->showLeds(cases[i].brightness);
+
+            FL_REQUIRE_EQ((int)driver->last.size(), 3);
+            FL_CHECK_EQ((int)driver->last[0], cases[i].expect[0]);
+            FL_CHECK_EQ((int)driver->last[1], cases[i].expect[1]);
+            FL_CHECK_EQ((int)driver->last[2], cases[i].expect[2]);
+        }
+    }
+}
+
+FL_TEST_CASE("[#4034] unbound SPI chipsets emit their legacy frames exactly") {
+    // The same criterion across the clocked chipsets, whose encoders the
+    // colour pipeline also reaches (#4453's joint solve, #4456's narrow-wire
+    // path). Expected frames are derived by hand from each protocol, not
+    // captured from the code under test: source CRGB(200, 100, 50) in channel
+    // order RGB, scaled by scale8 (FASTLED_SCALE8_FIXED: (v * (b + 1)) >> 8)
+    // to (100, 50, 25) at brightness 128.
+    struct Case {
+        const char* name;
+        SpiEncoder encoder;
+        u8 brightness;
+        fl::vector<u8> expect;
+    };
+    auto bytes = [](fl::initializer_list<u8> list) { return fl::vector<u8>(list); };
+    const Case cases[] = {
+        // Start frame, 0xE0 | field 31, three codes, one all-ones end dword.
+        {"APA102 at full brightness", SpiEncoder::apa102(), 255,
+         bytes({0x00, 0x00, 0x00, 0x00, 0xFF, 200, 100, 50, 0xFF, 0xFF, 0xFF, 0xFF})},
+        {"APA102 at half", SpiEncoder::apa102(), 128,
+         bytes({0x00, 0x00, 0x00, 0x00, 0xFF, 100, 50, 25, 0xFF, 0xFF, 0xFF, 0xFF})},
+        {"SK9822 at full brightness", SpiEncoder::sk9822(), 255,
+         bytes({0x00, 0x00, 0x00, 0x00, 0xFF, 200, 100, 50, 0xFF, 0xFF, 0xFF, 0xFF})},
+        {"SK9822 at half", SpiEncoder::sk9822(), 128,
+         bytes({0x00, 0x00, 0x00, 0x00, 0xFF, 100, 50, 25, 0xFF, 0xFF, 0xFF, 0xFF})},
+        // Raw bytes, latched by the clock pausing.
+        {"WS2801 at full brightness", SpiEncoder::ws2801(), 255, bytes({200, 100, 50})},
+        {"WS2801 at half", SpiEncoder::ws2801(), 128, bytes({100, 50, 25})},
+        // 0x80 | (v >> 1), with the low bit forced on for lit values below 254;
+        // then (n * 3 + 63) / 64 zero latch bytes.
+        {"LPD8806 at full brightness", SpiEncoder::lpd8806(), 255, bytes({0xE5, 0xB3, 0x99, 0x00})},
+        {"LPD8806 at half", SpiEncoder::lpd8806(), 128, bytes({0xB3, 0x99, 0x8D, 0x00})},
+        // Four zero bytes, then 1rrrrrgggggbbbbb from the top five bits of each.
+        {"LPD6803 at full brightness", SpiEncoder::lpd6803(), 255,
+         bytes({0x00, 0x00, 0x00, 0x00, 0xE5, 0x86})},
+        {"LPD6803 at half", SpiEncoder::lpd6803(), 128,
+         bytes({0x00, 0x00, 0x00, 0x00, 0xB0, 0xC3})},
+    };
+
+    for (fl::size i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        FL_SUBCASE(cases[i].name) {
+            auto& mgr = ChannelManager::instance();
+            mgr.clearAllDrivers();
+            auto driver = fl::make_shared<CapturingDriver>();
+            mgr.addDriver(9300, driver);
+            auto cleanup = fl::make_scope_exit([&mgr]() { mgr.clearAllDrivers(); });
+
+            CRGB leds[1] = {CRGB(200, 100, 50)};
+            ChannelOptions options;
+            options.mDitherMode = DISABLE_DITHER;
+            ChannelConfig config(SpiChipsetConfig{5, 6, cases[i].encoder},
+                                 fl::span<CRGB>(leds, 1), RGB, options);
+            ChannelPtr ch = Channel::create(config);
+            FL_REQUIRE(ch != nullptr);
+            FL_CHECK_FALSE(ch->hasColorProfile());
+            ch->showLeds(cases[i].brightness);
+
+            FL_REQUIRE_EQ(driver->last.size(), cases[i].expect.size());
+            for (fl::size b = 0; b < cases[i].expect.size(); ++b) {
+                FL_CHECK_EQ((int)driver->last[b], (int)cases[i].expect[b]);
+            }
+        }
+    }
+}
+
+FL_TEST_CASE("[#4034] and binding a profile does change them") {
+    // The guard. Without it, the case above would pass just as well against a
+    // pipeline that had stopped doing anything at all -- which is the other
+    // way this criterion can be satisfied for the wrong reason.
+    auto& mgr = ChannelManager::instance();
+    mgr.clearAllDrivers();
+    auto driver = fl::make_shared<CapturingDriver>();
+    mgr.addDriver(9300, driver);
+    auto cleanup = fl::make_scope_exit([&mgr]() { mgr.clearAllDrivers(); });
+
+    CRGB leds[1] = {CRGB(200, 100, 50)};
+    ChannelOptions options;
+    options.mDitherMode = DISABLE_DITHER;
+    FL_REQUIRE(options.setColorProfile(kProfile, SourceProfile::linearSrgb()));
+    auto timing = makeTimingConfig<TIMING_WS2812_800KHZ>();
+    ChannelConfig config(126, timing, fl::span<CRGB>(leds, 1), RGB, options);
+    ChannelPtr ch = Channel::create(config);
+    FL_REQUIRE(ch != nullptr);
+    FL_REQUIRE(ch->isColorManaged());
+    ch->showLeds(255);
+
+    FL_REQUIRE_EQ((int)driver->last.size(), 3);
+    const bool same = driver->last[0] == 200 && driver->last[1] == 100 &&
+                      driver->last[2] == 50;
+    FL_CHECK_FALSE(same);
+}
+
+// ============ showPixels helper split parity (#4566) ============
+// `Channel::showPixels` became a dispatcher over waitForInUseBuffer(),
+// resolveDynamicDriver(), encodeFrame() and submitFrame(). These pin the
+// observable contract across that split: bytes, pixel format, one enqueue per
+// accepted frame, the enqueue event's driver name, and the dither phase moving
+// only when a driver accepts a frame.
+
+namespace {
+
+/// Show `pixels` once through a fresh dynamic channel bound to a fresh
+/// ByteCapturingMockEngine and return the encoded bytes.
+fl::vector<u8> showOnce4566(fl::span<CRGB> pixels, u8 brightness,
+                            const ChannelOptions& options) {
+    auto& mgr = ChannelManager::instance();
+    mgr.clearAllDrivers();
+    auto driver = fl::make_shared<ByteCapturingMockEngine>("PARITY_4566");
+    mgr.addDriver(9400, driver);
+    auto cleanup = fl::make_scope_exit([&mgr]() { mgr.clearAllDrivers(); });
+
+    auto timing = makeTimingConfig<TIMING_WS2812_800KHZ>();
+    ChannelPtr ch = Channel::create(ChannelConfig(140, timing, pixels, GRB, options));
+    fl::vector<u8> out;
+    if (!ch) {
+        return out;
+    }
+    ch->showLeds(brightness);
+    if (!driver->mCapturedChannels.empty()) {
+        const auto& d = driver->mCapturedChannels[0]->getData();
+        for (fl::size i = 0; i < d.size(); ++i) {
+            out.push_back(d[i]);
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+FL_TEST_CASE("[#4566] dynamic WS2812 channel encodes GRB and enqueues once per show") {
+    auto& mgr = ChannelManager::instance();
+    mgr.clearAllDrivers();
+    auto driver = fl::make_shared<ByteCapturingMockEngine>("PARITY_4566_A");
+    mgr.addDriver(9400, driver);
+
+    int enqueueEvents = 0;
+    fl::string lastEngine;
+    auto& events = ChannelEvents::instance();
+    int listenerId = events.onChannelEnqueued.add(
+        [&](const IChannel& ch, const fl::string& engineName) {
+            (void)ch;
+            ++enqueueEvents;
+            lastEngine = engineName;
+        });
+    auto cleanup = fl::make_scope_exit([&]() {
+        events.onChannelEnqueued.remove(listenerId);
+        mgr.clearAllDrivers();
+    });
+
+    CRGB leds[2] = {CRGB(200, 100, 50), CRGB(1, 2, 3)};
+    ChannelOptions options;
+    options.mDitherMode = DISABLE_DITHER;
+    auto timing = makeTimingConfig<TIMING_WS2812_800KHZ>();
+    ChannelPtr ch = Channel::create(
+        ChannelConfig(141, timing, fl::span<CRGB>(leds, 2), GRB, options));
+    FL_REQUIRE(ch != nullptr);
+
+    ch->showLeds(255);
+    FL_REQUIRE_EQ(driver->mCapturedChannels.size(), 1);
+    FL_CHECK_EQ(enqueueEvents, 1);
+    FL_CHECK_EQ(lastEngine, fl::string::from_literal("PARITY_4566_A"));
+    FL_CHECK(driver->mCapturedChannels[0]->getPixelFormat() == ChannelPixelFormat::RGB);
+    FL_CHECK_EQ(driver->mCapturedChannels[0]->getData(),
+                fl::vector<u8>({100, 200, 50, 2, 1, 3}));
+
+    // Dynamic path re-resolves every frame and still enqueues exactly once.
+    ch->showLeds(255);
+    FL_CHECK_EQ(driver->mCapturedChannels.size(), 2);
+    FL_CHECK_EQ(enqueueEvents, 2);
+    FL_CHECK_EQ(ch->getEngineName(), fl::string::from_literal("PARITY_4566_A"));
+}
+
+FL_TEST_CASE("[#4566] identical pixels produce identical bytes across fresh channels") {
+    CRGB a[3] = {CRGB(10, 20, 30), CRGB(255, 0, 128), CRGB(7, 7, 7)};
+    CRGB b[3] = {CRGB(10, 20, 30), CRGB(255, 0, 128), CRGB(7, 7, 7)};
+    ChannelOptions options;
+    options.mDitherMode = DISABLE_DITHER;
+    fl::vector<u8> first = showOnce4566(fl::span<CRGB>(a, 3), 200, options);
+    fl::vector<u8> second = showOnce4566(fl::span<CRGB>(b, 3), 200, options);
+    FL_REQUIRE_EQ((int)first.size(), 9);
+    FL_CHECK_EQ(first, second);
+}
+
+FL_TEST_CASE("[#4566] an RGBW channel reports RGBW and emits 4 bytes per pixel") {
+    auto& mgr = ChannelManager::instance();
+    mgr.clearAllDrivers();
+    auto driver = fl::make_shared<ByteCapturingMockEngine>("PARITY_4566_RGBW");
+    mgr.addDriver(9400, driver);
+    auto cleanup = fl::make_scope_exit([&mgr]() { mgr.clearAllDrivers(); });
+
+    CRGB leds[2] = {CRGB(200, 100, 50), CRGB(0, 0, 0)};
+    ChannelOptions options;
+    options.mDitherMode = DISABLE_DITHER;
+    options.mWhiteCfg = Rgbw(fl::kRGBWDefaultColorTemp, fl::RGBW_MODE::kRGBWExactColors);
+    FL_REQUIRE(options.isRgbw());
+    auto timing = makeTimingConfig<TIMING_WS2812_800KHZ>();
+    ChannelPtr ch = Channel::create(
+        ChannelConfig(142, timing, fl::span<CRGB>(leds, 2), RGB, options));
+    FL_REQUIRE(ch != nullptr);
+    ch->showLeds(255);
+
+    FL_REQUIRE_EQ(driver->mCapturedChannels.size(), 1);
+    const auto& data = driver->mCapturedChannels[0];
+    FL_CHECK(data->getPixelFormat() == ChannelPixelFormat::RGBW);
+    FL_CHECK_EQ((int)data->getData().size(), 8);
+}
+
+FL_TEST_CASE("[#4566] no resolvable driver: no enqueue and dither phase holds") {
+    auto& mgr = ChannelManager::instance();
+    mgr.clearAllDrivers();
+    auto cleanup = fl::make_scope_exit([&mgr]() { mgr.clearAllDrivers(); });
+
+    // Default options keep dithering on, so a consumed phase would show up
+    // in the bytes of the next accepted frame.
+    CRGB leds[2] = {CRGB(201, 99, 37), CRGB(3, 130, 77)};
+    ChannelOptions options;
+    auto timing = makeTimingConfig<TIMING_WS2812_800KHZ>();
+    ChannelPtr ch = Channel::create(
+        ChannelConfig(140, timing, fl::span<CRGB>(leds, 2), GRB, options));
+    FL_REQUIRE(ch != nullptr);
+
+    const u8 phaseBefore = ch->ditherPhase();
+    ch->showLeds(100);  // No driver registered: frame is dropped.
+    FL_CHECK_EQ((int)ch->ditherPhase(), (int)phaseBefore);
+
+    auto driver = fl::make_shared<ByteCapturingMockEngine>("PARITY_4566");
+    mgr.addDriver(9400, driver);
+    ch->showLeds(100);
+    FL_REQUIRE_EQ(driver->mCapturedChannels.size(), 1);
+    FL_CHECK_EQ((int)ch->ditherPhase(), (int)(u8)(phaseBefore + 1));
+    fl::vector<u8> got;
+    const auto& d = driver->mCapturedChannels[0]->getData();
+    for (fl::size i = 0; i < d.size(); ++i) {
+        got.push_back(d[i]);
+    }
+    ch.reset();
+
+    // A fresh channel's first accepted frame must match byte-for-byte.
+    CRGB fresh[2] = {CRGB(201, 99, 37), CRGB(3, 130, 77)};
+    fl::vector<u8> expected = showOnce4566(fl::span<CRGB>(fresh, 2), 100, options);
+    FL_CHECK_EQ(got, expected);
+}
+
+FL_TEST_CASE("[#4566] a pre-bound mBus channel matches the dynamic path byte-for-byte") {
+    CRGB leds[2] = {CRGB(200, 100, 50), CRGB(1, 2, 3)};
+    ChannelOptions options;
+    options.mDitherMode = DISABLE_DITHER;
+
+    // Dynamic (AUTO) reference bytes for the same pixels.
+    CRGB ref[2] = {CRGB(200, 100, 50), CRGB(1, 2, 3)};
+    fl::vector<u8> expected = showOnce4566(fl::span<CRGB>(ref, 2), 255, options);
+    FL_REQUIRE_EQ(expected, fl::vector<u8>({100, 200, 50, 2, 1, 3}));
+
+    // Pre-bound: a capturing driver registered under the RMT bus name, with
+    // the channel pinned to Bus::RMT so selection takes the typed path.
+    auto& mgr = ChannelManager::instance();
+    mgr.clearAllDrivers();
+    auto driver = fl::make_shared<ByteCapturingMockEngine>("RMT");
+    mgr.addDriver(9400, driver);
+
+    int enqueueEvents = 0;
+    fl::string lastEngine;
+    auto& events = ChannelEvents::instance();
+    int listenerId = events.onChannelEnqueued.add(
+        [&](const IChannel& ch, const fl::string& engineName) {
+            (void)ch;
+            ++enqueueEvents;
+            lastEngine = engineName;
+        });
+    auto cleanup = fl::make_scope_exit([&]() {
+        events.onChannelEnqueued.remove(listenerId);
+        mgr.clearAllDrivers();
+    });
+
+    options.mBus = Bus::RMT;
+    auto timing = makeTimingConfig<TIMING_WS2812_800KHZ>();
+    ChannelPtr ch = Channel::create(
+        ChannelConfig(143, timing, fl::span<CRGB>(leds, 2), GRB, options));
+    FL_REQUIRE(ch != nullptr);
+
+    ch->showLeds(255);
+    FL_REQUIRE_EQ(driver->mCapturedChannels.size(), 1);
+    FL_CHECK_EQ(enqueueEvents, 1);
+    FL_CHECK_EQ(lastEngine, fl::string::from_literal("RMT"));
+    FL_CHECK_EQ(ch->getEngineName(), fl::string::from_literal("RMT"));
+    FL_CHECK_EQ(driver->mCapturedChannels[0]->getData(), expected);
+
+    ch->showLeds(255);
+    FL_CHECK_EQ(driver->mCapturedChannels.size(), 2);
+    FL_CHECK_EQ(enqueueEvents, 2);
+}
+
+}  // FL_TEST_FILE

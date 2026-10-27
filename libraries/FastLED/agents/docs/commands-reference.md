@@ -2,50 +2,23 @@
 
 Detailed reference for all build, test, and development commands. For quick reference, see the Key Commands section in `CLAUDE.md`.
 
-## Docker Testing (Linux Environment)
+## Docker Testing (retired)
 
-Run tests inside a Docker container for consistent Linux environment with ASAN/LSAN sanitizers:
-
-```bash
-# Run all C++ tests in Docker (implies --debug with sanitizers)
-bash test --docker
-
-# Run specific unit test in Docker
-bash test --docker tests/fl/async
-
-# Run with quick mode (no sanitizers, faster)
-bash test --docker --quick
-
-# Run with release mode (optimized)
-bash test --docker --build-mode release
-
-# Run only unit tests
-bash test --docker --unit
-
-# Run only examples
-bash test --docker --examples
-```
-
-**Notes:**
-- `--docker` implies `--debug` mode (ASAN/LSAN sanitizers enabled) unless `--quick` or `--build-mode` is specified
-- First run downloads Docker image and Python packages (cached for subsequent runs)
-- Uses named volumes for `.venv` and `.build` to persist between runs
-
-**AI AGENTS: Avoid `bash test --docker` unless necessary** — Docker testing is slow (3-5 minutes per test). Use `bash test` for quick local testing. Only use Docker when:
-- You need Linux-specific sanitizers (ASAN/LSAN) that aren't working locally
-- Reproducing CI failures that only occur in the Linux environment
-- Testing cross-platform compatibility issues
+`bash test --docker` was retired along with the host `docker/unit-tests` image.
+C++ tests run natively via Meson — `bash test --debug` still enables
+ASAN/LSAN/UBSAN on any host that ships them. To reproduce a Linux-specific CI
+failure on Windows, use WSL2 rather than Docker.
 
 ## fbuild (Default for Board Builds)
 
-The project uses `fbuild` as the build system for all board compiles. New board targets must take the fbuild path by default; do not add board allowlists or PlatformIO fallbacks for board compatibility issues. Fix those in fbuild instead.
+The project uses `fbuild` as the build system for all board compiles. New board targets must take the fbuild path by default; do not add board allowlists or legacy-backend fallbacks for board compatibility issues. Fix those in fbuild instead.
 
 File board build compatibility problems at https://github.com/FastLED/fbuild/issues.
 
 fbuild provides:
 - **Daemon-based compilation** — Background process handles builds, survives agent interrupts
 - **Cached toolchains/frameworks** — Downloads and caches ESP32 toolchain, Arduino framework
-- **Direct esptool integration** — Fast uploads without PlatformIO overhead
+- **Direct esptool integration** - Fast uploads with no extra tooling layer
 
 **Default behavior:**
 - **All boards**: fbuild is used by default
@@ -101,7 +74,7 @@ FastLED supports fast host-based compilation of `.ino` examples using Meson buil
 All three modes use separate build directories (no cache conflicts, can coexist simultaneously).
 
 **Performance Notes:**
-- Host compilation is 60x+ faster than PlatformIO (2.2s vs 137s for single example)
+- Host compilation is 60x+ faster than a board build (2.2s vs 137s for single example)
 - All 80 examples compile in ~0.24s with PCH caching in quick/release modes
 - Examples execute with limited loop iterations (5 loops) for fast testing
 
@@ -131,18 +104,19 @@ bash run wasm Blink            # Opens browser automatically
 `bash profile <function>` — Generate profiler and run performance benchmarks:
 
 ```bash
-# Profile a function (local build, 20 iterations)
+# Profile a function (native local build, 20 iterations)
 bash profile sincos16
 
-# Profile in Docker (consistent environment, recommended)
-bash profile sincos16 --docker
-
 # More iterations for better statistics
-bash profile sincos16 --docker --iterations 50
+bash profile sincos16 --iterations 50
 
-# With callgrind analysis (slower, detailed hotspots)
-bash profile sincos16 --docker --callgrind
+# With callgrind analysis (slower, detailed hotspots; Linux/WSL2 only)
+bash profile sincos16 --callgrind
 ```
+
+The `--docker` flag was retired along with the host `fastled-unit-tests` image
+in the platform-Docker sweep — profiling is native. Callgrind still requires a
+Linux host (WSL2 works on Windows).
 
 **What it does:**
 1. **Generate profiler** — Creates `tests/profile/profile_<function>.cpp` from template
@@ -152,11 +126,10 @@ bash profile sincos16 --docker --callgrind
 5. **Export for AI** — Creates `profile_<function>_results.ai.json` for AI consumption
 
 **Options:**
-- `--docker` — Run in Docker (consistent Linux environment, recommended)
 - `--iterations N` — Number of benchmark runs (default: 20)
 - `--build-mode MODE` — Build mode: quick, debug, release, profile (default: release)
 - `--no-generate` — Skip test generation (use existing profiler)
-- `--callgrind` — Run valgrind callgrind analysis (requires valgrind)
+- `--callgrind` — Run valgrind callgrind analysis (requires valgrind on Linux/WSL2)
 
 **Output Files:**
 - `tests/profile/profile_<function>.cpp` — Generated profiler source (template, needs customization)

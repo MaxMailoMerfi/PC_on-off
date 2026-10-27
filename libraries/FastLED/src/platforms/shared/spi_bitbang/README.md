@@ -420,24 +420,6 @@ For detailed hardware octal-SPI information, see:
 3. **Fallback**: When hardware SPI unavailable
 4. **Low-level debugging**: Inspect GPIO events with ring buffer
 
-## 📋 Test Running Environment (QEMU)
-
-### QEMU RISC-V Testing
-
-To test examples in QEMU:
-
-```bash
-# Install QEMU for ESP32 (one-time setup)
-uv run ci/install-qemu.py
-
-# Run example in QEMU
-uv run test.py --qemu esp32c3 Esp32C3_SingleSPI_ISR
-uv run test.py --qemu esp32c3 Esp32C3_DualSPI_ISR
-uv run test.py --qemu esp32c3 Esp32C3_QuadSPI_ISR
-```
-
-Examples produce serial output that can be regex-matched for pass/fail validation.
-
 ## 📚 Additional Documentation
 
 - **`LOOP.md`** (project root) - Project iteration loop and task tracking

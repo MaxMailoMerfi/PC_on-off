@@ -165,8 +165,7 @@ private:
     u8 mData3Pin;
 
     // DMA buffer management
-    fl::span<u8> mDMABuffer;    // Allocated DMA buffer (interleaved format for quad-lane)
-    size_t mMaxBytesPerLane;         // Max bytes per lane we've allocated for
+    DMABuffer mDMABuffer;       // Owned DMA buffer (interleaved format for quad-lane)
     size_t mCurrentTotalSize;        // Current transmission size (bytes_per_lane * num_lanes)
     bool mBufferAcquired;
 
@@ -190,7 +189,6 @@ SPIQuadSAMD51::SPIQuadSAMD51(int bus_id, const char* name)
     , mData2Pin(0)
     , mData3Pin(0)
     , mDMABuffer()
-    , mMaxBytesPerLane(0)
     , mCurrentTotalSize(0)
     , mBufferAcquired(false) {
 }
@@ -229,6 +227,16 @@ bool SPIQuadSAMD51::begin(const SpiHw4::Config& config) {
     if (config.data1_pin >= 0) mActiveLanes++;
     if (config.data2_pin >= 0) mActiveLanes++;
     if (config.data3_pin >= 0) mActiveLanes++;
+
+    // QSPI supports single, dual, or quad widths. It cannot represent three
+    // independent lanes, and active data pins must form a contiguous prefix.
+    const bool pins_are_contiguous =
+        (config.data2_pin < 0 || config.data1_pin >= 0) &&
+        (config.data3_pin < 0 || config.data2_pin >= 0);
+    if (!pins_are_contiguous || mActiveLanes == 3) {
+        FL_WARN("SPIQuadSAMD51: QSPI requires 1, 2, or 4 contiguous data lanes");
+        return false;
+    }
 
     // Configure QSPI peripheral
     // Note: SAMD51 has dedicated QSPI pins (not configurable via SERCOM PADs):
@@ -323,48 +331,34 @@ void SPIQuadSAMD51::end() {
 
 DMABuffer SPIQuadSAMD51::acquireDMABuffer(size_t bytes_per_lane) {
     if (!mInitialized) {
-        return SPIError::NOT_INITIALIZED;
+        return DMABuffer(SPIError::NOT_INITIALIZED);
     }
 
     // Auto-wait if previous transmission still active
     if (mTransactionActive) {
         if (!waitComplete()) {
-            return SPIError::BUSY;
+            return DMABuffer(SPIError::BUSY);
         }
     }
 
-    // For quad-lane SPI: total size = bytes_per_lane × 4 (interleaved)
-    constexpr size_t num_lanes = 4;
+    // Allocate one interleaved slice for each configured QSPI lane.
+    const size_t num_lanes = mActiveLanes;
+    // Validate size against platform max (256KB practical limit for embedded)
+    constexpr size_t max_size = 256 * 1024;
+    if (bytes_per_lane > max_size / num_lanes) {
+        return DMABuffer(SPIError::BUFFER_TOO_LARGE);
+    }
     const size_t total_size = bytes_per_lane * num_lanes;
 
-    // Validate size against platform max (256KB practical limit for embedded)
-    constexpr size_t MAX_SIZE = 256 * 1024;
-    if (total_size > MAX_SIZE) {
-        return SPIError::BUFFER_TOO_LARGE;
-    }
-
-    // Reallocate buffer only if we need more capacity
-    if (bytes_per_lane > mMaxBytesPerLane) {
-        if (!mDMABuffer.empty()) {
-            fl::free(mDMABuffer.data());
-            mDMABuffer = fl::span<u8>();
-        }
-
-        // Allocate DMA-capable memory (SAMD51 uses regular malloc)
-        u8* ptr = static_cast<u8*>(fl::malloc(total_size));
-        if (!ptr) {
-            return SPIError::ALLOCATION_FAILED;
-        }
-
-        mDMABuffer = fl::span<u8>(ptr, total_size);
-        mMaxBytesPerLane = bytes_per_lane;
+    mDMABuffer = DMABuffer(total_size);
+    if (!mDMABuffer.ok()) {
+        return DMABuffer(SPIError::ALLOCATION_FAILED);
     }
 
     mBufferAcquired = true;
     mCurrentTotalSize = total_size;
 
-    // Return span of current size (not max allocated size)
-    return fl::span<u8>(mDMABuffer.data(), total_size);
+    return mDMABuffer;
 }
 
 bool SPIQuadSAMD51::transmit(TransmitMode mode) {
@@ -437,7 +431,7 @@ bool SPIQuadSAMD51::transmit(TransmitMode mode) {
     //
     // Note: This is polling-based (blocking) for simplicity.
     // A DMA-based implementation would be more efficient.
-    const u8* data_ptr = mDMABuffer.data();
+    const u8* data_ptr = mDMABuffer.data().data();
     size_t remaining = mCurrentTotalSize;
 
     while (remaining > 0) {
@@ -508,6 +502,7 @@ bool SPIQuadSAMD51::waitComplete(u32 timeout_ms) {
     // AUTO-RELEASE DMA buffer
     mBufferAcquired = false;
     mCurrentTotalSize = 0;
+    mDMABuffer.reset();
 
     return true;
 }
@@ -538,14 +533,9 @@ void SPIQuadSAMD51::cleanup() {
             waitComplete();
         }
 
-        // Free DMA buffer
-        if (!mDMABuffer.empty()) {
-            fl::free(mDMABuffer.data());
-            mDMABuffer = fl::span<u8>();
-            mMaxBytesPerLane = 0;
-            mCurrentTotalSize = 0;
-            mBufferAcquired = false;
-        }
+        mDMABuffer.reset();
+        mCurrentTotalSize = 0;
+        mBufferAcquired = false;
 
         // Disable QSPI peripheral
         QSPI->CTRLA.bit.ENABLE = 0;
@@ -567,24 +557,6 @@ void SPIQuadSAMD51::cleanup() {
         mInitialized = false;
     }
 }
-
-// ============================================================================
-// Static Registration - New Polymorphic Pattern
-// ============================================================================
-
-namespace platforms {
-
-/// @brief Initialize SAMD51 SpiHw4 instances
-///
-/// This function is called lazily by SpiHw4::getAll() on first access.
-/// It replaces the old FL_INIT-based static initialization.
-void initSpiHw4Instances() {
-    // SAMD51 has one QSPI peripheral
-    static auto controller0 = fl::make_shared<SPIQuadSAMD51>(0, "QSPI");
-    SpiHw4::registerInstance(controller0);
-}
-
-}  // namespace platforms
 
 }  // namespace fl
 

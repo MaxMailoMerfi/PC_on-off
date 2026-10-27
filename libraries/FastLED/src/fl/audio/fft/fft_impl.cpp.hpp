@@ -25,6 +25,7 @@
 #include "fl/stl/cstring.h"
 #include "fl/stl/singleton.h"
 #include "fl/stl/noexcept.h"
+#include "fl/stl/assert.h"
 
 #ifndef FL_AUDIO_SAMPLE_RATE
 #define FL_AUDIO_SAMPLE_RATE 44100
@@ -60,7 +61,7 @@ class Context {
   public:
     Context(int samples, int bands, float fmin, float fmax, int sample_rate,
               Mode mode, Window window)
-        : mFftrCfg(nullptr), mInputSamples(samples),
+        FL_NO_EXCEPT : mFftrCfg(nullptr), mInputSamples(samples),
           mKernels(nullptr),
           mMode(mode), mTotalBands(bands), mFmin(fmin), mFmax(fmax),
           mSampleRate(sample_rate), mWindow(window) {
@@ -92,7 +93,7 @@ class Context {
         }
     }
 
-    ~Context() FL_NOEXCEPT {
+    ~Context() FL_NO_EXCEPT {
         if (mFftrCfg) {
             kiss_fftr_free(mFftrCfg);
         }
@@ -112,9 +113,9 @@ class Context {
         }
     }
 
-    fl::size sampleSize() const { return mInputSamples; }
+    fl::size sampleSize() const FL_NO_EXCEPT { return mInputSamples; }
 
-    void run(span<const i16> buffer, Bins *out) {
+    void run(span<const i16> buffer, Bins *out) FL_NO_EXCEPT {
         switch (mMode) {
         case Mode::LOG_REBIN:
             runLogRebin(buffer, out);
@@ -134,7 +135,7 @@ class Context {
         }
     }
 
-    fl::string info() const {
+    fl::string info() const FL_NO_EXCEPT {
         Bins tmp(mTotalBands);
         tmp.setParams(mFmin, mFmax, mSampleRate);
         for (int i = 0; i < mTotalBands; ++i) {
@@ -163,9 +164,18 @@ class Context {
         fl::vector<kiss_fft_scalar> windowed;
         fl::vector<kiss_fft_cpx> fftOut;
         fl::vector<u32> rawBinsI;
+        // CQ magnitudes snapshotted before the coverage supplement edits
+        // rawBins. FIXED16 keeps them as the integers fastMag() produced so
+        // the supplement decision stays integer (#4540).
+#ifdef FIXED_POINT
+        fl::vector<u32> cqSnapshot;
+#else
+        fl::vector<float> cqSnapshot;
+#endif
+        fl::vector<u16> coverageMaxQueue;  // band indices, < mTotalBands
     };
 
-    static FftScratch &scratch() {
+    static FftScratch &scratch() FL_NO_EXCEPT {
         return SingletonThreadLocal<FftScratch>::instance();
     }
 
@@ -175,7 +185,7 @@ class Context {
     // geometrically-spaced output bins. Same approach as WLED.
     // Cost: ~0.15ms on ESP32-S3. No kernel memory.
 
-    void initLogRebin() {
+    void initLogRebin() FL_NO_EXCEPT {
         // Pre-compute bin edges aligned with CQ center frequencies.
         // CQ center[i] = fmin * exp(logRatio * i / (bands-1)), so
         // binToFreq(i) returns these centers for both modes.
@@ -234,7 +244,7 @@ class Context {
                                    0, mTotalBands);
     }
 
-    void runLogRebin(span<const i16> buffer, Bins *out) {
+    void runLogRebin(span<const i16> buffer, Bins *out) FL_NO_EXCEPT {
         out->setParams(mFmin, mFmax, mSampleRate);
         const int N = mInputSamples;
         const int bands = mTotalBands;
@@ -279,7 +289,7 @@ class Context {
 
     // ---- Naive single-FFT path (narrow frequency ranges) ----
 
-    void initNaive(int samples, int bands, float fmin, float fmax, int sr) {
+    void initNaive(int samples, int bands, float fmin, float fmax, int sr) FL_NO_EXCEPT {
         mCqCfg.samples = samples;
         mCqCfg.bands = bands;
         mCqCfg.fmin = fmin;
@@ -292,7 +302,7 @@ class Context {
         // Adding time-domain Hanning would double-window and over-attenuate.
     }
 
-    void runNaive(span<const i16> buffer, Bins *out) {
+    void runNaive(span<const i16> buffer, Bins *out) FL_NO_EXCEPT {
         out->setParams(mFmin, mFmax, mSampleRate);
         const int fftSize = mInputSamples;
         const int numRawBins = fftSize / 2 + 1;
@@ -333,7 +343,7 @@ class Context {
     // Fast integer magnitude: max(|re|,|im|) + 0.40625*min(|re|,|im|)
     // Max error ~3.5% vs exact sqrt(re²+im²). No float, no division.
     // 0.40625 = 13/32, exactly representable → bit-exact with original.
-    static inline u16 fastMag(i32 re, i32 im) {
+    static inline u16 fastMag(i32 re, i32 im) FL_NO_EXCEPT {
         u32 a = (re >= 0) ? static_cast<u32>(re) : static_cast<u32>(-re);
         u32 b = (im >= 0) ? static_cast<u32>(im) : static_cast<u32>(-im);
         u32 mx = (a > b) ? a : b;
@@ -347,7 +357,7 @@ class Context {
     // for fractional part. Max error ~0.05 dB — imperceptible for audio
     // visualization. No log10f, no division.
     // Internally uses fixed-point u16x16 in FIXED16 mode, converts to float at output.
-    static inline float fastDb(u32 x) {
+    static inline float fastDb(u32 x) FL_NO_EXCEPT {
         if (x == 0) return 0.0f;
 
         // Find highest set bit (integer part of log2)
@@ -398,7 +408,7 @@ class Context {
     // Enables auto-vectorization of the subsequent batchMag loop.
     static void deinterleave(const kiss_fft_cpx *cpx,
                              kiss_fft_scalar *re, kiss_fft_scalar *im,
-                             int n) {
+                             int n) FL_NO_EXCEPT {
         for (int i = 0; i < n; ++i) {
             re[i] = cpx[i].r;
             im[i] = cpx[i].i;
@@ -409,14 +419,14 @@ class Context {
     // Contiguous layout allows compiler to auto-vectorize (4-8 mags per SIMD).
     static void batchMag(const kiss_fft_scalar *re,
                          const kiss_fft_scalar *im,
-                         u16 *mag, int n) {
+                         u16 *mag, int n) FL_NO_EXCEPT {
         for (int i = 0; i < n; ++i) {
             mag[i] = fastMag(re[i], im[i]);
         }
     }
 
     // Compute Q16.16 bin edges from float bin edges for integer inner loops.
-    void computeBinEdgesQ16() {
+    void computeBinEdgesQ16() FL_NO_EXCEPT {
         int n = static_cast<int>(mLogBinEdges.size());
         mLogBinEdgesQ16.resize(n);
         for (int i = 0; i < n; ++i) {
@@ -427,7 +437,7 @@ class Context {
     // Build log-bin LUT: for each FFT bin k, pre-compute which output bin
     // it maps to. Moves the binary search from runtime to init.
     void buildLogBinLut(fl::vector<u8>& lut, int fftN, float fs,
-                        int binStart, int binEnd) {
+                        int binStart, int binEnd) FL_NO_EXCEPT {
         const int numRawBins = fftN / 2 + 1;
         lut.resize(numRawBins);
         const u16x16 rawBinHz(fs / static_cast<float>(fftN));
@@ -449,7 +459,7 @@ class Context {
 
     // Build linear-bin LUT: for each FFT bin k, pre-compute which linear
     // output bin it maps to. Moves the u16x16 division from runtime to init.
-    void buildLinearBinLut(fl::vector<u8>& lut, int fftN) {
+    void buildLinearBinLut(fl::vector<u8>& lut, int fftN) FL_NO_EXCEPT {
         const int numRawBins = fftN / 2 + 1;
         const int numLinearBins = mTotalBands;
         lut.resize(numRawBins);
@@ -489,7 +499,7 @@ class Context {
 
     // Compute window function as alpha16 (UNORM16) coefficients in [0, 1].
     // Uses fixed-point arithmetic throughout to avoid float on MCUs.
-    static void computeWindow(fl::vector<alpha16> &win, int N, Window type) {
+    static void computeWindow(fl::vector<alpha16> &win, int N, Window type) FL_NO_EXCEPT {
         using FP = fl::fixed_point<16, 16>;
         win.resize(N);
 
@@ -543,14 +553,14 @@ class Context {
     // Apply window: out[i] = sample[i] * win[i]
     // Window coefficients are alpha16 (UNORM16 [0,1]); uses scale_signed().
     static void applyWindow(const kiss_fft_scalar *samples,
-                            const alpha16 *win, kiss_fft_scalar *out, int N) {
+                            const alpha16 *win, kiss_fft_scalar *out, int N) FL_NO_EXCEPT {
         for (int i = 0; i < N; ++i) {
             out[i] = static_cast<kiss_fft_scalar>(
                 win[i].scale_signed(static_cast<int>(samples[i])));
         }
     }
 
-    void initWindow() {
+    void initWindow() FL_NO_EXCEPT {
         computeWindow(mWindowBuf, mInputSamples, mWindow);
     }
 
@@ -571,7 +581,7 @@ class Context {
     };
 
     void initOctaveWise(int samples, int bands, float fmin, float fmax,
-                        int sr) {
+                        int sr) FL_NO_EXCEPT {
 
 
         // Use floor so the top octave covers the remaining frequency range
@@ -653,11 +663,35 @@ class Context {
         mFftOut.resize(samples);
 
         buildLinearBinLut(mLinearBinLut, samples);
+        initLogRebin();
+        computeWindow(mWindowBuf, samples, Window::BLACKMAN_HARRIS);
+        const float mainLobeHz = 4.0f * static_cast<float>(sr) /
+                                 static_cast<float>(samples);
+        // Band indices are stored as u16. `centerFreqs` above is a stack
+        // array of `bands` floats, so any band count that fits a real task
+        // stack is far below 65536.
+        FL_ASSERT(bands <= 0xFFFF, "CQ_OCTAVE band count exceeds u16 index range");
+        mCoverageFirst.resize(bands);
+        mCoverageLast.resize(bands);
+        int firstNearby = 0;
+        int lastNearby = 0;
+        for (int i = 0; i < bands; ++i) {
+            while (centerFreqs[i] - centerFreqs[firstNearby] > mainLobeHz) {
+                ++firstNearby;
+            }
+            if (lastNearby < i) lastNearby = i;
+            while (lastNearby + 1 < bands &&
+                   centerFreqs[lastNearby + 1] - centerFreqs[i] <= mainLobeHz) {
+                ++lastNearby;
+            }
+            mCoverageFirst[i] = static_cast<u16>(firstNearby);
+            mCoverageLast[i] = static_cast<u16>(lastNearby);
+        }
         // Note: CQ kernels already apply Hamming windowing in frequency domain.
         // Adding time-domain Hanning would double-window and over-attenuate.
     }
 
-    void runOctaveWise(span<const i16> buffer, Bins *out) {
+    void runOctaveWise(span<const i16> buffer, Bins *out) FL_NO_EXCEPT {
         const int N = mInputSamples;
         const int numOctaves = static_cast<int>(mOctaves.size());
         const int numRawBins = N / 2 + 1;
@@ -710,7 +744,6 @@ class Context {
                     mWorkBuf[i] = 0;
                 fl_fft_real_forward(mFftrCfg, mInputSamples, mWorkBuf.data(), mFftOut.data());
             }
-
             // Zero the CQ accumulator and apply kernels
             fl::memset(cq, 0, sizeof(kiss_fft_cpx) * oi.numBins);
             apply_kernels(mFftOut.data(), cq, oi.kernels, oi.cfg);
@@ -728,6 +761,68 @@ class Context {
 #endif
             }
         }
+
+        // A full-rate Blackman-Harris FFT supplies a low-gain floor wherever
+        // the narrow CQ kernels leave a gap. Its low-frequency resolution is
+        // coarse, so do not let it override a CQ detection within its main
+        // lobe (about four FFT-bin widths).
+        s.windowed.resize(N);
+        s.fftOut.resize(N);
+        s.rawBinsI.resize(mTotalBands);
+        applyWindow(buffer.data(), mWindowBuf.data(), s.windowed.data(), N);
+        fl_fft_real_forward(mFftrCfg, N, s.windowed.data(), s.fftOut.data());
+        deinterleave(s.fftOut.data(), s.re.data(), s.im.data(), numRawBins);
+        batchMag(s.re.data(), s.im.data(), s.mag.data(), numRawBins);
+        fl::memset(s.rawBinsI.data(), 0, sizeof(u32) * mTotalBands);
+        logRebinRange(s.mag.data(), N, static_cast<float>(mSampleRate), 0,
+                      mTotalBands, s.rawBinsI.data(), mLogBinLut);
+        // Coverage floor = 1/50 (0.02) of the full-rate FFT magnitude; a CQ
+        // band at or above 20 counts as a detection. FIXED16 decides with
+        // detail::coverageFloorApplies(); float modes keep float compares.
+        static constexpr float kCoverageGain = 0.02f;
+        s.cqSnapshot.resize(mTotalBands);
+        s.coverageMaxQueue.resize(mTotalBands);
+        for (int i = 0; i < mTotalBands; ++i) {
+#ifdef FIXED_POINT
+            // Exact: rawBins[i] was set from an integer fastMag() above.
+            s.cqSnapshot[i] = static_cast<u32>(rawBins[i]);
+#else
+            s.cqSnapshot[i] = rawBins[i];
+#endif
+        }
+        int head = 0;
+        int tail = 0;
+        int next = 0;
+        for (int i = 0; i < mTotalBands; ++i) {
+            while (next <= mCoverageLast[i]) {
+                while (tail > head &&
+                       s.cqSnapshot[s.coverageMaxQueue[tail - 1]] <=
+                           s.cqSnapshot[next]) {
+                    --tail;
+                }
+                s.coverageMaxQueue[tail++] = static_cast<u16>(next++);
+            }
+            while (head < tail &&
+                   s.coverageMaxQueue[head] < mCoverageFirst[i]) {
+                ++head;
+            }
+#ifdef FIXED_POINT
+            // Integer form of `localCq < 20 && fft/50 > cq`; float appears
+            // only when writing the Bins output.
+            if (detail::coverageFloorApplies(
+                    s.rawBinsI[i], s.cqSnapshot[i],
+                    s.cqSnapshot[s.coverageMaxQueue[head]])) {
+                rawBins[i] = static_cast<float>(s.rawBinsI[i]) * kCoverageGain;
+            }
+#else
+            const float localCq = s.cqSnapshot[s.coverageMaxQueue[head]];
+            static constexpr float kDetectedCqMagnitude = 20.0f;
+            float coverage = static_cast<float>(s.rawBinsI[i]) * kCoverageGain;
+            if (localCq < kDetectedCqMagnitude && coverage > rawBins[i]) {
+                rawBins[i] = coverage;
+            }
+#endif
+        }
     }
 
     // ---- Hybrid path: dual LOG_REBIN (full-rate upper + decimated bass) ----
@@ -739,7 +834,7 @@ class Context {
     // The small FFT is much faster than 512-point, and the anti-alias
     // decimation filter removes high-frequency content before bass analysis.
 
-    void initHybrid(int samples, int bands, float fmin, float fmax, int sr) {
+    void initHybrid(int samples, int bands, float fmin, float fmax, int sr) FL_NO_EXCEPT {
         float logRatio = logf(fmax / fmin);
 
         // Log-spaced center frequencies for all bins
@@ -864,7 +959,7 @@ class Context {
         }
     }
 
-    void runHybrid(span<const i16> buffer, Bins *out) {
+    void runHybrid(span<const i16> buffer, Bins *out) FL_NO_EXCEPT {
         const int N = mInputSamples;
         const int numRawBins = N / 2 + 1;
 
@@ -971,7 +1066,7 @@ class Context {
     void computeLogRebinNormFactors(fl::vector<float>& normFactors,
                                      const fl::vector<u8>& lut,
                                      int fftN, float fs,
-                                     int binStart, int binEnd) {
+                                     int binStart, int binEnd) FL_NO_EXCEPT {
         int bands = binEnd - binStart;
         normFactors.resize(binEnd);
         for (int i = 0; i < binEnd; ++i) {
@@ -1009,7 +1104,7 @@ class Context {
     // Uses pre-computed LUT for O(1) bin mapping per FFT bin.
     void logRebinRange(const u16 *mag, int fftN, float fs,
                        int binStart, int binEnd,
-                       u32 *rawBinsI, const fl::vector<u8>& lut) {
+                       u32 *rawBinsI, const fl::vector<u8>& lut) FL_NO_EXCEPT {
         const int numRawBins = fftN / 2 + 1;
         // Compute loop bounds to skip out-of-range FFT bins
         const u16x16 rawBinHz(fs / static_cast<float>(fftN));
@@ -1031,7 +1126,7 @@ class Context {
         }
     }
 
-    void computeLinearBins(const u16 *mag, int /*nfft*/, Bins *out) {
+    void computeLinearBins(const u16 *mag, int /*nfft*/, Bins *out) FL_NO_EXCEPT {
         const int numLinearBins = mTotalBands;
 
         fl::vector<float> &linBins = out->linear_mut();
@@ -1058,7 +1153,7 @@ class Context {
     // h = [-1/32, 0, 9/32, 1/2, 9/32, 0, -1/32]
     // Stopband rejection: ~-45dB per stage (vs -13dB for old 3-tap).
     // Total rejection with 3 decimation stages: ~-135dB.
-    static void decimateBy2(kiss_fft_scalar *buf, int len) {
+    static void decimateBy2(kiss_fft_scalar *buf, int len) FL_NO_EXCEPT {
         int outLen = len / 2;
         for (int i = 0; i < outLen; i++) {
             int idx = i * 2;
@@ -1117,6 +1212,8 @@ class Context {
 
     // Pre-computed bin mapping LUTs (built at init, used at runtime)
     fl::vector<u8> mLogBinLut;       // FFT bin k → log-bin index (primary fft::FFT)
+    fl::vector<u16> mCoverageFirst;   // first CQ band within one FFT main lobe
+    fl::vector<u16> mCoverageLast;    // last CQ band within one FFT main lobe
     fl::vector<u8> mLinearBinLut;    // FFT bin k → linear-bin index (primary fft::FFT)
     fl::vector<u8> mLogBinLutMid;    // HYBRID mid-tier LUT (256pt)
     fl::vector<u8> mLogBinLutBass;   // HYBRID bass-tier LUT (64pt)
@@ -1130,15 +1227,15 @@ class Context {
     Window mWindow;
 };
 
-Impl::Impl(const Args &args) {
+Impl::Impl(const Args &args) FL_NO_EXCEPT {
     mContext = fl::make_unique<Context>(args.samples, args.bands, args.fmin,
                                           args.fmax, args.sample_rate,
                                           args.mode, args.window);
 }
 
-Impl::~Impl() FL_NOEXCEPT { mContext.reset(); }
+Impl::~Impl() FL_NO_EXCEPT { mContext.reset(); }
 
-fl::string Impl::info() const {
+fl::string Impl::info() const FL_NO_EXCEPT {
     if (mContext) {
         return mContext->info();
     } else {
@@ -1147,20 +1244,20 @@ fl::string Impl::info() const {
     }
 }
 
-fl::size Impl::sampleSize() const {
+fl::size Impl::sampleSize() const FL_NO_EXCEPT {
     if (mContext) {
         return mContext->sampleSize();
     }
     return 0;
 }
 
-Impl::Result Impl::run(const Sample &sample, Bins *out) {
+Impl::Result Impl::run(const Sample &sample, Bins *out) FL_NO_EXCEPT {
     auto &audio_sample = sample.pcm();
     span<const i16> slice(audio_sample);
     return run(slice, out);
 }
 
-Impl::Result Impl::run(span<const i16> sample, Bins *out) {
+Impl::Result Impl::run(span<const i16> sample, Bins *out) FL_NO_EXCEPT {
     if (!mContext) {
         return Impl::Result(false, "Impl context is not initialized");
     }

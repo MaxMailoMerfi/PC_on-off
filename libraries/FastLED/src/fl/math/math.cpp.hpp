@@ -23,6 +23,7 @@
 #if FL_MATH_USE_LIBM
 // IWYU pragma: begin_keep
 #include <math.h>
+#include "fl/stl/noexcept.h"
 // IWYU pragma: end_keep  // okay banned header (STL wrapper implementation requires standard math.h)
 #endif
 
@@ -40,7 +41,7 @@
 namespace fl {
 
 // Standalone floor implementation for float
-float floor_impl_float(float value) {
+float floor_impl_float(float value) FL_NO_EXCEPT {
     if (value >= 0.0f) {
         return static_cast<float>(static_cast<int>(value));
     }
@@ -49,7 +50,7 @@ float floor_impl_float(float value) {
 }
 
 // Standalone floor implementation for double
-double floor_impl_double(double value) {
+double floor_impl_double(double value) FL_NO_EXCEPT {
     if (value >= 0.0) {
         return static_cast<double>(static_cast<long long>(value));
     }
@@ -58,7 +59,7 @@ double floor_impl_double(double value) {
 }
 
 // Standalone ceil implementation for float
-float ceil_impl_float(float value) {
+float ceil_impl_float(float value) FL_NO_EXCEPT {
     if (value <= 0.0f) {
         return static_cast<float>(static_cast<int>(value));
     }
@@ -67,7 +68,7 @@ float ceil_impl_float(float value) {
 }
 
 // Standalone ceil implementation for double
-double ceil_impl_double(double value) {
+double ceil_impl_double(double value) FL_NO_EXCEPT {
     if (value <= 0.0) {
         return static_cast<double>(static_cast<long long>(value));
     }
@@ -75,49 +76,130 @@ double ceil_impl_double(double value) {
     return static_cast<double>(i + (value != static_cast<double>(i) ? 1 : 0));
 }
 
-// Standalone exp implementation using Taylor series
-// e^x ≈ 1 + x + x²/2! + x³/3! + x⁴/4! + ...
-float exp_impl_float(float value) {
-    if (value > 10.0f)
-        return 22026.465794806718f; // e^10 approx
-    if (value < -10.0f)
-        return 0.0000453999297625f; // e^-10 approx
+// exp: range reduction + short polynomial, libm-grade on every target, and
+// the only exp implementation (no libm path).
+//
+// e^x = 2^k * e^r with k = round(x / ln2) and |r| <= ln2/2 = 0.3466. On that
+// interval a degree-6 minimax polynomial (float) / fdlibm's rational form
+// (double) is accurate to the last bit, and 2^k is an exponent-field write with no
+// rounding. The previous implementation evaluated a ten-term series at the
+// raw x and clamped at +-10: exact for |x| <= 1, 3 % off at 5, 54 % off at 10,
+// and wrong by orders of magnitude beyond (#4288).
+//
+// Cost matters on cores without an FPU, where every float operation and
+// every conversion is a library call, so the surrounding work is integer:
+// range checks read the exponent bits, k comes from the "magic number"
+// rounding trick instead of float->int->float conversions, and type punning
+// goes through a union rather than fl::memcpy (an out-of-line byte loop).
+//
+// Reduction uses the Cody-Waite split of ln2 (ln2_hi has trailing zero
+// bits so k * ln2_hi is exact for every k in range). Constants are the
+// fdlibm/musl values.
+namespace detail {
 
-    // For negative values, use exp(x) = 1/exp(-x) to keep the Taylor series
-    // input non-negative where it converges well with limited terms.
-    if (value < 0.0f) {
-        return 1.0f / exp_impl_float(-value);
-    }
+union FloatBits { float f; u32 u; i32 i; };
+union DoubleBits { double f; u64 u; i64 i; };
 
-    float result = 1.0f;
-    float term = 1.0f;
-    for (int i = 1; i < 10; ++i) {
-        term *= value / static_cast<float>(i);
-        result += term;
-    }
-    return result;
+// p * 2^k built from the exponent field. k is split in two so each half is
+// a normal float, and p is scaled by the halves in turn: the intermediate
+// stays finite for k = 128 (p < 1) and the only rounding, for subnormal
+// results, happens once in the final multiply.
+inline float scale_pow2_(float p, int k) FL_NO_EXCEPT {
+    const int a = k / 2;
+    const int b = k - a;
+    FloatBits fa, fb;
+    fa.u = static_cast<u32>(a + 127) << 23;
+    fb.u = static_cast<u32>(b + 127) << 23;
+    return (p * fa.f) * fb.f;
 }
 
-double exp_impl_double(double value) {
-    if (value > 10.0)
-        return 22026.465794806718; // e^10 approx
-    if (value < -10.0)
-        return 0.0000453999297625; // e^-10 approx
-
-    // For negative values, use exp(x) = 1/exp(-x) to keep the Taylor series
-    // input non-negative where it converges well with limited terms.
-    if (value < 0.0) {
-        return 1.0 / exp_impl_double(-value);
-    }
-
-    double result = 1.0;
-    double term = 1.0;
-    for (int i = 1; i < 10; ++i) {
-        term *= value / static_cast<double>(i);
-        result += term;
-    }
-    return result;
+inline double scale_pow2_(double p, int k) FL_NO_EXCEPT {
+    const int a = k / 2;
+    const int b = k - a;
+    DoubleBits fa, fb;
+    fa.u = static_cast<u64>(a + 1023) << 52;
+    fb.u = static_cast<u64>(b + 1023) << 52;
+    return (p * fa.f) * fb.f;
 }
+
+inline float exp_reduced_(float x) FL_NO_EXCEPT {
+    FloatBits xb;
+    xb.f = x;
+    const u32 ax = xb.u & 0x7fffffffu;
+    if (ax >= 0x42b17218u) {           // |x| >= 88.7228, or NaN
+        if (ax > 0x7f800000u) return x;  // NaN
+        if ((xb.u >> 31) == 0u) {        // overflow -> +inf
+            FloatBits inf;
+            inf.u = 0x7f800000u;
+            return inf.f;
+        }
+        if (ax >= 0x42cff1b5u) return 0.0f;  // x <= -103.972: underflow
+    }
+    // k = round(x / ln2) via the 1.5 * 2^23 magic constant: adding it puts
+    // the integer in the low mantissa bits, so no float<->int conversions.
+    const float kMagic = 12582912.0f;
+    FloatBits t;
+    t.f = x * 1.44269504088896341f + kMagic;
+    const int k = t.i - 0x4b400000;
+    const float kf = t.f - kMagic;
+    const float r = (x - kf * 6.9314575195e-01f) - kf * 1.4286067653e-06f;
+    // e^r = 1 + r + r^2 * P(r), P minimax on |r| <= ln2/2: worst case 1 ulp.
+    float p = 1.393364297e-03f;
+    p = p * r + 8.363175565e-03f;
+    p = p * r + 4.166646498e-02f;
+    p = p * r + 1.666657700e-01f;
+    p = p * r + 5.000000013e-01f;
+    p = (p * r * r) + r + 1.0f;
+    return scale_pow2_(p, k);
+}
+
+inline double exp_reduced_(double x) FL_NO_EXCEPT {
+    // AVR builds double as 32 bits: the float path is the double path there,
+    // and the 64-bit bit patterns below would read past the value.
+    if (sizeof(double) == sizeof(float)) {
+        return static_cast<double>(exp_reduced_(static_cast<float>(x)));
+    }
+    DoubleBits xb;
+    xb.f = x;
+    const u64 ax = xb.u & 0x7fffffffffffffffull;
+    if (ax >= 0x40862e42fefa39efull) {          // |x| >= 709.7827, or NaN
+        if (ax > 0x7ff0000000000000ull) return x;  // NaN
+        if ((xb.u >> 63) == 0u) {                  // overflow -> +inf
+            DoubleBits inf;
+            inf.u = 0x7ff0000000000000ull;
+            return inf.f;
+        }
+        if (ax >= 0x40874910d52d3052ull) return 0.0;  // x <= -745.133: underflow
+    }
+    const double kMagic = 6755399441055744.0;  // 1.5 * 2^52
+    DoubleBits t;
+    t.f = x * 1.44269504088896338700e+00 + kMagic;
+    const int k = static_cast<int>(t.i - 0x4338000000000000ll);
+    const double kd = t.f - kMagic;
+    // fdlibm e_exp: e^r = 1 + 2r/(2 - c(r)) with c a degree-5 polynomial in
+    // r^2. Five multiply-adds and one division reach < 1 ulp, half the work of
+    // a Taylor series of the same accuracy; that matters on cores that do
+    // double in software.
+    const double hi = x - kd * 6.93147180369123816490e-01;
+    const double lo = kd * 1.90821492927058770002e-10;
+    const double r = hi - lo;
+    const double r2 = r * r;
+    const double c = r - r2 * (1.66666666666666019037e-01 +
+                              r2 * (-2.77777777770155933842e-03 +
+                                   r2 * (6.61375632143793436117e-05 +
+                                        r2 * (-1.65339022054652515390e-06 +
+                                             r2 * 4.13813679705723846039e-08))));
+    const double p = 1.0 - ((lo - (r * c) / (2.0 - c)) - hi);
+    return scale_pow2_(p, k);
+}
+
+}  // namespace detail
+
+// exp takes the range-reduced form on every target, including ones with
+// libm: it is within 2 ulp of libm, cheaper than a libm call, and gives the
+// same answers everywhere, so audio goldens do not depend on the host.
+float exp_impl_float(float value) FL_NO_EXCEPT { return detail::exp_reduced_(value); }
+double exp_impl_double(double value) FL_NO_EXCEPT { return detail::exp_reduced_(value); }
 
 // =============================================================================
 // Libm-free trig / sqrt / log / pow implementations
@@ -148,7 +230,7 @@ namespace detail {
 // 5 decimal digits for float, 10 for double — more than enough for color
 // space and rotational math.
 template <typename F>
-inline F sqrt_newton_(F value) FL_NOEXCEPT {
+inline F sqrt_newton_(F value) FL_NO_EXCEPT {
     if (value <= F(0)) return F(0);
     // Initial estimate: x_0 = value / 2. Pure-arithmetic, no bit-cast needed.
     // Newton converges quadratically so 5-6 iterations is plenty even from a
@@ -167,21 +249,21 @@ inline F sqrt_newton_(F value) FL_NOEXCEPT {
 // Reduce input to [-π/4, π/4] then evaluate degree-7 Taylor polynomial.
 // Max error ~1e-5 for float, ~1e-10 for double on the reduced range.
 template <typename F>
-inline F sin_poly_quarterturn_(F x) FL_NOEXCEPT {
+inline F sin_poly_quarterturn_(F x) FL_NO_EXCEPT {
     // sin(x) ≈ x - x³/6 + x⁵/120 - x⁷/5040
     const F x2 = x * x;
     return x * (F(1) - x2 * (F(1.0 / 6.0) - x2 * (F(1.0 / 120.0) - x2 * F(1.0 / 5040.0))));
 }
 
 template <typename F>
-inline F cos_poly_quarterturn_(F x) FL_NOEXCEPT {
+inline F cos_poly_quarterturn_(F x) FL_NO_EXCEPT {
     // cos(x) ≈ 1 - x²/2 + x⁴/24 - x⁶/720
     const F x2 = x * x;
     return F(1) - x2 * (F(0.5) - x2 * (F(1.0 / 24.0) - x2 * F(1.0 / 720.0)));
 }
 
 template <typename F>
-inline F sin_reduce_(F x) FL_NOEXCEPT {
+inline F sin_reduce_(F x) FL_NO_EXCEPT {
     const F kPi      = F(3.14159265358979323846);
     const F kTwoPi   = F(6.28318530717958647692);
     const F kPiHalf  = F(1.57079632679489661923);
@@ -199,7 +281,7 @@ inline F sin_reduce_(F x) FL_NOEXCEPT {
 }
 
 template <typename F>
-inline F cos_reduce_(F x) FL_NOEXCEPT {
+inline F cos_reduce_(F x) FL_NO_EXCEPT {
     // cos(x) = sin(π/2 - x)
     const F kPiHalf = F(1.57079632679489661923);
     return sin_reduce_(kPiHalf - x);
@@ -211,7 +293,7 @@ inline F cos_reduce_(F x) FL_NOEXCEPT {
 // Repeatedly multiply/divide by 2 to bring x into [1, 2), then evaluate
 // log(m) via a polynomial in (m-1) on [0, 1].
 template <typename F>
-inline F log_natural_(F value) FL_NOEXCEPT {
+inline F log_natural_(F value) FL_NO_EXCEPT {
     if (value <= F(0)) return F(-1e30);  // -inf surrogate
     int e = 0;
     while (value >= F(2)) { value *= F(0.5); ++e; }
@@ -237,7 +319,7 @@ inline F log_natural_(F value) FL_NOEXCEPT {
 // Each impl below picks libm (Large-memory targets) or polynomial / Newton
 // (Low-memory targets — keeps libm out of the link).
 
-float sqrt_impl_float(float value) {
+float sqrt_impl_float(float value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::sqrtf(value);
 #else
@@ -245,7 +327,7 @@ float sqrt_impl_float(float value) {
 #endif
 }
 
-double sqrt_impl_double(double value) {
+double sqrt_impl_double(double value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::sqrt(value);
 #else
@@ -253,7 +335,7 @@ double sqrt_impl_double(double value) {
 #endif
 }
 
-float sin_impl_float(float value) {
+float sin_impl_float(float value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::sinf(value);
 #else
@@ -261,7 +343,7 @@ float sin_impl_float(float value) {
 #endif
 }
 
-double sin_impl_double(double value) {
+double sin_impl_double(double value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::sin(value);
 #else
@@ -269,7 +351,7 @@ double sin_impl_double(double value) {
 #endif
 }
 
-float cos_impl_float(float value) {
+float cos_impl_float(float value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::cosf(value);
 #else
@@ -277,7 +359,7 @@ float cos_impl_float(float value) {
 #endif
 }
 
-double cos_impl_double(double value) {
+double cos_impl_double(double value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::cos(value);
 #else
@@ -285,7 +367,7 @@ double cos_impl_double(double value) {
 #endif
 }
 
-float log_impl_float(float value) {
+float log_impl_float(float value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::logf(value);
 #else
@@ -293,7 +375,7 @@ float log_impl_float(float value) {
 #endif
 }
 
-double log_impl_double(double value) {
+double log_impl_double(double value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::log(value);
 #else
@@ -301,7 +383,7 @@ double log_impl_double(double value) {
 #endif
 }
 
-float log10_impl_float(float value) {
+float log10_impl_float(float value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::log10f(value);
 #else
@@ -310,7 +392,7 @@ float log10_impl_float(float value) {
 #endif
 }
 
-double log10_impl_double(double value) {
+double log10_impl_double(double value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::log10(value);
 #else
@@ -319,7 +401,7 @@ double log10_impl_double(double value) {
 #endif
 }
 
-float pow_impl_float(float base, float exponent) {
+float pow_impl_float(float base, float exponent) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::powf(base, exponent);
 #else
@@ -335,7 +417,7 @@ float pow_impl_float(float base, float exponent) {
 #endif
 }
 
-double pow_impl_double(double base, double exponent) {
+double pow_impl_double(double base, double exponent) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::pow(base, exponent);
 #else
@@ -352,15 +434,15 @@ double pow_impl_double(double base, double exponent) {
 }
 
 // Absolute value: pure arithmetic; libm path unnecessary, same on both.
-float fabs_impl_float(float value) {
+float fabs_impl_float(float value) FL_NO_EXCEPT {
     return value < 0.0f ? -value : value;
 }
 
-double fabs_impl_double(double value) {
+double fabs_impl_double(double value) FL_NO_EXCEPT {
     return value < 0.0 ? -value : value;
 }
 
-long lround_impl_float(float value) {
+long lround_impl_float(float value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::lroundf(value);
 #else
@@ -369,7 +451,7 @@ long lround_impl_float(float value) {
 #endif
 }
 
-long lround_impl_double(double value) {
+long lround_impl_double(double value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::lround(value);
 #else
@@ -381,7 +463,7 @@ long lround_impl_double(double value) {
 // Arduino.h defines `round` as a macro, so we temporarily hide it.
 #pragma push_macro("round")
 #undef round
-float round_impl_float(float value) {
+float round_impl_float(float value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::roundf(value);
 #else
@@ -389,7 +471,7 @@ float round_impl_float(float value) {
 #endif
 }
 
-double round_impl_double(double value) {
+double round_impl_double(double value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::round(value);
 #else
@@ -398,7 +480,7 @@ double round_impl_double(double value) {
 }
 #pragma pop_macro("round")
 
-float fmod_impl_float(float x, float y) {
+float fmod_impl_float(float x, float y) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::fmodf(x, y);
 #else
@@ -410,7 +492,7 @@ float fmod_impl_float(float x, float y) {
 #endif
 }
 
-double fmod_impl_double(double x, double y) {
+double fmod_impl_double(double x, double y) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::fmod(x, y);
 #else
@@ -451,7 +533,7 @@ double fmod_impl_double(double x, double y) {
 // only when they actually need it.
 namespace detail {
 template <typename F>
-inline F atan_poly_unit_(F u) FL_NOEXCEPT {
+inline F atan_poly_unit_(F u) FL_NO_EXCEPT {
     // Polynomial approximation of atan on [-1, 1].
     // Coefficients from Padé-style minimax fit; max abs error ~1.5e-3.
     const F u2 = u * u;
@@ -464,7 +546,7 @@ inline F atan_poly_unit_(F u) FL_NOEXCEPT {
 }
 
 template <typename F>
-inline F atan_full_(F u) FL_NOEXCEPT {
+inline F atan_full_(F u) FL_NO_EXCEPT {
     const F kPiHalf = F(1.57079632679489661923);
     // Reduce to |u| <= 1 via the reciprocal identity.
     if (u > F(1)) {
@@ -476,7 +558,7 @@ inline F atan_full_(F u) FL_NOEXCEPT {
 }
 
 template <typename F>
-inline F atan2_full_(F y, F x) FL_NOEXCEPT {
+inline F atan2_full_(F y, F x) FL_NO_EXCEPT {
     const F kPi     = F(3.14159265358979323846);
     const F kPiHalf = F(1.57079632679489661923);
     // x == 0 special case: angle is ±π/2 (sign of y), or 0 when both are 0.
@@ -493,7 +575,7 @@ inline F atan2_full_(F y, F x) FL_NOEXCEPT {
 }
 }  // namespace detail
 
-float atan2_impl_float(float y, float x) {
+float atan2_impl_float(float y, float x) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::atan2f(y, x);
 #else
@@ -501,7 +583,7 @@ float atan2_impl_float(float y, float x) {
 #endif
 }
 
-double atan2_impl_double(double y, double x) {
+double atan2_impl_double(double y, double x) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::atan2(y, x);
 #else
@@ -509,7 +591,7 @@ double atan2_impl_double(double y, double x) {
 #endif
 }
 
-float hypot_impl_float(float x, float y) {
+float hypot_impl_float(float x, float y) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::hypotf(x, y);
 #else
@@ -517,7 +599,7 @@ float hypot_impl_float(float x, float y) {
 #endif
 }
 
-double hypot_impl_double(double x, double y) {
+double hypot_impl_double(double x, double y) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::hypot(x, y);
 #else
@@ -525,7 +607,7 @@ double hypot_impl_double(double x, double y) {
 #endif
 }
 
-float atan_impl_float(float value) {
+float atan_impl_float(float value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::atanf(value);
 #else
@@ -533,7 +615,7 @@ float atan_impl_float(float value) {
 #endif
 }
 
-double atan_impl_double(double value) {
+double atan_impl_double(double value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::atan(value);
 #else
@@ -541,7 +623,7 @@ double atan_impl_double(double value) {
 #endif
 }
 
-float asin_impl_float(float value) {
+float asin_impl_float(float value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::asinf(value);
 #else
@@ -554,7 +636,7 @@ float asin_impl_float(float value) {
 #endif
 }
 
-double asin_impl_double(double value) {
+double asin_impl_double(double value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::asin(value);
 #else
@@ -567,7 +649,7 @@ double asin_impl_double(double value) {
 #endif
 }
 
-float acos_impl_float(float value) {
+float acos_impl_float(float value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::acosf(value);
 #else
@@ -576,7 +658,7 @@ float acos_impl_float(float value) {
 #endif
 }
 
-double acos_impl_double(double value) {
+double acos_impl_double(double value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::acos(value);
 #else
@@ -585,7 +667,7 @@ double acos_impl_double(double value) {
 #endif
 }
 
-float tan_impl_float(float value) {
+float tan_impl_float(float value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::tanf(value);
 #else
@@ -595,7 +677,7 @@ float tan_impl_float(float value) {
 #endif
 }
 
-double tan_impl_double(double value) {
+double tan_impl_double(double value) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::tan(value);
 #else
@@ -620,7 +702,7 @@ double tan_impl_double(double value) {
 // a small integer (|exp| < 30), so the bounded loop is cheap (≤ 30 mults).
 namespace detail {
 template <typename F>
-inline F ldexp_loop_(F value, int exp) FL_NOEXCEPT {
+inline F ldexp_loop_(F value, int exp) FL_NO_EXCEPT {
     if (value == F(0)) return value;
     if (exp == 0) return value;
     if (exp > 0) {
@@ -642,7 +724,7 @@ inline F ldexp_loop_(F value, int exp) FL_NOEXCEPT {
 }
 }  // namespace detail
 
-float ldexp_impl_float(float value, int exp) {
+float ldexp_impl_float(float value, int exp) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::ldexpf(value, exp);
 #else
@@ -650,7 +732,7 @@ float ldexp_impl_float(float value, int exp) {
 #endif
 }
 
-double ldexp_impl_double(double value, int exp) {
+double ldexp_impl_double(double value, int exp) FL_NO_EXCEPT {
 #if FL_MATH_USE_LIBM
     return ::ldexp(value, exp);
 #else

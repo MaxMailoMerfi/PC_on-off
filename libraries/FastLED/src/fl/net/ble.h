@@ -23,9 +23,13 @@
 #include "fl/stl/noexcept.h"
 #include "fl/stl/pair.h"
 
-// BLE requires: ESP32 + IDF 5+ + NimBLE headers present
+// BLE requires either ESP32 + IDF 5+ + NimBLE headers, or an RP2350W build
+// that selected Arduino-Pico's BTstack menu.
 #if defined(FL_IS_ESP32) && defined(FL_IS_IDF_5_OR_HIGHER) \
     && FL_HAS_INCLUDE(<nimble/nimble_port.h>)
+#define FL_BLE_AVAILABLE 1
+#elif defined(FL_IS_RP2350) && defined(ENABLE_BLE) && ENABLE_BLE \
+    && FL_HAS_INCLUDE(<BTstackLib.h>)
 #define FL_BLE_AVAILABLE 1
 #else
 #define FL_BLE_AVAILABLE 0
@@ -76,22 +80,22 @@ struct TransportState;
 /// @param deviceName BLE advertising name (e.g., "FastLED-C6")
 /// @return Heap-allocated state pointer (caller owns, free with destroyTransport)
 ///         Returns nullptr on platforms without BLE support.
-TransportState* createTransport(const char* deviceName) FL_NOEXCEPT;
+TransportState* createTransport(const char* deviceName) FL_NO_EXCEPT;
 
 /// @brief Deinitialize BLE stack and free heap state
 /// @param state Pointer returned by createTransport (safe to call with nullptr)
-void destroyTransport(TransportState* state) FL_NOEXCEPT;
+void destroyTransport(TransportState* state) FL_NO_EXCEPT;
 
 /// @brief Query BLE connection/subscription diagnostics
 /// @param state Pointer returned by createTransport
 /// @return Platform-neutral status snapshot
-StatusInfo queryStatus(const TransportState* state) FL_NOEXCEPT;
+StatusInfo queryStatus(const TransportState* state) FL_NO_EXCEPT;
 
 /// @brief Get RequestSource and ResponseSink lambdas for fl::Remote
 /// @param state Pointer returned by createTransport (must outlive returned lambdas)
 /// @return Pair of {RequestSource, ResponseSink} ready for fl::Remote constructor
 fl::pair<fl::function<fl::optional<fl::json>()>, fl::function<void(const fl::json&)>>
-getTransportCallbacks(TransportState* state) FL_NOEXCEPT;
+getTransportCallbacks(TransportState* state) FL_NO_EXCEPT;
 
 } // namespace ble
 } // namespace net

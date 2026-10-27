@@ -11,6 +11,10 @@ This directory contains the **ChannelManager-based RMT4 driver** for ESP32 platf
 - ✅ **Direct hardware memory access** - High-performance pixel transmission
 - ✅ **Polling-based architecture** - Compatible with ChannelManager pattern
 - ✅ **Identical timing characteristics** - Drop-in replacement for legacy RMT4
+- ✅ **`IRMT4Peripheral` lifecycle wrapper** (#3458) - ESP-IDF API surface is
+   isolated behind a virtual interface mirroring `IUartPeripheral` /
+   `IRMT5Peripheral`. The ISR hot path stays inline IRAM and is **not**
+   virtualised (see `irmt4_peripheral.h` for the interface scope).
 
 ---
 
@@ -158,19 +162,32 @@ All interrupt handlers are marked `IRAM_ATTR` to ensure flash-safe execution:
 
 ## Platform Support
 
-| Platform | RMT Channels | Memory Blocks | IDF Version | Status |
+Channel and memory-block figures describe the silicon. This driver itself
+builds only on ESP-IDF 4.x — see the note under *Conditional Compilation*.
+
+| Platform | RMT Channels | Memory Blocks | RMT4 driver | Status |
 |----------|--------------|---------------|-------------|--------|
-| ESP32 (original) | 8 | 64 words/channel | IDF 4.x, 5.x | ✅ Tested |
-| ESP32-S2 | 4 | 64 words/channel | IDF 4.x, 5.x | ✅ Tested |
-| ESP32-S3 | 4 | 48 words/channel | IDF 4.x, 5.x | ✅ Tested |
-| ESP32-C3 | 2 | 48 words/channel | IDF 4.x, 5.x | ⚠️ Untested |
-| ESP32-C6 | 2 | 48 words/channel | IDF 5.x only | ⚠️ Untested |
-| ESP32-H2 | 2 | 48 words/channel | IDF 5.x only | ⚠️ Untested |
+| ESP32 (original) | 8 | 64 words/channel | ✅ IDF 4.x | ✅ Tested |
+| ESP32-S2 | 4 | 64 words/channel | ✅ IDF 4.x | ✅ Tested |
+| ESP32-S3 | 4 | 48 words/channel | ✅ IDF 4.x | ✅ Tested |
+| ESP32-C3 | 2 | 48 words/channel | ✅ IDF 4.x | ⚠️ Untested |
+| ESP32-C6 | 2 | 48 words/channel | ❌ RMT5-only silicon | n/a |
+| ESP32-H2 | 2 | 48 words/channel | ❌ RMT5-only silicon | n/a |
+
+ESP32-C6 and ESP32-H2 have a newer RMT architecture that the legacy driver does
+not target; `FASTLED_ESP32_RMT5_ONLY_PLATFORM` forces `FASTLED_RMT5=1` there
+regardless of IDF version.
 
 **Conditional Compilation:**
 - RMT4 driver used when `FASTLED_RMT5=0` (IDF 4.x default)
 - RMT5 driver used when `FASTLED_RMT5=1` (IDF 5.x with new RMT API)
 - Both drivers are mutually exclusive (compile-time selection)
+
+> **IDF 4.x only.** Setting `FASTLED_RMT5=0` on ESP‑IDF 5.x or newer is rejected
+> by `FastLED.h` with a compile-time diagnostic. This driver does not build
+> against IDF 5 headers — `RMTMEM` is not exposed publicly there, and the TX/RX
+> engines predate the current `IChannelDriver` / `RmtRxChannel` contracts. See
+> FastLED#3936.
 
 ---
 

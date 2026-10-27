@@ -35,25 +35,25 @@ namespace fl {
 /// Higher = preferred. The function is `constexpr` so callers can use it in
 /// constant expressions if needed. Buses without a registered priority fall
 /// back to 0.
-constexpr int default_bus_priority(Bus b) FL_NOEXCEPT {
+constexpr int default_bus_priority(Bus b, fl::u8 which) FL_NO_EXCEPT {
     // FORCE-style overrides (FASTLED_ESP32_FORCE_*) are intentionally not
     // applied here -- the legacy initChannelDrivers() retains its own
     // priority-bumping logic for backward compatibility. This table is the
     // baseline used by the new enableDrivers<>() opt-in API.
+    //
+    // Secondary FLEX_IO instances sit one below the primary so the
+    // manager fills the primary bank first and overflows to the
+    // secondary (classic-ESP32 I2S0 second bank, ESP32-P4 LCD_RGB —
+    // FastLED#3576 Phase 1).
     return
-        b == Bus::I2S_SPI       ? 10 :
-        b == Bus::LCD_SPI       ? 10 :
-        b == Bus::PARLIO        ? 4  :
-        b == Bus::LCD_RGB       ? 3  :
-        b == Bus::RMT           ? 2  :
-        b == Bus::LCD_CLOCKLESS ? 2  :
-        b == Bus::I2S           ? 1  :
-        b == Bus::FLEX_IO       ? 1  :
-        b == Bus::OBJECT_FLED   ? 1  :
-        b == Bus::SPI           ? 0  :
-        b == Bus::BIT_BANG      ? 0  :
-        b == Bus::STUB          ? 0  :
-        b == Bus::UART          ? -1 :
+        b == Bus::FLEX_IO   ? (which == 0 ? 4 : which == 1 ? 3 : 2) :
+        b == Bus::RMT       ? 2  :
+        b == Bus::SPI       ? 1  :
+        b == Bus::DUAL_SPI  ? 1  :
+        b == Bus::QUAD_SPI  ? 1  :
+        b == Bus::OCTAL_SPI ? 1  :
+        b == Bus::BIT_BANG  ? 0  :
+        b == Bus::UART      ? (which == 0 ? -1 : -2) :
         0;
 }
 

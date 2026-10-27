@@ -7,13 +7,13 @@ This directory contains shared code for all Raspberry Pi RP2xxx platforms (RP204
 ### PIO-Based Clockless LED Driver
 
 #### `clockless_rp_pio.h`
-**Purpose**: Core PIO-based implementation for clockless LED protocols (WS2812, WS2811, SK6812, etc.)
+**Purpose**: Legacy `addLeds<>()` clockless controller. Since #4589 it is a `fl::SlimBridgeController` over `ChannelEngineRpPio` (`BusTraits<Bus::FLEX_IO, 0>`), so legacy and Channel API strips share one PIO/DMA owner.
 
 **Key Features**:
-- Hardware-timed waveforms using PIO state machines
+- Hardware-timed waveforms using PIO state machines (via the channel engine)
 - DMA-based data transfer for efficient CPU usage
-- Automatic PIO instance selection (2 PIOs on RP2040, 3 on RP2350)
-- Fallback to Cortex-M0 bit-banging if PIO unavailable
+- `FASTLED_RP2040_CLOCKLESS_PIO 0` routes through `fl::SlimBridgeController` onto the blocking bit-bang engine `ChannelEngineRpBitBang` (`Bus::BIT_BANG`), with interrupts off for each frame
+- `FASTLED_RP2040_CLOCKLESS_PIO_AUTO 1` maps WS2812 `addLeds<>()` onto the same slim bridge / `ChannelEngineRpPio` (PIO0). Consecutive pins with matching length and timing share one multi-lane state machine, and independent strips run concurrently (#4620)
 - Supports all common clockless LED protocols with configurable timing
 
 **Platform Adaptation**:
@@ -168,6 +168,19 @@ Data:  GPIO 3, 5, 7, 9, 11, 13, 15, 17
 ---
 
 ### System Definitions
+
+#### Public SPI API routing
+
+RP2040's legacy `SPIOutput` template is intentionally software-only. The
+public `FastLED.addLeds<APA102...>()` and `FastLED.addLeds<SK9822...>()` paths
+are routed through the Channel API by `FASTLED_SPI_USES_CHANNEL_API` and use
+`ChannelEngineRpSpi` with the fixed-function PL022 SPI0/SPI1 drivers. This is
+the supported public hardware-SPI path for one LED stream.
+
+The PIO+DMA `SpiHw2`, `SpiHw4`, and `SpiHw8` implementations are reserved for
+`MultiLaneDevice`, which owns the per-lane buffers and performs bit
+transposition before transmission. They are not interchangeable with the
+single-channel `SpiChannelEngineAdapter`.
 
 #### `led_sysdefs_rp_common.h`
 **Purpose**: Common system definitions shared across all RP2xxx platforms

@@ -31,20 +31,22 @@ test_abs_include_args = [
 # chain with "module file has a different size or modification time than expected".
 # Instead, test_pch.h directly #includes FastLED.h, making this PCH self-contained.
 cpp_compiler = meson.get_compiler('cpp')
+test_pch_input_abs = path_norm_root + '/tests/test_pch.h'
 test_pch = custom_target('test_pch',
   input: 'test_pch.h',
   output: 'test_pch.h.pch',      # Only PCH is an output; .d file is depfile only
   depfile: 'test_pch.h.d',
-  depends: [fastled_lib],         # Ensure library is built first (tests link against it)
   command: [
     uv, 'run', 'python',
     meson.project_source_root() / 'ci/compile_pch.py',
-    cpp_compiler.cmd_array(),
+    native_pch_compiler,
     '-c',                          # Suppress linker step (MinGW driver adds link job without -c)
+    '-Wno-unused-command-line-argument',  # ...so drivers that add no link job report -c as unused
     '-x', 'c++-header',           # Treat input as C++ header
-    '@INPUT@',                     # test_pch.h
+    test_pch_input_abs,            # Canonical absolute forward-slash spelling
     '-o', '@OUTPUT@',              # test_pch.h.pch
     '-MD', '-MF', '@DEPFILE@',     # Generate dependency file (will be fixed by wrapper)
+    get_option('cpp_args'),        # Includes native-file SDK selection on Apple debug
     unit_test_compile_args,        # Same flags as all tests
     '-fPIC',                       # Required: tests build as shared_library which needs PIC
     test_abs_include_args,
@@ -85,7 +87,7 @@ runner_exe = executable('runner',
   'shared/runner.cpp',
   cpp_args: runner_cpp_args + [path_norm_I_src, path_norm_I_stub, path_norm_I_tests],
   link_args: runner_link_args,
-  link_with: [crash_handler_lib],  # Shared crash handler from root meson.build
+  link_with: [crash_handler_lib] + apple_runner_watchdog_libs,
   implicit_include_directories: false,
   install: false
 )
@@ -96,11 +98,14 @@ runner_exe = executable('runner',
 cache_script = meson.current_source_dir() / 'test_metadata_cache.py'
 tests_source_dir = meson.current_source_dir()
 tests_build_dir = meson.current_build_dir()
+# Find Python once for configuration helpers and test wrappers.
+python_exe = host_python
 
 # Check if cache is valid
 cache_check = run_command(
-  'python', cache_script, '--check', tests_source_dir, tests_build_dir,
-  check: false
+  python_exe, cache_script, '--check', tests_source_dir, tests_build_dir,
+  check: false,
+  env: host_python_env
 )
 
 if cache_check.returncode() == 0
@@ -112,17 +117,19 @@ else
   message('Running test discovery (cache invalid or missing)')
 
   discovery_result = run_command(
-    'python', meson.current_source_dir() / 'organize_tests.py',
+    python_exe, meson.current_source_dir() / 'organize_tests.py',
     tests_source_dir,
-    check: true
+    check: true,
+    env: host_python_env
   )
   test_metadata_output = discovery_result.stdout().strip()
 
   # Update cache
   run_command(
-    'python', cache_script, '--update',
+    python_exe, cache_script, '--update',
     tests_source_dir, tests_build_dir, test_metadata_output,
-    check: true
+    check: true,
+    env: host_python_env
   )
 endif
 
@@ -154,14 +161,8 @@ all_test_runners = []
 # Environment for test execution - ensure fastled.dll and runtime DLLs are discoverable
 test_env = environment()
 test_env.prepend('PATH', fastled_lib_dir)
-# Add clang-tool-chain runtime dirs so ASan/MinGW DLLs are found even when
-# zccache caches the link and skips ctc-clang++'s post-link deployment.
-foreach _rtdll_dir : runtime_dll_paths
-  test_env.prepend('PATH', _rtdll_dir)
-endforeach
-
-# Find python once for test wrapper (avoid 245 find_program calls inside loop)
-python_exe = find_program('python')
+# Windows GNU runtime DLLs are copied beside link outputs by the zccache
+# deploy hook. Linux/macOS use their linked runtime search paths instead.
 
 # ============================================================================
 # SHARED TEST OBJECTS (compiled once, reused by all test DLLs)
@@ -178,13 +179,70 @@ shared_test_cpp_args = test_abs_include_args + unit_test_compile_args + [
 ]
 
 test_shared_objs_lib = static_library('test_shared_objs',
-  ['doctest_main.cpp', 'shared/fl_unittest.cpp', 'misc' / 'coroutine_impl.cpp', test_pch],
+  [
+    # Relative, for the same reason as test_sources below: an absolute source
+    # path makes meson flatten the whole path into the object file's name
+    # (FastLED#2887).
+    'doctest_main.cpp',
+    'shared/fl_unittest.cpp',
+    'misc/coroutine_impl.cpp',
+    test_pch,
+  ],
   cpp_args: shared_test_cpp_args,
   pic: true,
   implicit_include_directories: false,
   install: false
 )
 shared_test_objects = test_shared_objs_lib.extract_all_objects(recursive: false)
+
+# P2 TINY layout probe: compile headers under an isolated tiny-memory
+# configuration. It deliberately does not link fastled_lib or use test_pch,
+# avoiding host-tier ODR/PCH contamination of sizeof assertions.
+color_profile_tiny_layout = executable('color_profile_tiny_layout',
+  'fl/channels/color_profile_tiny_layout.cpp',
+  cpp_args: test_abs_include_args + unit_test_compile_args + [
+    '-DFL_PLATFORM_HAS_TINY_MEMORY=1',
+    '-DFL_PLATFORM_HAS_LARGE_MEMORY=0',
+    '-DFL_PLATFORM_HAS_HUGE_MEMORY=0',
+    '-DFL_COLOR_PROFILE_RUNTIME=0',
+  ],
+  link_args: unit_test_link_args,
+  implicit_include_directories: false,
+  build_by_default: false,
+  install: false
+)
+test('color_profile_tiny_layout', color_profile_tiny_layout)
+
+# Consistent TINY production library plus runtime identity probe. Never link
+# against host-tier fastled_lib: the ABI/layout flags must match both sides.
+fastled_tiny_lib = static_library('fastled_tiny_profile',
+  fastled_sources + platforms_shared_files,
+  cpp_args: base_compile_args + test_abs_include_args + [
+    '-DFASTLED_BUILDING_DLL',
+    '-DFL_PLATFORM_HAS_TINY_MEMORY=1',
+    '-DFL_PLATFORM_HAS_LARGE_MEMORY=0',
+    '-DFL_PLATFORM_HAS_HUGE_MEMORY=0',
+    '-DFL_COLOR_PROFILE_RUNTIME=0',
+  ],
+  implicit_include_directories: false,
+  build_by_default: false,
+  install: false
+)
+color_profile_tiny_runtime = executable('color_profile_tiny_runtime',
+  'fl/channels/color_profile_tiny_runtime.cpp',
+  cpp_args: test_abs_include_args + unit_test_compile_args + [
+    '-DFL_PLATFORM_HAS_TINY_MEMORY=1',
+    '-DFL_PLATFORM_HAS_LARGE_MEMORY=0',
+    '-DFL_PLATFORM_HAS_HUGE_MEMORY=0',
+    '-DFL_COLOR_PROFILE_RUNTIME=0',
+  ],
+  link_args: unit_test_link_args,
+  link_with: fastled_tiny_lib,
+  implicit_include_directories: false,
+  build_by_default: false,
+  install: false
+)
+test('color_profile_tiny_runtime', color_profile_tiny_runtime)
 
 # Build each test as a DLL with shared PCH
 foreach test_name : test_names
@@ -193,6 +251,14 @@ foreach test_name : test_names
 
   # Test sources: only the unique test file + PCH dependency
   # doctest_main.cpp and fl_unittest.cpp are pre-compiled in shared_test_objects
+  # Relative, not absolute. Meson derives each object file's name from the
+  # source path it is given; an absolute source gets the entire path flattened
+  # into that name, e.g.
+  #   C__Users_me_dev_fastled_.claude_worktrees_my-branch_tests_misc_foo.cpp.obj
+  # `test_file` is already relative to this directory, so passing it directly
+  # collapses the object name to misc_foo.cpp.obj -- around 90 characters
+  # shorter per object. That matters on Windows, where the encoded name is what
+  # pushed builds under .claude/worktrees/<branch>/ past MAX_PATH (FastLED#2887).
   test_sources = [
     test_file,
     test_pch,
@@ -288,6 +354,7 @@ foreach test_name : test_names
     'fl_stl_asio_http_stream_server',    # HTTP stream server test
     'fl_stl_asio_http_stream_transport', # HTTP stream transport test
     'fl_stl_asio_http_test_utils_mock_http', # HTTP mock test utilities
+    'fl_stl_json_cross_thread',   # Threaded JSON stress takes ~35s under core ASan
   ]
 
   if test_name in slow_tests
@@ -302,9 +369,7 @@ foreach test_name : test_names
   # timeout to match the meson timeout (runner defaults to 20s otherwise).
   this_test_env = environment()
   this_test_env.prepend('PATH', fastled_lib_dir)
-  foreach _rtdll_dir : runtime_dll_paths
-    this_test_env.prepend('PATH', _rtdll_dir)
-  endforeach
+  # Runtime-DLL PATH injection removed — see test_env above and #3129 A6.
   this_test_env.set('FASTLED_TEST_TIMEOUT', test_timeout.to_string())
 
   if use_wrapper

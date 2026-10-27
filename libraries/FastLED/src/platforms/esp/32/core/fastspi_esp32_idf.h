@@ -3,6 +3,7 @@
 // IWYU pragma: private
 
 #include "platforms/esp/is_esp.h"
+#include "platforms/esp/esp_version.h"
 
 // ESP32 Hardware SPI implementation using native ESP-IDF driver
 // This file uses driver/spi_master.h for pure ESP-IDF builds without Arduino framework
@@ -24,12 +25,18 @@ FL_EXTERN_C_BEGIN
 #include "esp_heap_caps.h"
 #include "fl/stl/compiler_control.h"
 #include "fl/stl/noexcept.h"
+#include "fl/spi_bus.h"
 
 FL_DISABLE_WARNING_PUSH
 FL_DISABLE_WARNING_DEPRECATED_REGISTER
 FL_EXTERN_C_END
 
 namespace fl {
+
+#if !ESP_IDF_VERSION_4_OR_HIGHER
+#define SPI2_HOST HSPI_HOST
+#define SPI3_HOST VSPI_HOST
+#endif
 
 // Determine default SPI host based on chip variant
 #if defined(FL_IS_ESP_32S2) || defined(FL_IS_ESP_32S3) || \
@@ -58,7 +65,7 @@ public:
 
     ESP32SPIOutput()
         : mSPIHandle(nullptr)
-        , mHost(FASTLED_ESP32_DEFAULT_SPI_HOST)
+        , mHost(defaultHost())
         , mPSelect(nullptr)
         , mInitialized(false)
         , mInTransaction(false)
@@ -68,7 +75,7 @@ public:
 
     ESP32SPIOutput(Selectable* pSelect)
         : mSPIHandle(nullptr)
-        , mHost(FASTLED_ESP32_DEFAULT_SPI_HOST)
+        , mHost(defaultHost())
         , mPSelect(pSelect)
         , mInitialized(false)
         , mInTransaction(false)
@@ -87,11 +94,38 @@ public:
         }
     }
 
-    void setSelect(Selectable* pSelect) FL_NOEXCEPT {
+    void setSelect(Selectable* pSelect) FL_NO_EXCEPT {
         mPSelect = pSelect;
     }
 
-    void init() FL_NOEXCEPT {
+    void setBus(Esp32SpiBus bus) FL_NO_EXCEPT {
+        switch (bus) {
+            case Esp32SpiBus::HOST2:
+                mHost = SPI2_HOST;
+                break;
+            case Esp32SpiBus::HOST3:
+#if SOC_SPI_PERIPH_NUM > 2
+                mHost = SPI3_HOST;
+#else
+                FL_WARN("SPI3 is unavailable on this ESP32 target; using the default SPI host");
+                mHost = defaultHost();
+#endif
+                break;
+            case Esp32SpiBus::AUTO:
+                mHost = defaultHost();
+                break;
+        }
+    }
+
+    static spi_host_device_t defaultHost() FL_NO_EXCEPT {
+#ifdef FASTLED_ESP32_SPI_BUS
+        return static_cast<spi_host_device_t>(FASTLED_ESP32_SPI_BUS);
+#else
+        return FASTLED_ESP32_DEFAULT_SPI_HOST;
+#endif
+    }
+
+    void init() FL_NO_EXCEPT {
         if (mInitialized) {
             return;
         }
@@ -107,7 +141,14 @@ public:
         bus_config.flags = SPICOMMON_BUSFLAG_MASTER;
 
         // Initialize bus with auto DMA
-        esp_err_t ret = spi_bus_initialize(mHost, &bus_config, SPI_DMA_CH_AUTO);
+#if ESP_IDF_VERSION_4_OR_HIGHER
+        const int dma_channel = SPI_DMA_CH_AUTO;
+#else
+        // IDF 3.3 has no automatic allocation. HSPI and VSPI use distinct
+        // DMA channels with the same numeric IDs as their host constants.
+        const int dma_channel = static_cast<i32>(mHost);
+#endif
+        esp_err_t ret = spi_bus_initialize(mHost, &bus_config, dma_channel);
         if (ret != ESP_OK) {
             FL_WARN("SPI bus init failed: " << ret);
             return;
@@ -136,21 +177,21 @@ public:
     static void wait() {}
     static void waitFully() {}
 
-    void writeByteNoWait(u8 b) FL_NOEXCEPT __attribute__((always_inline)) {
+    void writeByteNoWait(u8 b) FL_NO_EXCEPT __attribute__((always_inline)) {
         writeByte(b);
     }
 
-    void writeBytePostWait(u8 b) FL_NOEXCEPT __attribute__((always_inline)) {
+    void writeBytePostWait(u8 b) FL_NO_EXCEPT __attribute__((always_inline)) {
         writeByte(b);
         wait();
     }
 
-    void writeWord(u16 w) FL_NOEXCEPT __attribute__((always_inline)) {
+    void writeWord(u16 w) FL_NO_EXCEPT __attribute__((always_inline)) {
         writeByte(static_cast<u8>(w >> 8));
         writeByte(static_cast<u8>(w & 0xFF));
     }
 
-    void writeByte(u8 b) FL_NOEXCEPT {
+    void writeByte(u8 b) FL_NO_EXCEPT {
         if (!mInitialized || !mSPIHandle) {
             return;
         }
@@ -163,7 +204,7 @@ public:
         spi_device_polling_transmit(mSPIHandle, &t);
     }
 
-    void writePixelsBulk(const CRGB* pixels, size_t n) FL_NOEXCEPT {
+    void writePixelsBulk(const CRGB* pixels, size_t n) FL_NO_EXCEPT {
         if (!mInitialized || !mSPIHandle || n == 0) {
             return;
         }
@@ -178,7 +219,7 @@ public:
         spi_device_polling_transmit(mSPIHandle, &t);
     }
 
-    void select() FL_NOEXCEPT {
+    void select() FL_NO_EXCEPT {
         if (!mInitialized) {
             return;
         }
@@ -192,7 +233,7 @@ public:
         }
     }
 
-    void release() FL_NOEXCEPT {
+    void release() FL_NO_EXCEPT {
         if (!mInitialized || !mInTransaction) {
             return;
         }
@@ -206,25 +247,25 @@ public:
         mInTransaction = false;
     }
 
-    void endTransaction() FL_NOEXCEPT {
+    void endTransaction() FL_NO_EXCEPT {
         waitFully();
         release();
     }
 
-    void writeBytesValue(u8 value, int len) FL_NOEXCEPT {
+    void writeBytesValue(u8 value, int len) FL_NO_EXCEPT {
         select();
         writeBytesValueRaw(value, len);
         release();
     }
 
-    void writeBytesValueRaw(u8 value, int len) FL_NOEXCEPT {
+    void writeBytesValueRaw(u8 value, int len) FL_NO_EXCEPT {
         while (len--) {
             writeByte(value);
         }
     }
 
     template <class D>
-    void writeBytes(FASTLED_REGISTER u8* data, int len) FL_NOEXCEPT {
+    void writeBytes(FASTLED_REGISTER u8* data, int len) FL_NO_EXCEPT {
         select();
         u8* end = data + len;
         while (data != end) {
@@ -234,14 +275,14 @@ public:
         release();
     }
 
-    void writeBytes(FASTLED_REGISTER u8* data, int len) FL_NOEXCEPT {
+    void writeBytes(FASTLED_REGISTER u8* data, int len) FL_NO_EXCEPT {
         writeBytes<DATA_NOP>(data, len);
     }
 
     static void finalizeTransmission() {}
 
     template <u8 BIT>
-    inline void writeBit(u8 b) FL_NOEXCEPT {
+    inline void writeBit(u8 b) FL_NO_EXCEPT {
         // Test bit BIT in value b, send 0xFF if set, 0x00 if clear
         writeByte((b & (1 << BIT)) ? 0xFF : 0x00);
     }
@@ -266,7 +307,7 @@ public:
                 D::adjust(pixels.loadAndScale0()),
                 D::adjust(pixels.loadAndScale1()),
                 D::adjust(pixels.loadAndScale2())
-            ) FL_NOEXCEPT;
+            );
             data_block[data_block_index++] = rgb;
             pixels.advanceData();
             pixels.stepDithering();

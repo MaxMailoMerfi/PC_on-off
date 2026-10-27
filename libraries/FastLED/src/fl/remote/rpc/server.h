@@ -5,6 +5,8 @@
 #include "fl/stl/optional.h"
 #include "fl/stl/vector.h"
 #include "fl/stl/noexcept.h"
+#include "fl/remote/rpc/response_stream.h"
+#include "fl/system/sketch_macros.h"
 
 namespace fl {
 
@@ -36,58 +38,69 @@ public:
      * Creates Server with no-op callbacks. Use setRequestSource/setResponseSink
      * to configure I/O, or call setRequestHandler() manually.
      */
-    Server() FL_NOEXCEPT;
+    Server() FL_NO_EXCEPT;
 
     /**
      * @brief Construct with I/O callbacks
      * @param source Function that returns next JSON-RPC request (or nullopt if none)
      * @param sink Function that handles outgoing JSON-RPC responses
      */
-    Server(RequestSource source, ResponseSink sink);
+    Server(RequestSource source, ResponseSink sink) FL_NO_EXCEPT;
 
-    virtual ~Server() FL_NOEXCEPT = default;
+    virtual ~Server() FL_NO_EXCEPT = default;
 
     // Non-copyable but movable
-    Server(const Server&) FL_NOEXCEPT = delete;
-    Server& operator=(const Server&) FL_NOEXCEPT = delete;
-    Server(Server&&) FL_NOEXCEPT = default;
-    Server& operator=(Server&&) FL_NOEXCEPT = default;
+    Server(const Server&) FL_NO_EXCEPT = delete;
+    Server& operator=(const Server&) FL_NO_EXCEPT = delete;
+    Server(Server&&) FL_NO_EXCEPT = default;
+    Server& operator=(Server&&) FL_NO_EXCEPT = default;
 
     /**
      * @brief Set request handler
      * @param handler Function that processes JSON-RPC requests and returns responses
      */
-    void setRequestHandler(RequestHandler handler);
+    void setRequestHandler(RequestHandler handler) FL_NO_EXCEPT;
 
     /**
      * @brief Set request source callback
      */
-    void setRequestSource(RequestSource source);
+    void setRequestSource(RequestSource source) FL_NO_EXCEPT;
 
     /**
      * @brief Set response sink callback
      */
-    void setResponseSink(ResponseSink sink);
+    void setResponseSink(ResponseSink sink) FL_NO_EXCEPT;
+
+    /**
+     * @brief Set streaming response sink callback
+     *
+     * The callback is invoked once per complete streamed JSON document. It
+     * owns transport framing such as serial prefixes and trailing newlines.
+     */
+    void setResponseStreamSink(ResponseStreamSink sink) FL_NO_EXCEPT;
 
     /**
      * @brief Main update: pull + push
      */
-    size_t update();
+    size_t update() FL_NO_EXCEPT;
 
     /**
      * @brief Pull requests from source, process, queue responses
      */
-    size_t pull();
+    size_t pull() FL_NO_EXCEPT;
 
     /**
      * @brief Push queued responses to sink
      */
-    size_t push();
+    size_t push() FL_NO_EXCEPT;
 
 protected:
     RequestSource mRequestSource;
     ResponseSink mResponseSink;
     RequestHandler mRequestHandler;
+#if FL_PLATFORM_HAS_LARGE_MEMORY
+    ResponseStreamSink mResponseStreamSink;
+#endif
     fl::vector<fl::json> mOutgoingQueue;
 };
 

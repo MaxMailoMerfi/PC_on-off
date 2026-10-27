@@ -1,12 +1,14 @@
 // platforms/esp/32/drivers/ble/ble_esp32.cpp.hpp
 // BLE GATT transport layer — ESP32 NimBLE C API implementation (IDF 5+)
 // Included via platforms/esp/32/drivers/ble/_build.cpp.hpp (unity build). Do NOT compile separately.
+// FL_LINT_ALLOW_GLOBAL_FILE(BLE mutable GATT service/characteristic table copies (fl_gatt_svr_svcs_mut / fl_gatt_chr_defs_mut) are patched once at BLE startup and handed to NimBLE by pointer. Migrating to `fl::Singleton<BleGattState>` is straightforward but deferred to a driver-focused PR so this linter-landing PR stays minimal — tracked under FastLED#3481.)
 
 #pragma once
 
 #include "fl/net/ble.h"
+#include "platforms/esp/is_esp.h"
 
-#if FL_BLE_AVAILABLE
+#if FL_BLE_AVAILABLE && defined(FL_IS_ESP32)
 
 #include "fl/stl/int.h"
 #include "fl/system/heap.h"
@@ -125,7 +127,7 @@ static const struct ble_gatt_svc_def fl_gatt_svr_svcs[] = {
 static struct ble_gatt_svc_def fl_gatt_svr_svcs_mut[2];
 static struct ble_gatt_chr_def fl_gatt_chr_defs_mut[3];
 
-static void fl_ble_patch_gatt_table(TransportState *state) FL_NOEXCEPT {
+static void fl_ble_patch_gatt_table(TransportState *state) FL_NO_EXCEPT {
     // Copy service table
     fl::memcpy(fl_gatt_svr_svcs_mut, fl_gatt_svr_svcs, sizeof(fl_gatt_svr_svcs));
     // Copy characteristic table
@@ -169,7 +171,7 @@ static int fl_ble_gatt_access_cb(u16 conn_handle, u16 attr_handle, // ok no noex
         fl::string val;
         val.resize(om_len);
         u16 out_len = 0;
-        int rc = ble_hs_mbuf_to_flat(ctxt->om, &val[0], om_len, &out_len);
+        int rc = ble_hs_mbuf_to_flat(ctxt->om, val.c_str_mutable(), om_len, &out_len);
         if (rc != 0) {
             FL_WARN("[BLE RX] mbuf_to_flat failed rc=" << rc);
             return BLE_ATT_ERR_UNLIKELY;
@@ -206,7 +208,7 @@ static int fl_ble_gatt_access_cb(u16 conn_handle, u16 attr_handle, // ok no noex
 // GAP event callback — handles connect, disconnect, adv complete
 // ---------------------------------------------------------------------------
 
-static void fl_ble_start_advertise(TransportState *state) FL_NOEXCEPT;
+static void fl_ble_start_advertise(TransportState *state) FL_NO_EXCEPT;
 
 static int fl_ble_gap_event_cb(struct ble_gap_event *event, void *arg) { // ok no noexcept
     auto *state = static_cast<TransportState *>(arg);
@@ -218,8 +220,7 @@ static int fl_ble_gap_event_cb(struct ble_gap_event *event, void *arg) { // ok n
             state->connected = true;
             FL_WARN("[BLE] Client connected, conn_handle=" << event->connect.conn_handle);
         } else {
-            FL_WARN("[BLE] Connection failed, status=" << event->connect.status
-                    << " — restarting advertising");
+            FL_WARN("[BLE] Connection failed, status=" << event->connect.status << " — restarting advertising");
             fl_ble_start_advertise(state);
         }
         break;
@@ -227,8 +228,7 @@ static int fl_ble_gap_event_cb(struct ble_gap_event *event, void *arg) { // ok n
     case BLE_GAP_EVENT_DISCONNECT:
         state->connected = false;
         state->connHandle = BLE_HS_CONN_HANDLE_NONE;
-        FL_WARN("[BLE] Client disconnected, reason=" << event->disconnect.reason
-                << " — restarting advertising");
+        FL_WARN("[BLE] Client disconnected, reason=" << event->disconnect.reason << " — restarting advertising");
         fl_ble_start_advertise(state);
         break;
 
@@ -239,9 +239,7 @@ static int fl_ble_gap_event_cb(struct ble_gap_event *event, void *arg) { // ok n
         break;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
-        FL_WARN("[BLE TX] subscribe event: cur_notify="
-                << (int)event->subscribe.cur_notify
-                << " cur_indicate=" << (int)event->subscribe.cur_indicate);
+        FL_WARN("[BLE TX] subscribe event: cur_notify=" << ((int)event->subscribe.cur_notify) << " cur_indicate=" << ((int)event->subscribe.cur_indicate));
         break;
 
     case BLE_GAP_EVENT_NOTIFY_TX:
@@ -261,7 +259,7 @@ static int fl_ble_gap_event_cb(struct ble_gap_event *event, void *arg) { // ok n
 // Advertising
 // ---------------------------------------------------------------------------
 
-static void fl_ble_start_advertise(TransportState *state) FL_NOEXCEPT {
+static void fl_ble_start_advertise(TransportState *state) FL_NO_EXCEPT {
     const char *name = ble_svc_gap_device_name();
 
     // Advertising packet: flags + device name (required for scanner discovery)
@@ -337,7 +335,7 @@ static void fl_ble_host_task(void *param) { // ok no noexcept
 // Public API implementation
 // ---------------------------------------------------------------------------
 
-TransportState* createTransport(const char* deviceName) FL_NOEXCEPT {
+TransportState* createTransport(const char* deviceName) FL_NO_EXCEPT {
     auto uptr = fl::make_unique<TransportState>();
     auto* state = uptr.get();
 
@@ -390,7 +388,7 @@ TransportState* createTransport(const char* deviceName) FL_NOEXCEPT {
     return state;
 }
 
-void destroyTransport(TransportState* state) FL_NOEXCEPT {
+void destroyTransport(TransportState* state) FL_NO_EXCEPT {
     if (!state) return;
     fl::unique_ptr<TransportState> guard(state); // ok no noexcept
 
@@ -413,7 +411,7 @@ void destroyTransport(TransportState* state) FL_NOEXCEPT {
     FL_WARN("[BLE] GATT server stopped");
 }
 
-StatusInfo queryStatus(const TransportState* state) FL_NOEXCEPT {
+StatusInfo queryStatus(const TransportState* state) FL_NO_EXCEPT {
     StatusInfo info;
     if (!state) return info;
     info.connected = state->connected;
@@ -426,7 +424,7 @@ StatusInfo queryStatus(const TransportState* state) FL_NOEXCEPT {
 }
 
 fl::pair<fl::function<fl::optional<fl::json>()>, fl::function<void(const fl::json&)>>
-getTransportCallbacks(TransportState* state) FL_NOEXCEPT {
+getTransportCallbacks(TransportState* state) FL_NO_EXCEPT {
     // RequestSource: polls ring buffer for incoming JSON-RPC
     auto requestSource = [state]() -> fl::optional<fl::json> {
         if (state->tail == state->head) {
@@ -505,4 +503,4 @@ getTransportCallbacks(TransportState* state) FL_NOEXCEPT {
 } // namespace net
 } // namespace fl
 
-#endif // FL_BLE_AVAILABLE
+#endif // FL_BLE_AVAILABLE && FL_IS_ESP32

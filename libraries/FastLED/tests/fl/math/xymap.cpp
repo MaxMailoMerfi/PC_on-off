@@ -3,12 +3,15 @@
 
 #include "fl/math/xymap.h"
 #include "fl/math/screenmap.h"
-#include "fl/test/fltest.h"
+#include "fl/math/xmap.h"
+#include "test.h"
 
 using namespace fl;
 
 // ============ XYMap Addressing Tests ============
 // Tests for XYMap layout transformations (serpentine, rectangular, etc)
+
+FL_TEST_FILE(FL_FILEPATH) {
 
 FL_TEST_CASE("ScreenMap stores source XYMap from toScreenMap conversion") {
     fl::XYMap xymap = fl::XYMap::constructSerpentine(4, 4);
@@ -156,7 +159,10 @@ FL_TEST_CASE("Corner case: All zeros buffer with addressing") {
 }
 
 FL_TEST_CASE("Corner case: All max brightness buffer with addressing") {
-    CRGB input[4] = {CRGB::White};
+    // All four, spelled out. `{CRGB::White}` initializes element 0 and
+    // value-initializes the rest to black, so the test asserted 255 on three
+    // pixels it had set to zero. It never failed because it never ran.
+    CRGB input[4] = {CRGB::White, CRGB::White, CRGB::White, CRGB::White};
     CRGB output[4] = {CRGB::Black};
 
     fl::XYMap addressing = fl::XYMap::constructRectangularGrid(2, 2);
@@ -283,3 +289,34 @@ FL_TEST_CASE("XYMap addressing with GBR color order (another permutation)") {
     FL_CHECK_EQ(output[1].r, 4);
     FL_CHECK_EQ(output[5].r, 10);
 }
+
+
+FL_TEST_CASE("[#4201] XYMap::fromXMap builds its own lookup table") {
+    // Regression. `fromXMap` asks `constructWithLookUpTable` to allocate the
+    // table and passes `nullptr` for the contents, meaning "I will fill it".
+    // The helper copied from that pointer unconditionally, so this crashed in
+    // `memcpy` -- taking every caller of `Channel::setScreenMap(const XMap&)`
+    // with it. The dormant `tests/fl/channels/channel.cpp` was the only thing
+    // exercising that path, so nothing caught it.
+    fl::XMap reverse = fl::XMap(4, true);
+    fl::XYMap mapped = fl::XYMap::fromXMap(reverse);
+
+    FL_CHECK_EQ(mapped.getWidth(), 4);
+    FL_CHECK_EQ(mapped.getHeight(), 1);
+    // Reverse addressing: physical 0 reads source 3, and so on.
+    for (fl::u16 i = 0; i < 4; ++i) {
+        FL_CHECK_EQ(mapped.mapToIndex(i, 0), reverse.mapToIndex(i));
+    }
+}
+
+FL_TEST_CASE("[#4201] constructWithLookUpTable copies a table when given one") {
+    // The other half of the same guard: a real table must still be copied,
+    // so the null case cannot be implemented by ignoring the argument.
+    const fl::u16 table[4] = {3, 2, 1, 0};
+    fl::XYMap mapped = fl::XYMap::constructWithLookUpTable(4, 1, table);
+    for (fl::u16 i = 0; i < 4; ++i) {
+        FL_CHECK_EQ(mapped.mapToIndex(i, 0), table[i]);
+    }
+}
+
+}  // FL_TEST_FILE

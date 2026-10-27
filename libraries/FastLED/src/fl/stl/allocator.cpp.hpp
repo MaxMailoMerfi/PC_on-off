@@ -52,30 +52,42 @@ void *DefaultAlloc(fl::size size) {
 }
 void DefaultFree(void *ptr) { heap_caps_free(ptr); }
 #else
-void *DefaultAlloc(fl::size size) { return malloc(size); }
-void DefaultFree(void *ptr) { free(ptr); }
+void *DefaultAlloc(fl::size size) FL_NO_EXCEPT { return malloc(size); }
+void DefaultFree(void *ptr) FL_NO_EXCEPT { free(ptr); }
 #endif
 
 void *(*Alloc)(fl::size) = DefaultAlloc;
 void (*Dealloc)(void *) = DefaultFree;
 
 #if defined(FASTLED_TESTING)
-// Test hook interface pointer
-MallocFreeHook* gMallocFreeHook = nullptr;
+// Test hook interface pointer. Storage lives inside a Singleton so
+// `--gc-sections` can drop it together with Singleton<T>::instance() when no
+// test installs a hook (FastLED#3484 / #3481).
+// Already inside this file's anonymous namespace.
+//
+// Safe to call from inside Malloc()/Free(): Singleton<T>::instance()
+// placement-news into a static char buffer and never touches the heap, so
+// routing the hook lookup through it cannot recurse back into the allocator.
+struct MallocFreeHookState {
+    MallocFreeHook* hook = nullptr;
+};
+inline MallocFreeHook*& malloc_free_hook() FL_NO_EXCEPT {
+    return fl::Singleton<MallocFreeHookState>::instance().hook;
+}
 
-int& tls_reintrancy_count() {
+int& tls_reintrancy_count() FL_NO_EXCEPT {
     return SingletonThreadLocal<int>::instance();
 }
 
 struct MemoryGuard {
     int& reintrancy_count;
-    MemoryGuard() FL_NOEXCEPT : reintrancy_count(tls_reintrancy_count()) {
+    MemoryGuard() FL_NO_EXCEPT : reintrancy_count(tls_reintrancy_count()) {
         reintrancy_count++;
     }
-    ~MemoryGuard() FL_NOEXCEPT {
+    ~MemoryGuard() FL_NO_EXCEPT {
         reintrancy_count--;
     }
-    bool enabled() const {
+    bool enabled() const FL_NO_EXCEPT {
         return reintrancy_count <= 1;
     }
 };
@@ -86,7 +98,7 @@ struct MemoryGuard {
 // If the first access happens during a memory allocation callback, we get
 // recursion. By initializing during static construction, we ensure the
 // ThreadLocal is ready before any test code runs.
-void init_tls_reentrancy() {
+void init_tls_reentrancy() FL_NO_EXCEPT {
     (void)tls_reintrancy_count();
 }
 
@@ -97,26 +109,26 @@ FL_INIT(allocator_init_wrapper, init_tls_reentrancy)
 } // namespace
 
 #if defined(FASTLED_TESTING)
-void SetMallocFreeHook(MallocFreeHook* hook) {
+void SetMallocFreeHook(MallocFreeHook* hook) FL_NO_EXCEPT {
     // Pre-initialize reentrancy counter to avoid recursive malloc during first hook call.
     // On macOS, ThreadLocal uses pthread_setspecific which calls operator new,
     // triggering recursive Malloc() that would corrupt the reentrancy counter.
     (void)tls_reintrancy_count();
 
-    gMallocFreeHook = hook;
+    malloc_free_hook() = hook;
 }
 
-void ClearMallocFreeHook() {
-    gMallocFreeHook = nullptr;
+void ClearMallocFreeHook() FL_NO_EXCEPT {
+    malloc_free_hook() = nullptr;
 }
 #endif
 
-void SetPSRamAllocator(void *(*alloc)(fl::size), void (*free)(void *)) {
+void SetPSRamAllocator(void *(*alloc)(fl::size), void (*free)(void *)) FL_NO_EXCEPT {
     Alloc = alloc;
     Dealloc = free;
 }
 
-void *PSRamAllocate(fl::size size, bool zero) {
+void *PSRamAllocate(fl::size size, bool zero) FL_NO_EXCEPT {
 
     void *ptr = Alloc(size);
     if (ptr && zero) {
@@ -124,10 +136,10 @@ void *PSRamAllocate(fl::size size, bool zero) {
     }
     
 #if defined(FASTLED_TESTING)
-    if (gMallocFreeHook && ptr) {
+    if (malloc_free_hook() && ptr) {
         MemoryGuard allows_hook;
         if (allows_hook.enabled()) {
-            gMallocFreeHook->onMalloc(ptr, size);
+            malloc_free_hook()->onMalloc(ptr, size);
         }
     }
 #endif
@@ -135,13 +147,13 @@ void *PSRamAllocate(fl::size size, bool zero) {
     return ptr;
 }
 
-void PSRamDeallocate(void *ptr) {
+void PSRamDeallocate(void *ptr) FL_NO_EXCEPT {
 #if defined(FASTLED_TESTING)
-    if (gMallocFreeHook && ptr) {
-        // gMallocFreeHook->onFree(ptr);
+    if (malloc_free_hook() && ptr) {
+        // malloc_free_hook()->onFree(ptr);
         MemoryGuard allows_hook;
         if (allows_hook.enabled()) {
-            gMallocFreeHook->onFree(ptr);
+            malloc_free_hook()->onFree(ptr);
         }
     }
 #endif
@@ -149,14 +161,14 @@ void PSRamDeallocate(void *ptr) {
     Dealloc(ptr);
 }
 
-void* Malloc(fl::size size) { 
+void* Malloc(fl::size size) FL_NO_EXCEPT {
     void* ptr = Alloc(size); 
     
 #if defined(FASTLED_TESTING)
-    if (gMallocFreeHook && ptr) {
+    if (malloc_free_hook() && ptr) {
         MemoryGuard allows_hook;    
         if (allows_hook.enabled()) {
-            gMallocFreeHook->onMalloc(ptr, size);
+            malloc_free_hook()->onMalloc(ptr, size);
         }
     }
 #endif
@@ -164,12 +176,12 @@ void* Malloc(fl::size size) {
     return ptr;
 }
 
-void Free(void *ptr) {
+void Free(void *ptr) FL_NO_EXCEPT {
 #if defined(FASTLED_TESTING)
-    if (gMallocFreeHook && ptr) {
+    if (malloc_free_hook() && ptr) {
         MemoryGuard allows_hook;
         if (allows_hook.enabled()) {
-            gMallocFreeHook->onFree(ptr);
+            malloc_free_hook()->onFree(ptr);
         }
     }
 #endif
@@ -241,40 +253,48 @@ namespace detail {
 
 // Process-wide SlabAllocator registry.
 // Ensures all DLLs share the same SlabAllocator for a given (block_size, slab_size).
-// Simple fixed-size array since the number of unique allocator types is small.
+// State lives inside a Singleton so `--gc-sections` can drop the 64-entry table
+// (~1.5 KB `.bss`) when no slab allocator is ever created (FastLED#3481).
 namespace {
     struct SlabRegistryEntry {
         fl::size block_size;
         fl::size slab_size;
         void* allocator;
     };
-    static constexpr int SLAB_REGISTRY_MAX = 64;
-    static SlabRegistryEntry slab_registry[SLAB_REGISTRY_MAX];
-    static int slab_registry_count = 0;
+    struct SlabRegistryState {
+        static constexpr int MAX = 64;
+        SlabRegistryEntry entries[MAX]{};
+        int count = 0;
+    };
+    inline SlabRegistryState& slab_registry_state() FL_NO_EXCEPT {
+        return fl::Singleton<SlabRegistryState>::instance();
+    }
 } // anonymous namespace
 
-void* slab_allocator_registry_get(fl::size block_size, fl::size slab_size) {
-    for (int i = 0; i < slab_registry_count; i++) {
-        if (slab_registry[i].block_size == block_size &&
-            slab_registry[i].slab_size == slab_size) {
-            return slab_registry[i].allocator;
+void* slab_allocator_registry_get(fl::size block_size, fl::size slab_size) FL_NO_EXCEPT {
+    auto& s = slab_registry_state();
+    for (int i = 0; i < s.count; i++) {
+        if (s.entries[i].block_size == block_size &&
+            s.entries[i].slab_size == slab_size) {
+            return s.entries[i].allocator;
         }
     }
     return nullptr;
 }
 
-void slab_allocator_registry_set(fl::size block_size, fl::size slab_size, void* allocator) {
+void slab_allocator_registry_set(fl::size block_size, fl::size slab_size, void* allocator) FL_NO_EXCEPT {
+    auto& s = slab_registry_state();
     // Check if already registered (update)
-    for (int i = 0; i < slab_registry_count; i++) {
-        if (slab_registry[i].block_size == block_size &&
-            slab_registry[i].slab_size == slab_size) {
-            slab_registry[i].allocator = allocator;
+    for (int i = 0; i < s.count; i++) {
+        if (s.entries[i].block_size == block_size &&
+            s.entries[i].slab_size == slab_size) {
+            s.entries[i].allocator = allocator;
             return;
         }
     }
     // Add new entry
-    if (slab_registry_count < SLAB_REGISTRY_MAX) {
-        slab_registry[slab_registry_count++] = {block_size, slab_size, allocator};
+    if (s.count < SlabRegistryState::MAX) {
+        s.entries[s.count++] = {block_size, slab_size, allocator};
     }
 }
 

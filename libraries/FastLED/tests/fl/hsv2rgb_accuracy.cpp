@@ -6,6 +6,7 @@
 #include "fl/stl/pair.h"
 #include "fl/stl/utility.h"
 #include "fl/stl/vector.h"
+#include "fl/gfx/colorutils.h"
 #include "chsv.h"
 #include "crgb.h"
 #include "test.h"
@@ -189,6 +190,99 @@ FL_TEST_CASE("HSV to RGB Conversion Accuracy Comparison") {
     FL_CHECK_LT(rainbow_stats.average, fullspectrum_stats.average);
 }
 
+FL_TEST_CASE("rgb2hsv_approximate - orange is not reported as green (issue #436)") {
+    // The Orange->Yellow branch computed (g - 85) + (171 - r), which goes
+    // negative for every r > 171 and then wrapped when truncated to u8 inside
+    // qsub8(). Orange came back green: rgb(255,153,0) reported hue 122.
+    struct Case {
+        u8 r, g, b;
+        u8 expected_hue;
+        const char *source;
+    };
+    const Case cases[] = {
+        {255, 153, 0, 26, "issue body"},
+        {255, 128, 0, 21, "cad435 #ff8000"},
+        {255, 166, 0, 24, "DrJaymz"},
+        {255, 143, 0, 25, "5chmidti precise impl"},
+    };
+
+    for (const auto &c : cases) {
+        CRGB original(c.r, c.g, c.b);
+        CHSV hsv = rgb2hsv_approximate(original);
+        CRGB roundtrip;
+        hsv2rgb_rainbow(hsv, roundtrip);
+        FL_WARN("rgb(" << (int)c.r << "," << (int)c.g << "," << (int)c.b
+                       << ") -> hue " << (int)hsv.hue << " -> rgb("
+                       << (int)roundtrip.r << "," << (int)roundtrip.g << ","
+                       << (int)roundtrip.b << ")   [" << c.source
+                       << ", standard-HSV hue would be " << (int)c.expected_hue
+                       << "]");
+        // Orange must land in the red..yellow arc, never in the greens. This
+        // is the actual regression: these all returned 110-130 before.
+        FL_CHECK_LE((int)hsv.hue, (int)HUE_YELLOW);
+        // rgb2hsv_approximate inverts hsv2rgb_rainbow, not a textbook HSV
+        // hexagon, so correctness is round-trip fidelity rather than agreement
+        // with a standard-HSV hue. Green must stay the middle channel and blue
+        // must stay dark -- i.e. it still looks orange.
+        FL_CHECK_GT((int)roundtrip.r, (int)roundtrip.g);
+        FL_CHECK_GT((int)roundtrip.g, (int)roundtrip.b);
+    }
+}
+
+FL_TEST_CASE("rgb2hsv_approximate - scaling does not wrap channels (issue #1074)") {
+    const CRGB original(218, 137, 48);
+    const CHSV hsv = rgb2hsv_approximate(original);
+    const CRGB roundtrip = hsv2rgb_rainbow(hsv);
+
+    // Scaling the desaturated channels produces an intermediate red value of
+    // 299. It must be normalized, not truncated to 43, which incorrectly
+    // makes green the dominant channel and moves this orange into green hues.
+    FL_CHECK_LE((int)hsv.hue, (int)HUE_YELLOW);
+    FL_CHECK_EQ((int)hsv.value, 255);
+    FL_CHECK_GT((int)roundtrip.r, (int)roundtrip.g);
+    FL_CHECK_GT((int)roundtrip.g, (int)roundtrip.b);
+}
+
+FL_TEST_CASE("rgb2hsv_approximate - hue stays in the red..yellow arc red -> yellow") {
+    // Sweeping green up at full red walks hue from red toward yellow. The
+    // underflow made this jump out into the greens partway through (46 -> 115
+    // -> 121 -> 126 -> 35), which is what made the bug so visible in fades.
+    //
+    // KNOWN LIMITATION: there is still a small backwards step of about 5 at
+    // g=128, where the Red-Orange and Orange-Yellow branches meet. The branch
+    // boundary sits at g = r/2, which does not correspond to HUE_ORANGE, so
+    // the two branches are calibrated against different endpoints. Closing
+    // that gap means recalibrating both branches together rather than fixing
+    // one expression, so it is left for follow-up -- a 5-unit seam is not
+    // visible where a 70-unit jump into green very much was.
+    const int kKnownSeam = 8;
+    int previous = -1;
+    for (int g = 0; g <= 255; g += 15) {
+        CHSV hsv = rgb2hsv_approximate(CRGB(255, g, 0));
+        FL_WARN("rgb(255," << g << ",0) -> hue " << (int)hsv.hue);
+        // The real regression check: never leave the red..yellow arc.
+        FL_CHECK_LE((int)hsv.hue, (int)HUE_YELLOW + 4);
+        FL_CHECK_GE((int)hsv.hue, previous - kKnownSeam);
+        previous = static_cast<int>(hsv.hue);
+    }
+}
+
+FL_TEST_CASE("rgb2hsv_approximate - greys report zero saturation") {
+    for (int level = 0; level <= 255; level += 51) {
+        CHSV hsv = rgb2hsv_approximate(CRGB(level, level, level));
+        FL_WARN("grey " << level << " -> sat " << (int)hsv.sat);
+        FL_CHECK_EQ((int)hsv.sat, 0);
+    }
+}
+
+FL_TEST_CASE("hsv2rgb_rainbow keeps mixed hues at low CHSV values (issue #1016)") {
+    CRGB rgb = hsv2rgb_rainbow(CHSV(80, 255, 30));
+
+    FL_CHECK_GT(rgb.r, 0);
+    FL_CHECK_GT(rgb.g, 0);
+    FL_CHECK_EQ(rgb.b, 0);
+}
+
 FL_TEST_CASE("HSV to RGB Conversion - Specific Color Tests") {
     FL_WARN("=== Specific Color Conversion Tests ===");
     
@@ -232,29 +326,81 @@ FL_TEST_CASE("HSV to RGB Conversion - Specific Color Tests") {
     FL_WARN("");
 }
 
-FL_TEST_CASE("HSV to RGB Conversion - Hue Sweep Test") {
-    FL_WARN("=== Hue Sweep Conversion Test ===");
-    FL_WARN("Testing full hue range at maximum saturation and brightness");
-    FL_WARN("");
-    FL_WARN("Hue   Rainbow RGB     Spectrum RGB    FullSpectrum RGB");
-    FL_WARN("----  -----------     ------------    ----------------");
-    
-    // Test hue sweep at full saturation and brightness
-    // Increased step from 1 to 4 for performance (256 -> 64 iterations = 75% reduction)
-    // Still provides excellent hue sweep coverage with 64 samples
-    for (int hue = 0; hue < 256; hue += 4) {
-        CHSV hsv(hue, 255, 255);
-        
-        CRGB rainbow_rgb, spectrum_rgb, fullspectrum_rgb;
-        hsv2rgb_rainbow(hsv, rainbow_rgb);
-        hsv2rgb_spectrum(hsv, spectrum_rgb);
-        hsv2rgb_fullspectrum(hsv, fullspectrum_rgb);
-        
-        FL_WARN(hue << "   (" << (int)rainbow_rgb.r << "," << (int)rainbow_rgb.g << "," << (int)rainbow_rgb.b << ")   (" <<
-                (int)spectrum_rgb.r << "," << (int)spectrum_rgb.g << "," << (int)spectrum_rgb.b << ")   (" <<
-                (int)fullspectrum_rgb.r << "," << (int)fullspectrum_rgb.g << "," << (int)fullspectrum_rgb.b << ")");
+// The hue ramps are hand-written piecewise functions: eight 32-hue sections
+// selected by bit tests on the hue, joined by magic constants (K85/K170/K171)
+// and compile-time switches (Y1/Y2/G2/Gscale). Nothing structurally forces one
+// section to end on the value the next one starts from, so a wrong constant
+// surfaces as a single off-colour pixel mid-ramp -- exactly the "unexpected red
+// pixel midway through the yellow region" reported in FastLED#668.
+//
+// Measured maxima at full saturation/value are rainbow=6, spectrum=4,
+// fullspectrum=6. A broken section boundary is tens, so 8 leaves room for a
+// constant to be nudged without hiding a real break.
+static const int kMaxHueStep = 8;
+
+static int iabs(int v) { return v < 0 ? -v : v; }
+
+// Largest per-channel change between two adjacent colors.
+static int channel_step(const CRGB& a, const CRGB& b) {
+    const int dr = iabs(int(b.r) - int(a.r));
+    const int dg = iabs(int(b.g) - int(a.g));
+    const int db = iabs(int(b.b) - int(a.b));
+    int worst = dr > dg ? dr : dg;
+    return db > worst ? db : worst;
+}
+
+static void check_ramp_is_continuous(const char* name,
+                                     void (*convert)(const CHSV&, CRGB&)) {
+    int worst = 0;
+    int worst_hue = -1;
+    for (int hue = 0; hue < 256; hue++) {
+        const int next = (hue + 1) & 0xFF;  // includes the 255 -> 0 wrap
+        CRGB a, b;
+        convert(CHSV(fl::u8(hue), 255, 255), a);
+        convert(CHSV(fl::u8(next), 255, 255), b);
+        const int step = channel_step(a, b);
+        if (step > worst) {
+            worst = step;
+            worst_hue = hue;
+        }
     }
-    FL_WARN("");
+    if (worst > kMaxHueStep) {
+        FL_WARN(name << ": discontinuity of " << worst << " between hue "
+                     << worst_hue << " and " << ((worst_hue + 1) & 0xFF)
+                     << " (allowed " << kMaxHueStep << ")");
+    }
+    FL_CHECK(worst <= kMaxHueStep);
+}
+
+FL_TEST_CASE("HSV to RGB Conversion - hue ramps have no discontinuity") {
+    // Every adjacent hue pair, not a sample of every fourth one: a lone bad
+    // hue is the whole failure mode, and sampling steps right over it.
+    check_ramp_is_continuous("rainbow", hsv2rgb_rainbow);
+    check_ramp_is_continuous("spectrum", hsv2rgb_spectrum);
+    check_ramp_is_continuous("fullspectrum", hsv2rgb_fullspectrum);
+}
+
+FL_TEST_CASE("fill_rainbow has no isolated off-colour pixel (issue #668)") {
+    // #668 reported a lone red pixel partway through the yellow region of a
+    // 114-LED strip filled with exactly this call.
+    const int kNumLeds = 114;
+    CRGB leds[kNumLeds];
+    fill_rainbow(leds, kNumLeds, 0, 1);
+
+    int worst = 0;
+    int worst_index = -1;
+    for (int i = 1; i < kNumLeds; i++) {
+        const int step = channel_step(leds[i - 1], leds[i]);
+        if (step > worst) {
+            worst = step;
+            worst_index = i;
+        }
+    }
+    if (worst > kMaxHueStep) {
+        FL_WARN("fill_rainbow: pixel " << worst_index << " jumps by " << worst
+                                       << " (allowed " << kMaxHueStep << ")");
+    }
+    FL_CHECK(worst <= kMaxHueStep);
 }
 
 } // FL_TEST_FILE

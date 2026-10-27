@@ -1,8 +1,31 @@
 // AutoResearchHelpers.cpp - Helper function implementations
 
+// Gate out under low-memory mode -- the LowMemory bring-up surface
+// (AutoResearchLowMemory.h) carries its own minimal helper inlined into
+// the .ino, and the full helpers here pull in fl/channels/manager.h and
+// the validation suite which exceed the LPC845 / Tiny-memory budgets.
+// Matches the conditional structure in AutoResearch.ino itself.
+#include "fl/system/sketch_macros.h"
+#if FL_PLATFORM_HAS_LARGE_MEMORY
+
 #include "AutoResearchHelpers.h"
 #include "fl/channels/manager.h"
+#include "fl/stl/cstdio.h"
 #include "fl/stl/sstream.h"
+
+// PR #3421 framework-hang fix: gate FL_WARN sstream construction on log
+// level so the heap-backed sstream is never built under ScopedLogDisable.
+// See AutoResearchTest.cpp for the full investigation note.
+#define AR_FL_WARN(...) do { \
+    if (fl::getLogLevel() >= static_cast<fl::u8>(fl::LogLevel::FL_LOG_LEVEL_WARN)) { \
+        FL_WARN(__VA_ARGS__); \
+    } \
+} while (0)
+#define AR_FL_ERROR(...) do { \
+    if (fl::getLogLevel() >= static_cast<fl::u8>(fl::LogLevel::FL_LOG_LEVEL_ERROR)) { \
+        FL_ERROR(__VA_ARGS__); \
+    } \
+} while (0)
 #include "fl/system/pin.h"  // Platform-independent pin API
 #include "fl/channels/detail/validation/rx_test.h"
 #include "fl/channels/detail/validation/platform.h"
@@ -51,13 +74,13 @@ void testDriver(
     // names at runtime, so we use the by-name helper (auto-enables all
     // drivers first to ensure the lookup succeeds).
     if (!autoResearchSetExclusiveDriverByName(driver_name)) {
-        FL_ERROR("Failed to set " << driver_name << " as exclusive driver");
+        AR_FL_ERROR("Failed to set " << driver_name << " as exclusive driver");
         result.skipped = true;
         return;
     }
-    FL_WARN(driver_name << " driver enabled exclusively\n");
+    AR_FL_WARN(driver_name << " driver enabled exclusively\n");
 
-    FL_WARN("[CONFIG] Driver: " << driver_name << " (physical jumper required)\n");
+    AR_FL_WARN("[CONFIG] Driver: " << driver_name << " (physical jumper required)\n");
 
     // Create TX configuration for autoresearch tests.
     // Build the ClocklessChipset explicitly so the encoder selector (carried
@@ -65,7 +88,7 @@ void testDriver(
     fl::ClocklessChipset chipset(pin_data, timing_config.timing, timing_config.encoder);
     fl::ChannelConfig tx_config(chipset, fl::span<CRGB>(leds, num_leds), color_order);
 
-    FL_WARN("[INFO] Testing " << timing_config.name << " timing\n");
+    AR_FL_WARN("[INFO] Testing " << timing_config.name << " timing\n");
 
     // Create autoresearch configuration with all input parameters
     fl::AutoResearchConfig autoresearch_config(
@@ -82,18 +105,18 @@ void testDriver(
 
     // FIRST RUN: Discard results (timing warm-up)
     // TX channel construction may have extra latency on first run
-    FL_WARN("[INFO] Running warm-up frame (results will be discarded)");
+    AR_FL_WARN("[INFO] Running warm-up frame (results will be discarded)");
     int warmup_total = 0, warmup_passed = 0;
     uint32_t warmup_duration_ms = 0;
     autoResearchChipsetTiming(autoresearch_config, warmup_total, warmup_passed, warmup_duration_ms);
-    FL_WARN("[INFO] Warm-up complete (" << warmup_passed << "/" << warmup_total << " passed - discarding)");
+    AR_FL_WARN("[INFO] Warm-up complete (" << warmup_passed << "/" << warmup_total << " passed - discarding)");
 
     // SECOND RUN: Keep results (actual test)
-    FL_WARN("[INFO] Running actual test frame");
+    AR_FL_WARN("[INFO] Running actual test frame");
     uint32_t test_duration_ms = 0;
     autoResearchChipsetTiming(autoresearch_config, result.total_tests, result.passed_tests, test_duration_ms);
 
-    FL_WARN("\n[INFO] All timing tests complete for " << driver_name << " driver");
+    AR_FL_WARN("\n[INFO] All timing tests complete for " << driver_name << " driver");
 }
 
 void printSummaryTable(const fl::vector<fl::DriverTestResult>& driver_results) {
@@ -102,3 +125,5 @@ void printSummaryTable(const fl::vector<fl::DriverTestResult>& driver_results) {
 }
 
 // Build test matrix configuration from preprocessor defines and available drivers
+
+#endif  // FL_PLATFORM_HAS_LARGE_MEMORY

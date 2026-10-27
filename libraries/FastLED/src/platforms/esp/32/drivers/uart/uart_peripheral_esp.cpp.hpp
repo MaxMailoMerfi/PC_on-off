@@ -12,11 +12,7 @@
 
 #include "platforms/esp/32/drivers/uart/uart_peripheral_esp.h"
 #include "fl/log/log.h"
-#include "fl/log/log.h"
 #include "fl/stl/noexcept.h"
-// IWYU pragma: begin_keep
-#include "fl/system/arduino.h"
-// IWYU pragma: end_keep
 
 // Include ESP-IDF headers ONLY in .cpp file
 FL_EXTERN_C_BEGIN
@@ -56,7 +52,7 @@ namespace fl {
 // Constructor / Destructor
 //=============================================================================
 
-UartPeripheralEsp::UartPeripheralEsp()
+UartPeripheralEsp::UartPeripheralEsp() FL_NO_EXCEPT
     : mConfig(),
       mInitialized(false),
       mResetExpireTime(0) {
@@ -73,9 +69,8 @@ UartPeripheralEsp::~UartPeripheralEsp() {
 // Lifecycle Methods
 //=============================================================================
 
-bool UartPeripheralEsp::initialize(const UartPeripheralConfig& config) FL_NOEXCEPT {
-    FL_DBG("UART_PERIPH: initialize() called - uart_num=" << config.mUartNum
-           << " baud=" << config.mBaudRate);
+bool UartPeripheralEsp::initialize(const UartPeripheralConfig& config) FL_NO_EXCEPT {
+    FL_DBG("UART_PERIPH: initialize() called - uart_num=" << config.mUartNum << " baud=" << config.mBaudRate);
 
     // Validate not already initialized
     if (mInitialized) {
@@ -92,7 +87,18 @@ bool UartPeripheralEsp::initialize(const UartPeripheralConfig& config) FL_NOEXCE
     // Configure UART parameters
     uart_config_t uart_config = {};
     uart_config.baud_rate = static_cast<int>(config.mBaudRate);
-    uart_config.data_bits = UART_DATA_8_BITS;
+    // Word length per the selected wave geometry: 8 data bits for
+    // wave10 (5 pulses/LED-bit), 6 for wave8-frame (4 pulses/LED-bit).
+    switch (config.mDataBits) {
+    case 5: uart_config.data_bits = UART_DATA_5_BITS; break;
+    case 6: uart_config.data_bits = UART_DATA_6_BITS; break;
+    case 7: uart_config.data_bits = UART_DATA_7_BITS; break;
+    case 8: uart_config.data_bits = UART_DATA_8_BITS; break;
+    default:
+        FL_WARN("UartPeripheralEsp: Invalid data bits (" << (static_cast<int>(config.mDataBits)) << "), defaulting to 8");
+        uart_config.data_bits = UART_DATA_8_BITS;
+        break;
+    }
     uart_config.parity = UART_PARITY_DISABLE;
 
     // Map stop bits (1 or 2)
@@ -101,8 +107,7 @@ bool UartPeripheralEsp::initialize(const UartPeripheralConfig& config) FL_NOEXCE
     } else if (config.mStopBits == 2) {
         uart_config.stop_bits = UART_STOP_BITS_2;
     } else {
-        FL_WARN("UartPeripheralEsp: Invalid stop bits (" << config.mStopBits
-                << "), defaulting to 1");
+        FL_WARN("UartPeripheralEsp: Invalid stop bits (" << config.mStopBits << "), defaulting to 1");
         uart_config.stop_bits = UART_STOP_BITS_1;
     }
 
@@ -171,15 +176,12 @@ bool UartPeripheralEsp::initialize(const UartPeripheralConfig& config) FL_NOEXCE
     }
 
     mInitialized = true;
-    FL_DBG("UART: Initialized (uart_num=" << config.mUartNum
-           << ", baud=" << config.mBaudRate
-           << ", tx_pin=" << config.mTxPin
-           << ", tx_inverted=true)");
+    FL_DBG("UART: Initialized (uart_num=" << config.mUartNum << ", baud=" << config.mBaudRate << ", tx_pin=" << config.mTxPin << ", tx_inverted=true)");
 
     return true;
 }
 
-void UartPeripheralEsp::deinitialize() FL_NOEXCEPT {
+void UartPeripheralEsp::deinitialize() FL_NO_EXCEPT {
     if (!mInitialized) {
         return;
     }
@@ -205,7 +207,7 @@ void UartPeripheralEsp::deinitialize() FL_NOEXCEPT {
     FL_DBG("UART: Deinitialized (uart_num=" << mConfig.mUartNum << ")");
 }
 
-bool UartPeripheralEsp::isInitialized() const FL_NOEXCEPT {
+bool UartPeripheralEsp::isInitialized() const FL_NO_EXCEPT {
     return mInitialized;
 }
 
@@ -213,7 +215,7 @@ bool UartPeripheralEsp::isInitialized() const FL_NOEXCEPT {
 // Transmission Methods
 //=============================================================================
 
-bool UartPeripheralEsp::writeBytes(const u8* data, size_t length) FL_NOEXCEPT {
+bool UartPeripheralEsp::writeBytes(const u8* data, size_t length) FL_NO_EXCEPT {
     if (!mInitialized) {
         FL_WARN("UartPeripheralEsp: Cannot write - not initialized");
         return false;
@@ -258,7 +260,7 @@ bool UartPeripheralEsp::writeBytes(const u8* data, size_t length) FL_NOEXCEPT {
     return true;
 }
 
-bool UartPeripheralEsp::waitTxDone(u32 timeout_ms) FL_NOEXCEPT {
+bool UartPeripheralEsp::waitTxDone(u32 timeout_ms) FL_NO_EXCEPT {
     if (!mInitialized) {
         FL_WARN("UartPeripheralEsp: Cannot wait - not initialized");
         return false;
@@ -295,7 +297,7 @@ bool UartPeripheralEsp::waitTxDone(u32 timeout_ms) FL_NOEXCEPT {
     return (err == ESP_OK);
 }
 
-bool UartPeripheralEsp::isBusy() const FL_NOEXCEPT {
+bool UartPeripheralEsp::isBusy() const FL_NO_EXCEPT {
     if (!mInitialized) {
         return false;
     }
@@ -316,7 +318,7 @@ bool UartPeripheralEsp::isBusy() const FL_NOEXCEPT {
 // State Queries
 //=============================================================================
 
-const UartPeripheralConfig& UartPeripheralEsp::getConfig() const FL_NOEXCEPT {
+const UartPeripheralConfig& UartPeripheralEsp::getConfig() const FL_NO_EXCEPT {
     return mConfig;
 }
 

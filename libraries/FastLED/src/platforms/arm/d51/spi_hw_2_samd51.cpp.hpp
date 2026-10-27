@@ -359,9 +359,7 @@ bool SPIDualSAMD51::begin(const SpiHw2::Config& config) {
     // For now, we'll use polling mode and document the DMA requirements
     mDmaChannel = -1;  // Mark as not using DMA
 
-    FL_WARN("SPIDualSAMD51: Initialized on SERCOM" << sercom_num
-            << " at " << (f_cpu / (2 * (baud_div + 1)) / 1000000.0) << " MHz"
-            << " (polling mode - DMA can be added later)");
+    FL_WARN("SPIDualSAMD51: Initialized on SERCOM" << sercom_num << " at " << ((f_cpu / (2 * (baud_div + 1)) / 1000000.0)) << " MHz (polling mode - DMA can be added later)");
 
     mInitialized = true;
     return true;
@@ -385,13 +383,12 @@ DMABuffer SPIDualSAMD51::acquireDMABuffer(size_t bytes_per_lane) {
 
     // For dual-lane SPI: total size = bytes_per_lane × 2 (interleaved)
     constexpr size_t num_lanes = 2;
-    const size_t total_size = bytes_per_lane * num_lanes;
-
     // Validate size against platform max (256KB practical limit for embedded)
     constexpr size_t MAX_SIZE = 256 * 1024;
-    if (total_size > MAX_SIZE) {
+    if (bytes_per_lane > MAX_SIZE / num_lanes) {
         return DMABuffer(SPIError::BUFFER_TOO_LARGE);
     }
+    const size_t total_size = bytes_per_lane * num_lanes;
 
     // Allocate new DMABuffer - it will manage its own memory
     mDMABuffer = DMABuffer(total_size);

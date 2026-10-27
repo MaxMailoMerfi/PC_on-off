@@ -30,42 +30,42 @@ template <typename T, fl::size Extent> class span;  // IWYU pragma: keep
 // Thread-safety: NOT thread-safe. Synchronize externally if needed.
 class StringInterner {
   public:
-    StringInterner() FL_NOEXCEPT;
-    ~StringInterner() FL_NOEXCEPT;
+    StringInterner() FL_NO_EXCEPT;
+    ~StringInterner() FL_NO_EXCEPT;
 
     // Intern a string_view (primary API) - returns a fl::string with heap allocation.
     // If the string already exists, returns the existing fl::string (cheap shared_ptr copy).
     // The returned fl::string is reference-counted via shared_ptr.
     // All interned strings use heap allocation to ensure stable pointers.
     // Performance: O(1) average time complexity via hash map lookup.
-    fl::string intern(const string_view& sv);
+    fl::string intern(const string_view& sv) FL_NO_EXCEPT;
 
     // Convenience overload: intern from fl::string
-    fl::string intern(const fl::string& str);
+    fl::string intern(const fl::string& str) FL_NO_EXCEPT;
 
     // Convenience overload: intern from C string
-    fl::string intern(const char* str);
+    fl::string intern(const char* str) FL_NO_EXCEPT;
 
     // Convenience overload: intern from span<const char>
-    fl::string intern(const fl::span<const char>& sp);
+    fl::string intern(const fl::span<const char>& sp) FL_NO_EXCEPT;
 
     // Check if a string is already interned
     // Performance: O(1) average time complexity via hash map lookup.
-    bool contains(const string_view& sv) const;
-    bool contains(const char* str) const;
+    bool contains(const string_view& sv) const FL_NO_EXCEPT;
+    bool contains(const char* str) const FL_NO_EXCEPT;
 
     // Get the number of unique interned strings
-    fl::size size() const;
+    fl::size size() const FL_NO_EXCEPT;
 
     // Check if the interner is empty
-    bool empty() const;
+    bool empty() const FL_NO_EXCEPT;
 
     // Clear all interned strings
     // Outstanding fl::string copies survive due to shared_ptr reference counting
-    void clear();
+    void clear() FL_NO_EXCEPT;
 
     // Reserve capacity for expected number of strings
-    void reserve(fl::size count);
+    void reserve(fl::size count) FL_NO_EXCEPT;
 
   private:
     using StringHolderPtr = fl::shared_ptr<StringHolder>;
@@ -76,14 +76,14 @@ class StringInterner {
 // Uses fl::Singleton to ensure the destructor is never called, avoiding
 // static destruction order issues and unnecessary cleanup in embedded systems.
 // Usage: fl::global_interner().intern("my string")
-StringInterner& global_interner();
+StringInterner& global_interner() FL_NO_EXCEPT;
 
 // Convenience functions for global interning
 // Returns heap-allocated fl::string with stable pointer (cheap to copy via shared_ptr)
 // Performance: O(1) average time complexity via hash map lookup.
-fl::string intern(const string_view& sv);
-fl::string intern(const fl::string& str);
-fl::string intern(const char* str);
-fl::string intern(const fl::span<const char>& sp);
+fl::string intern(const string_view& sv) FL_NO_EXCEPT;
+fl::string intern(const fl::string& str) FL_NO_EXCEPT;
+fl::string intern(const char* str) FL_NO_EXCEPT;
+fl::string intern(const fl::span<const char>& sp) FL_NO_EXCEPT;
 
 } // namespace fl

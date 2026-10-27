@@ -22,7 +22,7 @@
 // ============================================================
 
 // ---- 2.1 Налаштування Telegram Bot ----
-#define BOT_TOKEN "8487247789:AAHBN9wKzSVsCCKi4cJYdYb2Nh83e_itIYE" // Токен бота від @BotFather (унікальний ключ доступу)
+#define BOT_TOKEN "8487247789:AAEpfzy7GXtMhOJGJ3BJqMiYpILyd_NAysQ" // Токен бота від @BotFather (унікальний ключ доступу)
 #define CHAT_ID_ADMIN "1031379571"                                 // ID адміністратора (кому будуть приходити сповіщення про запуск та зміни стану)
 
 // ---- 2.2 Налаштування апаратних пінів (GPIO) ----
@@ -1060,6 +1060,7 @@ void initializePcState()
 void addInitialEvent()
 {
   if (eventCount < MAX_EVENTS)
+
   {
     eventLog[eventCount].timestamp = time(nullptr);
     eventLog[eventCount].state = pcIsOn;

@@ -95,22 +95,25 @@ namespace fl {
 
 namespace lpc_plu_detail {
 
-// PLU peripheral base address (UM11065 Table 4, APB1).
-// TODO(2841): cross-check against LPC804.h CMSIS header at build time.
-static const fl::u32 kPluBase = 0x40028000UL;
+// Peripheral access uses the vendor CMSIS PAL `PLU_Type` and `SYSCON_Type`
+// (LPC804.h, brought in via led_sysdefs_arm_lpc.h). `PLU` and `SYSCON` are
+// the canonical pointer macros. Previously this file used hand-typed
+// raw-offset constants which (it turned out) had THREE register-block
+// offsets wrong against UM11065 §12: LUT_TRUTH was at 0x000 (correct 0x800),
+// OUTPUT_MUX at 0x800 (correct 0xC00), LUT_INP_MUX at 0xC00 (correct 0x000).
+// Vendoring the canonical NXP layout eliminated those bugs structurally.
+// See FastLED #3437 for the audit.
 
-// Offsets within the PLU register block.
-static const fl::u32 kOffLutTruth0   = 0x000;  // 26 x u32, stride 4
-static const fl::u32 kOffOutputMux0  = 0x800;  // 4  x u32, stride 4
-static const fl::u32 kOffLutInpMux0  = 0xC00;  // 26 x 5 u32, stride 4
-static const fl::u32 kOffWakeIntCtrl = 0xFF8;
-
-// SYSCON peripheral base and the SYSAHBCLKCTRL register that gates the PLU.
-// UM11065 Chapter 4 (SYSCON) - PLU clock is bit 18 of SYSAHBCLKCTRL0 (§4.6.13).
-// TODO(2841): confirm bit position against LPC804 CMSIS once-and-only PLU enum.
-static const fl::u32 kSysconBase             = 0x40048000UL;
-static const fl::u32 kOffSysahbclkctrl0      = 0x080;
+// PLU clock gate sits at SYSCON->SYSAHBCLKCTRL0 bit 18 (UM11065 §4.6.13).
 static const fl::u32 kSysconPluClkBit        = (1UL << 18);
+
+// WAKEINT_CTRL register is at PLU_BASE + 0xFF8 in the silicon. The vendor
+// PLU_Type does not include it (struct ends at OUTPUT_MUX[7] @ 0xC1C). The
+// disable-write below uses a single raw access; switching to vendor types
+// for the WAKEINT_CTRL register would require a vendor-header change at
+// nxp-mcuxpresso/mcux-sdk and is not warranted for a one-write defensive
+// init step.
+static const fl::u32 kOffWakeIntCtrl = 0xFF8;
 
 // SWM peripheral base. Pin-assignment for PLU inputs / outputs lives here
 // (UM11065 Chapter 8 "Switch Matrix"). The PLU pin-assign registers are part
@@ -119,41 +122,35 @@ static const fl::u32 kSysconPluClkBit        = (1UL << 18);
 // the SWM register offsets here: the user is expected to pre-configure pin
 // routing in board-setup code before calling FastLED.addLeds<>(). This is
 // consistent with how Arduino-style LPC845 sketches handle SWM setup today.
-// TODO(2841): provide an optional `fl::lpc::plu::set_data_pin(uint8_t pio)`
+// TODO(2841): provide an optional `fl::lpc::plu::set_data_pin(uint8_t pin)`
 // helper in a follow-up that programs PINASSIGN_PLU_IN[0] directly.
 
-// Volatile access helpers. C-style cast is the canonical embedded-register
-// access pattern (compare ARM_DEMCR / ARM_DWT_CTRL in clockless_arm_giga.h);
-// the FastLED reinterpret_cast linter explicitly allows C-style casts for
-// MMIO addresses.
-static inline volatile fl::u32* reg32(fl::u32 base, fl::u32 off) FL_NOEXCEPT {
-    return (volatile fl::u32*)(base + off);  // MMIO register address
-}
-
 // LUTn_TRUTH[n] write helper.
-static inline void writeLutTruth(fl::u8 lut, fl::u32 truth_table) FL_NOEXCEPT {
-    *reg32(kPluBase, kOffLutTruth0 + (fl::u32(lut) << 2)) = truth_table;
+static inline void writeLutTruth(fl::u8 lut, fl::u32 truth_table) FL_NO_EXCEPT {
+    PLU->LUT_TRUTH[lut] = truth_table;
 }
 
 // LUTn_INP_MUX[m] write helper.
 // sel: 0..5 -> primary input PLU_IN0..PLU_IN5
 //      6..N -> LUT[sel-6] output (UM11065 §12.6.1 mux encoding)
 static inline void writeLutInputMux(fl::u8 lut, fl::u8 input_idx,
-                                    fl::u8 sel) FL_NOEXCEPT {
-    // Stride is 5 u32 per LUT (one per input).
-    fl::u32 off = kOffLutInpMux0 + (fl::u32(lut) * 5UL + input_idx) * 4UL;
-    *reg32(kPluBase, off) = sel;
+                                    fl::u8 sel) FL_NO_EXCEPT {
+    PLU->LUT[lut].INP_MUX[input_idx] = sel;
 }
 
 // OUTPUTm_MUX write helper. Selects which LUT drives PLU_OUTm.
-static inline void writeOutputMux(fl::u8 out_idx, fl::u8 lut_sel) FL_NOEXCEPT {
-    *reg32(kPluBase, kOffOutputMux0 + (fl::u32(out_idx) << 2)) = lut_sel;
+static inline void writeOutputMux(fl::u8 out_idx, fl::u8 lut_sel) FL_NO_EXCEPT {
+    PLU->OUTPUT_MUX[out_idx] = lut_sel;
 }
 
 // Enable PLU peripheral clock (SYSCON->SYSAHBCLKCTRL0 bit 18).
-static inline void enablePluClock() FL_NOEXCEPT {
-    volatile fl::u32* p = reg32(kSysconBase, kOffSysahbclkctrl0);
-    *p = *p | kSysconPluClkBit;
+static inline void enablePluClock() FL_NO_EXCEPT {
+    SYSCON->SYSAHBCLKCTRL0 = SYSCON->SYSAHBCLKCTRL0 | kSysconPluClkBit;
+}
+
+// Raw access for WAKEINT_CTRL (vendor PLU_Type doesn't include it).
+static inline volatile fl::u32* pluRawReg(fl::u32 off) FL_NO_EXCEPT {
+    return (volatile fl::u32*)(PLU_BASE + off);  // MMIO register address
 }
 
 // -----------------------------------------------------------------------------
@@ -226,12 +223,12 @@ static const fl::u8 kMuxPluIn0 = 0;
 static const fl::u8 kMuxPluIn1 = 1;
 static const fl::u8 kMuxPluIn2 = 2;
 // sel = 6 + lut_id -> LUTn output
-static inline fl::u8 muxLutOutput(fl::u8 lut_id) FL_NOEXCEPT {
+static inline fl::u8 muxLutOutput(fl::u8 lut_id) FL_NO_EXCEPT {
     return fl::u8(6u + lut_id);
 }
 
 // One-shot PLU init. Idempotent: a second call rewrites the same registers.
-static void initPluGraph() FL_NOEXCEPT {
+static void initPluGraph() FL_NO_EXCEPT {
     // Step 1: enable peripheral clock BEFORE any register write
     // (ARM Cortex-M0+ silently drops writes to unpowered peripherals).
     enablePluClock();
@@ -265,7 +262,7 @@ static void initPluGraph() FL_NOEXCEPT {
 
     // Step 6: PLU is purely combinational + a wake-int block we don't use.
     // Disable any latent wake-interrupt config (UM11065 §12.6.4).
-    *reg32(kPluBase, kOffWakeIntCtrl) = 0;
+    *pluRawReg(kOffWakeIntCtrl) = 0;
 
     // Step 7 (deferred): bring up the timing-counter source feeding PLU_IN1 /
     // PLU_IN2. On LPC804 this is most naturally an SCT-generated Gray-coded
@@ -303,9 +300,9 @@ class ClocklessController : public CPixelLEDController<RGB_ORDER> {
     bool       mPluReady;
 
 public:
-    ClocklessController() FL_NOEXCEPT : mPinMask(0), mPort(0), mPluReady(false) {}
+    ClocklessController() FL_NO_EXCEPT : mPinMask(0), mPort(0), mPluReady(false) {}
 
-    virtual void init() FL_NOEXCEPT {
+    virtual void init() FL_NO_EXCEPT {
         // The CPU still owns the data pin - the PLU samples it via SWM, but
         // the pin itself is a normal GPIO that the CPU writes to.
         FastPin<DATA_PIN>::setOutput();
@@ -319,7 +316,7 @@ public:
 
     virtual fl::u16 getMaxRefreshRate() const { return 400; }
 
-    virtual void showPixels(PixelController<RGB_ORDER>& pixels) FL_NOEXCEPT {
+    virtual void showPixels(PixelController<RGB_ORDER>& pixels) FL_NO_EXCEPT {
         mWait.wait();
 
         // The PLU drives the wire shape; the CPU's only job is to clock data
@@ -354,7 +351,7 @@ private:
     // "ready-for-next-bit" PLU flag via OUTPUT3 and have the CPU spin on it
     // instead of relying on the slack envelope. That would let this loop
     // run lock-step against the PLU and eliminate any cadence drift.
-    void feedPixels(PixelController<RGB_ORDER>& pixels) FL_NOEXCEPT {
+    void feedPixels(PixelController<RGB_ORDER>& pixels) FL_NO_EXCEPT {
         const fl::u8 nLeds = static_cast<fl::u8>(pixels.size());
         if (nLeds == 0) return;
 
@@ -376,7 +373,7 @@ private:
     }
 
     // Push one byte MSB-first to the PLU data input.
-    inline void sendByte(fl::u8 b) FL_NOEXCEPT {
+    inline void sendByte(fl::u8 b) FL_NO_EXCEPT {
         // We unroll to 8 bit writes. Each write touches SET (for bit=1) or
         // CLR (for bit=0) of the data pin. The PLU is what actually drives
         // the WS2812 timing waveform - this loop just selects 0 vs 1 width.

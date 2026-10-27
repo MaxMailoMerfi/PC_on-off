@@ -10,12 +10,13 @@ bootstrap.
 import os
 import re
 import shutil
-import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
+
+from running_process import RunningProcess
 
 from ci.meson.build_config import cleanup_build_artifacts, setup_meson_build
 from ci.meson.build_timer import BuildTimer
@@ -113,10 +114,11 @@ def _recover_stale_build(
             Path(sys.prefix) / "Scripts" / "ninja.EXE"
         )
         try:
-            result = subprocess.run(
+            result = RunningProcess.run(
                 [ninja_exe, "-C", str(build_dir), "-t", "cleandead"],
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=60,
             )
             if result.returncode == 0:
@@ -144,7 +146,9 @@ def _recover_stale_build(
             build_dir / "test_list_cache.txt",
             build_dir / ".source_files_hash",
             build_dir / "tests" / "test_metadata.cache",
-            build_dir / "example_metadata.cache",
+            # Nested under examples/ — save_cache() writes it to meson's
+            # current_build_dir. The flat path here was a silent no-op.
+            build_dir / "examples" / "example_metadata.cache",
         ]
         for cache_file in cache_files:
             if cache_file.exists():
@@ -355,32 +359,23 @@ def _write_testlog_failures(build_dir: Path, log_dir: Path) -> None:
         _write_failure_log(log_dir, safe_name, "run", content)
 
 
-def _start_zccache_session(build_dir: Path) -> None:
+def _start_zccache_session(build_dir: Path, build_mode: str) -> None:
     """Start a zccache session with logging to the build directory.
 
     Sets ZCCACHE_SESSION_ID in os.environ so all subsequent compiler
     invocations through zccache use this session and get logged.
     The session auto-cleans up via PID monitoring when the process exits.
 
-    Also sets ZCCACHE_LINK_DEPLOY_CMD so zccache invokes
-    `clang-tool-chain-libdeploy` after each cache-miss link. This
-    materializes runtime DLLs next to the linked binary (on Windows
-    these otherwise don't get deployed because the native ctc-clang++
-    trampoline skips Python post-link hooks) and lets zccache's
-    side-effect scanner bundle them into the cached artifact set —
-    fixing flaky error-126 DLL load failures under parallel test
-    execution. See https://github.com/FastLED/FastLED/issues/2329.
+    No post-link deploy command is used on any platform: on Windows, reld
+    deploys runtime DLLs next to the linked binary (zackees/reld#208), and
+    zccache caches them as part of the link output. ZCCACHE_LINK_DEPLOY_CMD
+    is cleared so a stale inherited value never triggers the Python deploy.
     """
-    if "ZCCACHE_LINK_DEPLOY_CMD" not in os.environ:
-        os.environ["ZCCACHE_LINK_DEPLOY_CMD"] = "clang-tool-chain-libdeploy"
+    os.environ.pop("ZCCACHE_LINK_DEPLOY_CMD", None)
     os.environ.setdefault("ZCCACHE_STRICT_PATHS", "absolute")
-    # Opt in to zccache's CLI-side probe-bypass fast-path for meson
-    # configure-phase try-compiles (zackees/zccache#625, #633, #636 — bench
-    # in #636 shows 7-10s saved per configure run). Not a disable: per-call
-    # routing, only sub-4 KiB single-source no-PCH no-@rsp invocations
-    # bypass; production TUs continue to use the cache. setdefault keeps any
-    # user override intact; older zccache without this env var ignores it.
-    os.environ.setdefault("ZCCACHE_PROBE_BYPASS", "1")
+    # ZCCACHE_PROBE_BYPASS=1 setdefault removed as a probe per #3129 A9
+    # (the CLI-side probe-bypass fast-path was internalised in zccache
+    # 1.12.x). If configure-phase try-compile times regress, revert.
 
     zccache_bin = _find_zccache_binary()
     if not zccache_bin:
@@ -391,7 +386,7 @@ def _start_zccache_session(build_dir: Path) -> None:
     journal_path = build_dir / "zccache-session.jsonl"
 
     try:
-        result = subprocess.run(
+        result = RunningProcess.run(
             [
                 zccache_bin,
                 "session-start",
@@ -402,7 +397,8 @@ def _start_zccache_session(build_dir: Path) -> None:
                 str(journal_path),
             ],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         if result.returncode == 0:

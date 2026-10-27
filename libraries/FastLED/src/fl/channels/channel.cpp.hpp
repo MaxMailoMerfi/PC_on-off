@@ -1,4 +1,4 @@
-/// @file channel.cpp
+﻿/// @file channel.cpp
 /// @brief LED channel implementation
 
 #include "platforms/is_platform.h"
@@ -11,6 +11,7 @@
 #include "fl/stl/atomic.h"
 #include "fl/log/log.h"
 #include "fl/channels/options.h"
+#include "fl/channels/pipeline_binding.h"
 #include "fl/gfx/pixel_iterator_any.h"
 #include "pixel_controller.h"
 #include "fl/system/trace.h"
@@ -24,36 +25,37 @@
 #include "fl/math/xymap.h"
 #include "fl/stl/singleton.h"
 #include "fl/stl/noexcept.h"
+#include "fl/stl/compiler_control.h"  // IWYU pragma: keep - FL_UNUSED
 
 namespace fl {
 
 namespace {
-
-/// @brief Apply the white-channel selection from ChannelOptions to a
-/// CLEDController. The variant alternative chooses RGB-only / RGBW / RGBWW
-/// without forcing every call site to duplicate the dispatch.
-inline void applyWhiteCfg(CLEDController& ctrl,
-                          const ChannelOptions& options) FL_NOEXCEPT {
-    if (auto* p = options.mWhiteCfg.ptr<Rgbww>()) {
-        ctrl.setRgbww(*p);
-    } else if (auto* p = options.mWhiteCfg.ptr<Rgbw>()) {
-        ctrl.setRgbw(*p);
-    } else {
-        // Empty alternative (or default-constructed) → plain RGB.
-        ctrl.clearWhiteChannel();
-    }
-}
 
 /// @brief Encapsulates pixel iterator construction with optional XYMap reordering
 class ReorderingPixelIteratorAny {
   private:
     /// @brief Get thread-local buffer for addressing transformation
     /// @return Reference to thread-local CRGB vector (reused across calls)
-    static fl::vector<CRGB>& getReorderBufferTLS() {
+    static fl::vector<CRGB>& getReorderBufferTLS() FL_NO_EXCEPT {
         return SingletonThreadLocal<fl::vector<CRGB>>::instance();
     }
     fl::optional<PixelController<RGB, 1, 0xFFFFFFFF>> mAddressedController;
     PixelIteratorAny mPixelIterator;
+#if FL_COLOR_PROFILE_RUNTIME
+    // Present only when a colour profile is bound. The managed source keeps
+    // a reference to the controller it wraps, so it has to outlive the
+    // iterator built over it -- both live here, for the frame.
+    //
+    // Raw storage rather than the types themselves, because naming them here
+    // is what made the whole colour pipeline reachable from `show()` and cost
+    // every sketch ~3.5 KB of flash. `colorPipelineHooks()` builds into this,
+    // and only `setColorProfile` installs those hooks -- so a program that
+    // never binds a profile never references the pipeline and the linker
+    // drops it.
+    FL_ALIGNAS(8) unsigned char mManagedSourceStorage[kColorPipelineSourceStorage];
+    FL_ALIGNAS(8) unsigned char mManagedIteratorStorage[kColorPipelineIteratorStorage];
+    PixelIterator* mManagedIterator = nullptr;
+#endif
 
   public:
     /// @brief Construct pixel iterator with optional addressing transformation
@@ -68,8 +70,18 @@ class ReorderingPixelIteratorAny {
         EOrder rgbOrder,
         Rgbw rgbw,
         Rgbww rgbww,
-        const fl::string& channelName)
+        const fl::string& channelName,
+#if FL_COLOR_PIPELINE_SHARED
+        const StreamingPipelineQ16* pipeline,
+#else
+        StreamingPipelineQ16* pipeline,
+#endif
+        u8 ditherPhase, u8 brightness) FL_NO_EXCEPT
         : mPixelIterator(pixels, rgbOrder, rgbw, rgbww) {
+        FL_UNUSED(pipeline);
+        FL_UNUSED(ditherPhase);  // read only by the colour-managed source
+        FL_UNUSED(brightness);   // read only by the colour-managed source
+        FL_UNUSED(channelName);  // only consumed by FL_ERROR, a no-op on small platforms
 
         // Apply addressing transformation if configured
         if (addressing) {
@@ -80,9 +92,7 @@ class ReorderingPixelIteratorAny {
 
             // Validate that XYMap dimensions match channel LED count
             if (expectedLeds != numLeds) {
-                FL_ERROR("Channel '" << channelName << "': XYMap dimensions (" << width << "x" << height
-                        << "=" << expectedLeds << ") don't match LED count (" << numLeds
-                        << "). Addressing transformation may produce unexpected results.");
+                FL_ERROR("Channel '" << channelName << "': XYMap dimensions (" << width << "x" << height << "=" << expectedLeds << ") don't match LED count (" << numLeds << "). Addressing transformation may produce unexpected results.");
             }
 
             // Cast mData to CRGB array
@@ -107,11 +117,70 @@ class ReorderingPixelIteratorAny {
                 pixels.mColorAdjustment, DISABLE_DITHER);
             mPixelIterator = PixelIteratorAny(mAddressedController.value(), rgbOrder, rgbw, rgbww);
         }
+
+#if FL_COLOR_PROFILE_RUNTIME
+        const ColorPipelineHooks& hooks = colorPipelineHooks();
+        if (pipeline != nullptr && hooks.makeIterator != nullptr) {
+            // Colour-managed: build the iterator over a streaming source
+            // instead of over the order-variant controller. The source
+            // applies the colour order itself, so it wraps the RGB-ordered
+            // controller -- whichever of the two that is after addressing.
+            PixelController<RGB, 1, 0xFFFFFFFF>& base =
+                mAddressedController ? mAddressedController.value() : pixels;
+            mManagedIterator = hooks.makeIterator(
+                mManagedSourceStorage, mManagedIteratorStorage, base, rgbOrder,
+                *pipeline, rgbw, rgbww, ditherPhase, brightness);
+        }
+#endif
+    }
+
+    ~ReorderingPixelIteratorAny() FL_NO_EXCEPT {
+#if FL_COLOR_PROFILE_RUNTIME
+        // Placement-new'd into our own storage, so the teardown goes back
+        // through the hooks too -- this file must not name the types.
+        if (mManagedIterator != nullptr) {
+            const ColorPipelineHooks& hooks = colorPipelineHooks();
+            if (hooks.destroyIterator != nullptr) {
+                hooks.destroyIterator(mManagedSourceStorage,
+                                      mManagedIteratorStorage);
+            }
+            mManagedIterator = nullptr;
+        }
+#endif
     }
 
     /// @brief Get the constructed pixel iterator
-    PixelIterator& get() { return mPixelIterator.get(); }
-    const PixelIterator& get() const { return mPixelIterator.get(); }
+    ///
+    /// The colour-managed one when a profile is bound, the legacy one
+    /// otherwise. Everything downstream sees the same type either way, which
+    /// is why the encoders need no branch of their own.
+    PixelIterator& get() FL_NO_EXCEPT {
+#if FL_COLOR_PROFILE_RUNTIME
+        if (mManagedIterator != nullptr) {
+            return *mManagedIterator;
+        }
+#endif
+        return mPixelIterator.get();
+    }
+    const PixelIterator& get() const FL_NO_EXCEPT {
+        return const_cast<ReorderingPixelIteratorAny*>(this)->get();
+    }
+
+    /// True when `get()` hands back the colour-managed iterator.
+    ///
+    /// Not the same question as "is a profile configured". The managed
+    /// iterator exists only when a pipeline was actually built and the hooks
+    /// were installed; a channel can have a profile on its options and still
+    /// be iterating the legacy controller -- a rejected binding, or a build
+    /// where the seam is not linked. Asking the options instead would send
+    /// 8-bit legacy pixels down the no-gamma path.
+    bool isManaged() const FL_NO_EXCEPT {
+#if FL_COLOR_PROFILE_RUNTIME
+        return mManagedIterator != nullptr;
+#else
+        return false;
+#endif
+    }
 };
 
 /// @brief Out-of-line cold-path emitter for the #2517 silent-drop
@@ -125,40 +194,86 @@ class ReorderingPixelIteratorAny {
 /// instantiations in showPixels' prologue/epilogue for code that runs
 /// at most once per channel lifetime. Splitting matches the same
 /// pattern the maintainer adopted for `resolveDynamicDriver()` in PR
-/// #2830 — keep the diagnostic chain in a `FL_NO_INLINE` helper so it
+/// #2830 â€” keep the diagnostic chain in a `FL_NO_INLINE` helper so it
 /// can't fold back into the hot path. (#2773 follow-up to #2832.)
 FL_NO_INLINE
 static void emitDisabledDriverError(const fl::string& channelName,
                                     const fl::string& driverName,
-                                    const fl::string& exclusive) FL_NOEXCEPT {
+                                    const fl::string& exclusive) FL_NO_EXCEPT {
+    FL_UNUSED(channelName);  // only consumed by FL_ERROR, a no-op on small platforms
+    FL_UNUSED(driverName);
     if (!exclusive.empty()) {
-        FL_ERROR("Channel '" << channelName << "': bound driver '" << driverName
-            << "' is currently DISABLED by exclusive-driver selection '"
-            << exclusive << "'. Frame will be silently dropped. "
-            << "Resolve with: FastLED.enableDrivers<fl::Bus::"
-            << driverName << ">() or FastLED.enableAllDrivers().");
+        FL_ERROR("Channel '" << channelName << "': bound driver '" << driverName << "' is currently DISABLED by exclusive-driver selection '" << exclusive << "'. Frame will be silently dropped. Resolve with: FastLED.enableDrivers<fl::Bus::" << driverName << ">() or FastLED.enableAllDrivers().");
     } else {
-        FL_ERROR("Channel '" << channelName << "': bound driver '" << driverName
-            << "' is currently DISABLED. Frame will be silently dropped. "
-            << "Resolve with: FastLED.enableDrivers<fl::Bus::"
-            << driverName << ">() or FastLED.enableAllDrivers().");
+        FL_ERROR("Channel '" << channelName << "': bound driver '" << driverName << "' is currently DISABLED. Frame will be silently dropped. Resolve with: FastLED.enableDrivers<fl::Bus::" << driverName << ">() or FastLED.enableAllDrivers().");
     }
 }
 
 }  // anonymous namespace
 
+Channel::PixelEncoder
+Channel::selectPixelEncoder(const ChipsetVariant& chipset) FL_NO_EXCEPT {
+    if (const ClocklessChipset* clockless = chipset.ptr<ClocklessChipset>()) {
+        switch (clockless->encoder) {
+            case ClocklessEncoder::CLOCKLESS_ENCODER_WS2812:
+                return &Channel::encodeWS2812;
+            case ClocklessEncoder::CLOCKLESS_ENCODER_TM1812_RGBWW:
+                return &Channel::encodeTM1812RGBWW;
+            case ClocklessEncoder::CLOCKLESS_ENCODER_TM1908:
+                return &Channel::encodeTM1908;
+#if !defined(FASTLED_DISABLE_UCS7604) || !FASTLED_DISABLE_UCS7604
+            case ClocklessEncoder::CLOCKLESS_ENCODER_UCS7604_8BIT:
+            case ClocklessEncoder::CLOCKLESS_ENCODER_UCS7604_16BIT:
+            case ClocklessEncoder::CLOCKLESS_ENCODER_UCS7604_16BIT_1600:
+                return &Channel::encodeUCS7604;
+#endif
+        }
+    } else if (const SpiChipsetConfig* spi = chipset.ptr<SpiChipsetConfig>()) {
+#if !defined(FASTLED_DISABLE_SPI_CHIPSETS) || !FASTLED_DISABLE_SPI_CHIPSETS
+        switch (spi->timing.chipset) {
+            case SpiChipset::APA102:
+            case SpiChipset::DOTSTAR:
+            case SpiChipset::APA102HD:
+            case SpiChipset::DOTSTARHD:
+            case SpiChipset::HD107:
+            case SpiChipset::HD107HD:
+                return &Channel::encodeAPA102;
+            case SpiChipset::SK9822:
+            case SpiChipset::SK9822HD:
+                return &Channel::encodeSK9822;
+            case SpiChipset::WS2801:
+                return &Channel::encodeWS2801;
+            case SpiChipset::WS2803:
+                return &Channel::encodeWS2803;
+            case SpiChipset::P9813:
+                return &Channel::encodeP9813;
+            case SpiChipset::LPD8806:
+                return &Channel::encodeLPD8806;
+            case SpiChipset::LPD6803:
+                return &Channel::encodeLPD6803;
+            case SpiChipset::SM16716:
+                return &Channel::encodeSM16716;
+            case SpiChipset::MY9221:
+                return &Channel::encodeMY9221;
+            case SpiChipset::HD108:
+                return &Channel::encodeHD108;
+        }
+#endif  // !FASTLED_DISABLE_SPI_CHIPSETS
+    }
+    return nullptr;
+}
 
-i32 Channel::nextId() {
+i32 Channel::nextId() FL_NO_EXCEPT {
     static fl::atomic<i32> gNextChannelId(0); // okay static in header
     return gNextChannelId.fetch_add(1);
 }
 
-fl::string Channel::makeName(i32 id, const fl::optional<fl::string>& configName) {
+fl::string Channel::makeName(i32 id, const fl::optional<fl::string>& configName) FL_NO_EXCEPT {
     if (configName.has_value()) {
         return configName.value();
     }
-    // Auto-naming `"Channel_<id>"` only matters for diagnostics — in release
-    // builds (NDEBUG → FASTLED_LOG_VERBOSITY=0 per Stage 1) every FL_WARN /
+    // Auto-naming `"Channel_<id>"` only matters for diagnostics â€” in release
+    // builds (NDEBUG â†’ FASTLED_LOG_VERBOSITY=0 per Stage 1) every FL_WARN /
     // FL_ERROR site that reads mName collapses to `do { } while(0)`, so the
     // string and the supporting `fl::to_string` + `operator+` chain go
     // unused. Empty in release saves the `fl::to_string<i64>` instantiation
@@ -171,7 +286,7 @@ fl::string Channel::makeName(i32 id, const fl::optional<fl::string>& configName)
 #endif
 }
 
-ChannelPtr Channel::create(const ChannelConfig &config) {
+ChannelPtr Channel::create(const ChannelConfig &config) FL_NO_EXCEPT {
     // Late binding strategy: Always create with empty driver
     // Engine binding happens on first showPixels() call:
     // - Affinity channels: Look up by name and cache
@@ -179,13 +294,19 @@ ChannelPtr Channel::create(const ChannelConfig &config) {
 
     auto channel = fl::make_shared<Channel>(config.chipset, config.mLeds,
                                               config.rgb_order, config.options);
-    channel->mName = makeName(channel->mId, config.mName);
     auto& events = ChannelEvents::instance();
+#if FL_COLOR_PROFILE_RUNTIME
+    if (channel->reconcileColorProfile(config.options)) {
+        events.onColorProfileFallback(
+            ColorProfileEvent{channel->id(), channel->colorProfileStatus(), {}});
+    }
+#endif
+    channel->mName = makeName(channel->mId, config.mName);
     events.onChannelCreated(*channel);
     return channel;
 }
 
-int Channel::getPin() const {
+int Channel::getPin() const FL_NO_EXCEPT {
     if (const ClocklessChipset* cs = mChipset.ptr<ClocklessChipset>()) {
         return cs->pin;
     }
@@ -195,7 +316,7 @@ int Channel::getPin() const {
     return -1;
 }
 
-const ChipsetTimingConfig& Channel::getTiming() const {
+const ChipsetTimingConfig& Channel::getTiming() const FL_NO_EXCEPT {
     if (const ClocklessChipset* cs = mChipset.ptr<ClocklessChipset>()) {
         return cs->timing;
     }
@@ -203,26 +324,15 @@ const ChipsetTimingConfig& Channel::getTiming() const {
     return sEmpty;
 }
 
-Channel::Channel(const ChipsetVariant& chipset, EOrder rgbOrder, RegistrationMode mode)
-    : CPixelLEDController<RGB>(mode)
-    , mChipset(chipset)
-    , mRgbOrder(rgbOrder)
-    , mDriver()
-    , mBus(Bus::AUTO)
-    , mId(nextId())
-    , mName(makeName(mId)) {
-    // NOTE: Do NOT call fl::pinMode() here — see comment in the
-    // Channel(ChipsetVariant, span, EOrder, ChannelOptions) constructor.
-    mChannelData = ChannelData::create(mChipset);
-}
-
 Channel::Channel(const ChipsetVariant& chipset, fl::span<CRGB> leds,
-                 EOrder rgbOrder, const ChannelOptions& options)
+                 EOrder rgbOrder, const ChannelOptions& options) FL_NO_EXCEPT
     : CPixelLEDController<RGB>(RegistrationMode::DeferRegister)  // Defer registration until FastLED.add()
     , mChipset(chipset)
+    , mPixelEncoder(selectPixelEncoder(chipset))
     , mRgbOrder(rgbOrder)
     , mDriver()  // Empty weak_ptr - late binding on first showPixels()
     , mBus(options.mBus)  // Bus selection (#2459)
+    , mBusWhich(options.mBusWhich)
     , mId(nextId())
     , mName(makeName(mId)) {
     // NOTE: Do NOT call fl::pinMode() here. The pin may already be
@@ -234,16 +344,12 @@ Channel::Channel(const ChipsetVariant& chipset, fl::span<CRGB> leds,
     // Set the LED data array
     setLeds(leds);
 
-    // Sync mSettings from ChannelOptions so the mWhiteCfg variant (and any
-    // other future fields) survives to showPixels(). The setter calls below
-    // are then idempotent overlays on top of the same data.
+    // Channels owns its options; copy only the legacy rendering fields into
+    // the base controller.
     mSettings = options;
 
     // Set color correction/temperature/dither/rgbw from ChannelOptions
-    setCorrection(options.mCorrection);
-    setTemperature(options.mTemperature);
-    setDither(options.mDitherMode);
-    applyWhiteCfg(*this, options);
+    syncLegacySettings();
 
     // Create ChannelData during construction with chipset variant
     mChannelData = ChannelData::create(mChipset);
@@ -251,57 +357,206 @@ Channel::Channel(const ChipsetVariant& chipset, fl::span<CRGB> leds,
 
 // Backwards-compatible constructor (deprecated)
 Channel::Channel(int pin, const ChipsetTimingConfig& timing, fl::span<CRGB> leds,
-                 EOrder rgbOrder, const ChannelOptions& options)
+                 EOrder rgbOrder, const ChannelOptions& options) FL_NO_EXCEPT
     : CPixelLEDController<RGB>(RegistrationMode::DeferRegister)  // Defer registration until FastLED.add()
     , mChipset(ClocklessChipset(pin, timing))  // Convert to variant
+    , mPixelEncoder(selectPixelEncoder(mChipset))
     , mRgbOrder(rgbOrder)
     , mDriver()  // Empty weak_ptr - late binding on first showPixels()
     , mBus(options.mBus)  // Bus selection (#2459)
+    , mBusWhich(options.mBusWhich)
     , mId(nextId())
     , mName(makeName(mId)) {
-    // NOTE: Do NOT call fl::pinMode() here — see comment in the
+    // NOTE: Do NOT call fl::pinMode() here â€” see comment in the
     // Channel(ChipsetVariant, span, EOrder, ChannelOptions) constructor.
 
     // Set the LED data array
     setLeds(leds);
 
-    // Sync mSettings from ChannelOptions so the mWhiteCfg variant survives
-    // to showPixels(). See sibling ChipsetVariant constructor for rationale.
+    // Channels owns its options; synchronize the base rendering fields.
     mSettings = options;
 
     // Set color correction/temperature/dither/rgbw from ChannelOptions
-    setCorrection(options.mCorrection);
-    setTemperature(options.mTemperature);
-    setDither(options.mDitherMode);
-    applyWhiteCfg(*this, options);
+    syncLegacySettings();
 
     // Create ChannelData during construction
     mChannelData = ChannelData::create(mChipset);
 }
 
-Channel::~Channel() FL_NOEXCEPT {
+Channel::~Channel() FL_NO_EXCEPT {
     auto& events = ChannelEvents::instance();
     events.onChannelBeginDestroy(*this);
 }
 
-void Channel::applyConfig(const ChannelConfig& config) {
+void Channel::syncLegacySettings() FL_NO_EXCEPT {
+    mLegacySettings.mCorrection = mSettings.mCorrection;
+    mLegacySettings.mTemperature = mSettings.mTemperature;
+    mLegacySettings.mDitherMode = mSettings.mDitherMode;
+    mLegacySettings.mWhiteCfg = mSettings.mWhiteCfg;
+    // Active white config assigned straight into ChannelOptions.mWhiteCfg
+    // never passed through setRgbw()/setRgbww(): install its conversion here
+    // (#4795).
+    if (const Rgbw* rgbw = mLegacySettings.mWhiteCfg.ptr<Rgbw>()) {
+        if (rgbw->active()) {
+            detail::enable_rgbw_conversion();
+        }
+    } else if (const Rgbww* rgbww = mLegacySettings.mWhiteCfg.ptr<Rgbww>()) {
+        if (rgbww->active()) {
+            detail::enable_rgbww_conversion();
+        }
+    }
+    if (const auto* rgbw = mSettings.mWhiteCfg.ptr<Rgbw>()) {
+        prepare_rgbw_colorimetric(*rgbw);
+        detail::enable_rgbw_power_estimate();
+    }
+}
+
+#ifndef FL_IS_AVR
+void Channel::onSettingsChanged(SettingsChange change) FL_NO_EXCEPT {
+    // Frame completion restores dithering through the base setter. Dithering
+    // does not change pipeline coefficients and must not rebuild the pipeline.
+    mSettings.mDitherMode = mLegacySettings.mDitherMode;
+    if (change == SettingsChange::Dither) return;
+    mSettings.mWhiteCfg = mLegacySettings.mWhiteCfg;
+    if (change == SettingsChange::Correction || change == SettingsChange::Temperature) {
+        mStaticProfileCleared = true;
+        if (change == SettingsChange::Correction) {
+            mSettings.setLegacyCorrection(mLegacySettings.mCorrection);
+        } else {
+            mSettings.setLegacyTemperature(mLegacySettings.mTemperature);
+        }
+    }
+#if FL_COLOR_PROFILE_RUNTIME
+    reconcileColorProfile(mSettings);
+#endif
+}
+#endif
+
+#if FL_COLOR_PROFILE_RUNTIME
+void Channel::raiseColorProfileFallback(const char* reason) FL_NO_EXCEPT {
+    mColorProfileFallback = true;
+    mProfileBindingAccepted = !detail::colorProfileStrictMode();
+    // C5's one-time warning. The event fired by the callers is the
+    // machine-readable half; this is the half a sketch sees without
+    // subscribing to anything (#4333). Strict mode turns the same condition
+    // into a disabled channel, so say which happened.
+    if (mWarnedColorProfileFallback) {
+        return;
+    }
+    if (mProfileBindingAccepted) {
+        FL_WARN("Channel " << id() << ": color management requested but " << reason << "; falling back to the legacy path");
+    } else {
+        FL_WARN("Channel " << id() << ": color management requested but " << reason << "; strict mode disables this channel");
+    }
+    mWarnedColorProfileFallback = true;
+}
+
+bool Channel::reconcileColorProfile(const ChannelOptions& options) FL_NO_EXCEPT {
+    // A strict-mode rejection disables the channel. Remember whether the
+    // current disabled state is ours, so that withdrawing the rejection
+    // re-enables the channel without also overriding a caller's own
+    // setEnabled(false).
+    const bool wasRejectedByUs = mColorProfileFallback && !mProfileBindingAccepted;
+
+    // Recompute from scratch. Reconfiguration must not inherit the verdict of
+    // the configuration it replaces: a valid profile applied over a rejected
+    // one has to clear the fallback, not keep reporting it.
+    mColorProfileFallback = false;
+    mProfileBindingAccepted = true;
+
+    // C5's fallback, raised by the two conditions that mean the same thing to
+    // a caller: management was asked for and is not happening. The second one
+    // -- a profile that binds but builds no pipeline -- is raised further
+    // down, once the build has been attempted.
+    if (options.mColorProfile.mRequested && !options.hasColorProfile()) {
+        raiseColorProfileFallback("no profile bound");
+    }
+    if (options.mColorProfile.mUseGlobalSourceDefault) {
+        mSettings.mColorProfile.mSource = detail::defaultSourceProfile();
+    }
+    // Guards the build below: a binding already rejected by strict mode must
+    // not be built. It is deliberately *not* reused for the enablement
+    // branch -- the build can raise the fallback itself (#4345), and reading
+    // this stale value there left a strict-mode channel reporting Rejected
+    // while still enabled and rendering through the legacy path, which is the
+    // one thing strict mode exists to prevent.
+    const bool rejectedBeforeBuild = mColorProfileFallback && !mProfileBindingAccepted;
+
+    // Derive the pipeline once, here, rather than per frame: it inverts
+    // matrices and bisects a lightness bound. A binding that does not
+    // describe a usable pipeline leaves the channel on the legacy path
+    // rather than failing -- an unbound channel is the ordinary case, not an
+    // error.
+    mPipeline.reset();
+    const ColorPipelineHooks& hooks = colorPipelineHooks();
+    if (!rejectedBeforeBuild && hooks.build != nullptr) {
+        // Through the hook, not by name. Calling `buildPipelineForBinding`
+        // directly from here is what kept the entire pipeline alive in every
+        // build; the pointer is null until `setColorProfile` installs it.
+        // Built on the stack first, so a binding that does not describe a
+        // usable pipeline costs no allocation -- that is the failing half of
+        // an ordinary unbound channel, not an exceptional path.
+        StreamingPipelineQ16 pipeline;
+        if (hooks.build(mSettings.mColorProfile, mSettings, mChipset,
+                        &pipeline)) {
+#if FL_COLOR_PIPELINE_SHARED
+            mPipeline = fl::make_shared<StreamingPipelineQ16>(pipeline);
+#else
+            mPipeline = fl::make_unique<StreamingPipelineQ16>(pipeline);
+#endif
+        } else if (options.hasColorProfile()) {
+            // R6: a profile outside the numerical bounds must "fail
+            // explicitly" and "not become native-drive input". A binding that
+            // cannot produce a pipeline used to leave every reporting surface
+            // saying the channel was fine -- Configured, no fallback flag, no
+            // warning -- while it rendered through the legacy path (#4345).
+            //
+            // This reports; it does not reject. Refusing the binding at
+            // setColorProfile() time is R6's fuller reading and needs the
+            // published coefficient bounds it also asks for, which do not
+            // exist yet.
+            raiseColorProfileFallback("bound profile builds no usable pipeline");
+        }
+    }
+
+    // Recomputed after the build, so a rejection raised by a failed build
+    // reaches this branch.
+    const bool rejectedNow = mColorProfileFallback && !mProfileBindingAccepted;
+    if (rejectedNow) {
+        setEnabled(false);
+    } else if (wasRejectedByUs) {
+        setEnabled(true);
+    }
+    return mColorProfileFallback;
+}
+#endif
+
+void Channel::applyConfig(const ChannelConfig& config) FL_NO_EXCEPT {
     mRgbOrder = config.rgb_order;
     if (config.mName.has_value()) {
         mName = config.mName.value();
     }
     setLeds(config.mLeds);
-    // Sync mSettings from incoming options so the mWhiteCfg variant survives
-    // to showPixels(). Setters below are idempotent overlays on the same data.
+    // Replace Channel-owned options and synchronize the base rendering fields.
     mSettings = config.options;
-    setCorrection(config.options.mCorrection);
-    setTemperature(config.options.mTemperature);
-    setDither(config.options.mDitherMode);
-    applyWhiteCfg(*this, config.options);
+#if !FL_COLOR_PROFILE_RUNTIME && !defined(FL_IS_AVR)
+    // Tiny options cannot carry a replacement profile; applying them is a
+    // legacy transition, just like the base correction/temperature setters.
+    mStaticProfileCleared = true;
+#endif
+    mBus = config.options.mBus;
+    mBusWhich = config.options.mBusWhich;
+    syncLegacySettings();
     auto& events = ChannelEvents::instance();
+#if FL_COLOR_PROFILE_RUNTIME
+    if (reconcileColorProfile(config.options)) {
+        events.onColorProfileFallback(ColorProfileEvent{id(), colorProfileStatus(), {}});
+    }
+#endif
     events.onChannelConfigured(*this, config);
 }
 
-int Channel::getClockPin() const {
+int Channel::getClockPin() const FL_NO_EXCEPT {
     if (const SpiChipsetConfig* spi = mChipset.ptr<SpiChipsetConfig>()) {
         return spi->clockPin;
     }
@@ -319,7 +574,7 @@ namespace {
 /// @param rgbOrder RGB ordering for current control reordering
 void writeUCS7604(fl::vector_psram<u8>* data, PixelIterator& pixelIterator,
                   ClocklessEncoder encoder, const ChannelOptions& settings,
-                  EOrder rgbOrder) {
+                  EOrder rgbOrder, bool managed) FL_NO_EXCEPT {
     // Map encoder enum to UCS7604Mode
     UCS7604Mode mode;
     switch (encoder) {
@@ -333,7 +588,7 @@ void writeUCS7604(fl::vector_psram<u8>* data, PixelIterator& pixelIterator,
             mode = UCS7604Mode::UCS7604_MODE_16BIT_1600KHZ;
             break;
         default:
-            // Should never happen — caller already checked
+            // Should never happen â€” caller already checked
             mode = UCS7604Mode::UCS7604_MODE_16BIT_800KHZ;
             break;
     }
@@ -349,7 +604,20 @@ void writeUCS7604(fl::vector_psram<u8>* data, PixelIterator& pixelIterator,
     UCS7604CurrentControl wire_current(
         rgb_currents[pos0], rgb_currents[pos1], rgb_currents[pos2], current.w);
 
-    // Get gamma LUT
+    // Get gamma LUT.
+    //
+    // Only the unbound path uses it. With a profile bound the pixel source
+    // has already produced the device drive and quantized it once, to 16
+    // bits, so widening it again through a curve is the second shaping stage
+    // B1 and section 6 forbid after the device solve -- and the 2.8 here is
+    // `value_or`'s default rather than anything the caller asked for, since
+    // `setColorProfile` clears `mGamma`. #4326.
+    // The iterator's own state, not the options'. `hasColorProfile()` says a
+    // profile is configured; it does not say the managed iterator was built.
+    // A rejected binding leaves the legacy controller in place, and taking
+    // the no-gamma path over its 8-bit pixels would drop a stage that path
+    // still needs.
+    const bool wide_source = managed;
     float gamma = settings.mGamma.value_or(2.8f);
     fl::shared_ptr<const Gamma8> gamma8 = Gamma8::getOrCreate(gamma);
 
@@ -358,12 +626,12 @@ void writeUCS7604(fl::vector_psram<u8>* data, PixelIterator& pixelIterator,
 
     // (#2558) UCS7604 is a 4-channel chipset (always RGBW). If the user
     // configured this channel for 5-channel RGBWW (warm-W + cool-W), the
-    // chipset can't carry the second W byte. Warn loudly — silently dropping
+    // chipset can't carry the second W byte. Warn loudly â€” silently dropping
     // the white channels would be very hard to diagnose. The pixel iterator
     // continues to emit RGB-only bytes (is_rgbw=false) so the strip still
     // lights up, just without the W diode.
     if (pixelIterator.get_rgbww().active() && !is_rgbw) {
-        FL_WARN_ONCE("UCS7604 cannot carry 5-channel RGBWW — this chipset "
+        FL_WARN_ONCE("UCS7604 cannot carry 5-channel RGBWW â€” this chipset "
                      "always emits 4-channel RGBW. The warm/cool white "
                      "channels in your Rgbww config will be dropped. "
                      "Set ChannelOptions.mWhiteCfg = Rgbw{...} instead to "
@@ -372,23 +640,193 @@ void writeUCS7604(fl::vector_psram<u8>* data, PixelIterator& pixelIterator,
 
     // Encode into the data buffer
     encodeUCS7604(pixelIterator, num_leds, fl::back_inserter(*data),
-                  mode, wire_current, is_rgbw, gamma8.get());
+                  mode, wire_current, is_rgbw, gamma8.get(), wide_source);
 }
 
 } // anonymous namespace
 
-/// @brief Cold fallback for the non-pre-bound driver path. Handles dynamic
+namespace {
+
+/// Shared color-managed SPI override check. Keeping it out of the per-chipset
+/// leaves avoids duplicating the optional pipeline hook in every writer.
+FL_NO_INLINE
+bool tryEncodeManagedSpi(Channel& channel, PixelIterator& pixels,
+                         bool managed, fl::vector_psram<u8>& output,
+                         SpiChipset chipset)
+    FL_NO_EXCEPT {
+#if FL_COLOR_PROFILE_RUNTIME
+    if (!managed) {
+        return false;
+    }
+    const ColorPipelineHooks& hooks = colorPipelineHooks();
+    return hooks.encodeManagedSpi != nullptr &&
+           hooks.encodeManagedSpi(pixels, &output, chipset, channel);
+#else
+    FL_UNUSED(channel);
+    FL_UNUSED(pixels);
+    FL_UNUSED(managed);
+    FL_UNUSED(output);
+    FL_UNUSED(chipset);
+    return false;
+#endif
+}
+
+SpiChipset spiChipsetFor(const Channel& channel) FL_NO_EXCEPT {
+    const SpiChipsetConfig* spi =
+        channel.getChipset().ptr<SpiChipsetConfig>();
+    return spi->timing.chipset;
+}
+
+}  // anonymous namespace
+
+FL_NO_INLINE
+void Channel::encodeWS2812(Channel&, PixelIterator& pixels,
+                           bool, fl::vector_psram<u8>& output) FL_NO_EXCEPT {
+    pixels.writeWS2812(&output);
+}
+
+FL_NO_INLINE
+void Channel::encodeTM1812RGBWW(Channel&, PixelIterator& pixels,
+                                bool, fl::vector_psram<u8>& output) FL_NO_EXCEPT {
+    pixels.writeTM1812RGBWW(&output);
+}
+
+FL_NO_INLINE
+void Channel::encodeTM1908(Channel&, PixelIterator& pixels,
+                           bool, fl::vector_psram<u8>& output) FL_NO_EXCEPT {
+    pixels.writeTM1908(&output);
+}
+
+FL_NO_INLINE
+void Channel::encodeUCS7604(Channel& channel, PixelIterator& pixels,
+                            bool managed,
+                            fl::vector_psram<u8>& output) FL_NO_EXCEPT {
+    const ClocklessChipset* clockless =
+        channel.mChipset.ptr<ClocklessChipset>();
+    writeUCS7604(&output, pixels, clockless->encoder, channel.mSettings,
+                 channel.mRgbOrder, managed);
+}
+
+FL_NO_INLINE
+void Channel::encodeAPA102(Channel& channel, PixelIterator& pixels,
+                           bool managed, fl::vector_psram<u8>& output)
+    FL_NO_EXCEPT {
+    const SpiChipset chipset = spiChipsetFor(channel);
+    if (tryEncodeManagedSpi(channel, pixels, managed, output, chipset)) {
+        return;
+    }
+    const bool hdGamma = chipset == SpiChipset::APA102HD ||
+                         chipset == SpiChipset::DOTSTARHD ||
+                         chipset == SpiChipset::HD107HD;
+    pixels.writeAPA102(&output, hdGamma);
+}
+
+FL_NO_INLINE
+void Channel::encodeSK9822(Channel& channel, PixelIterator& pixels,
+                           bool managed, fl::vector_psram<u8>& output)
+    FL_NO_EXCEPT {
+    const SpiChipset chipset = spiChipsetFor(channel);
+    if (tryEncodeManagedSpi(channel, pixels, managed, output, chipset)) {
+        return;
+    }
+    pixels.writeSK9822(&output, chipset == SpiChipset::SK9822HD);
+}
+
+FL_NO_INLINE
+void Channel::encodeWS2801(Channel& channel, PixelIterator& pixels,
+                           bool managed, fl::vector_psram<u8>& output)
+    FL_NO_EXCEPT {
+    if (tryEncodeManagedSpi(channel, pixels, managed, output,
+                           spiChipsetFor(channel))) {
+        return;
+    }
+    pixels.writeWS2801(&output);
+}
+
+FL_NO_INLINE
+void Channel::encodeWS2803(Channel& channel, PixelIterator& pixels,
+                           bool managed, fl::vector_psram<u8>& output)
+    FL_NO_EXCEPT {
+    if (tryEncodeManagedSpi(channel, pixels, managed, output,
+                           spiChipsetFor(channel))) {
+        return;
+    }
+    pixels.writeWS2803(&output);
+}
+
+FL_NO_INLINE
+void Channel::encodeP9813(Channel& channel, PixelIterator& pixels,
+                          bool managed, fl::vector_psram<u8>& output)
+    FL_NO_EXCEPT {
+    if (tryEncodeManagedSpi(channel, pixels, managed, output,
+                           spiChipsetFor(channel))) {
+        return;
+    }
+    pixels.writeP9813(&output);
+}
+
+FL_NO_INLINE
+void Channel::encodeLPD8806(Channel& channel, PixelIterator& pixels,
+                            bool managed, fl::vector_psram<u8>& output)
+    FL_NO_EXCEPT {
+    if (tryEncodeManagedSpi(channel, pixels, managed, output,
+                           spiChipsetFor(channel))) {
+        return;
+    }
+    pixels.writeLPD8806(&output);
+}
+
+FL_NO_INLINE
+void Channel::encodeLPD6803(Channel& channel, PixelIterator& pixels,
+                            bool managed, fl::vector_psram<u8>& output)
+    FL_NO_EXCEPT {
+    if (tryEncodeManagedSpi(channel, pixels, managed, output,
+                           spiChipsetFor(channel))) {
+        return;
+    }
+    pixels.writeLPD6803(&output);
+}
+
+FL_NO_INLINE
+void Channel::encodeSM16716(Channel& channel, PixelIterator& pixels,
+                            bool managed, fl::vector_psram<u8>& output)
+    FL_NO_EXCEPT {
+    if (tryEncodeManagedSpi(channel, pixels, managed, output,
+                           spiChipsetFor(channel))) {
+        return;
+    }
+    pixels.writeSM16716(&output);
+}
+
+FL_NO_INLINE
+void Channel::encodeHD108(Channel& channel, PixelIterator& pixels,
+                          bool managed, fl::vector_psram<u8>& output)
+    FL_NO_EXCEPT {
+    if (tryEncodeManagedSpi(channel, pixels, managed, output,
+                           spiChipsetFor(channel))) {
+        return;
+    }
+    pixels.writeHD108(&output, managed);
+}
+
+FL_NO_INLINE
+void Channel::encodeMY9221(Channel& channel, PixelIterator& pixels,
+                           bool managed, fl::vector_psram<u8>& output)
+    FL_NO_EXCEPT {
+    (void)tryEncodeManagedSpi(channel, pixels, managed, output,
+                             spiChipsetFor(channel));
+}
+
+/// @brief Resolve the driver for this channel. Handles dynamic
 ///        `ChannelManager::selectDriverForChannel` lookup AND the
 ///        bus-key-miss diagnostic chain. Hoisted out of `showPixels` so the
-///        hot legacy `addLeds<>` path stays compact — see #2773 item 2.1.
+///        hot path stays compact -- see #2773 item 2.1. This is the only
+///        driver-resolution path; there is no pre-bound fast path.
 ///
-/// Marked `noinline` (via `FL_NOINLINE`) so the compiler doesn't fold the
-/// cold body back into `showPixels`. The whole helper is reachable only
-/// when `mDriverPreBound == false`, which on stock Blink is never true —
-/// LTO can use that across the call site to keep the cold body off the
-/// hot icache line.
+/// Marked `noinline` (via `FL_NO_INLINE`) so the compiler doesn't fold the
+/// cold body back into `showPixels`.
 FL_NO_INLINE
-fl::shared_ptr<IChannelDriver> Channel::resolveDynamicDriver() {
+fl::shared_ptr<IChannelDriver> Channel::resolveDynamicDriver() FL_NO_EXCEPT {
 #if defined(FASTLED_DISABLE_DYNAMIC_DRIVER) && FASTLED_DISABLE_DYNAMIC_DRIVER
     // Body excluded via FASTLED_DISABLE_DYNAMIC_DRIVER (#2926). The
     // showPixels call site is also gated so this is unreachable; the
@@ -399,7 +837,7 @@ fl::shared_ptr<IChannelDriver> Channel::resolveDynamicDriver() {
     // Build busKey only when we actually need it (mBus != AUTO).
     fl::string busKey;
     if (mBus != Bus::AUTO) {
-        busKey = fl::string::from_literal(busName(mBus));
+        busKey = fl::string::from_literal(busDriverName(mBus, mBusWhich, isSpi()));
     }
 
     fl::shared_ptr<IChannelDriver> driver =
@@ -409,35 +847,26 @@ fl::shared_ptr<IChannelDriver> Channel::resolveDynamicDriver() {
     // #2455 / #2459: one-shot diagnostic when a typed-Bus miss happens.
     // Probe via `findDriverByName` (silent) to distinguish "driver wasn't
     // instantiated" from "driver exists but canHandle() rejected this
-    // chipset" — resolution paths differ. The mBusWarned guard suppresses
+    // chipset" â€” resolution paths differ. The mBusWarned guard suppresses
     // duplicate logs on subsequent shows of the same channel.
 #if FASTLED_LOG_RUNTIME_ENABLED
     if (mBus != Bus::AUTO && !mBusWarned &&
         (!driver || driver->getName() != busKey)) {
         auto busDriver = ChannelManager::instance().findDriverByName(busKey);
         if (!busDriver) {
-            // Typed Bus miss — emit the actionable hint with the three
+            // Typed Bus miss â€” emit the actionable hint with the three
             // currently-shipping remediations (option 3 added in #2460).
-            FL_ERROR("Channel '" << mName << "': Driver '" << busKey
-                << "' wasn't instantiated. Resolve with: "
-                << "(1) fl::enableDrivers<fl::Bus::" << busKey << ">() "
-                << "(links only this driver), "
-                << "(2) FastLED.enableAllDrivers() (links every driver), or "
-                << "(3) FastLED.addLeds<..., fl::Bus::" << busKey << ">(...) "
-                << "(legacy API; pins Bus + triggers linker keep-alive). "
-                << "Defaulting to AUTO/priority dispatch.");
+            FL_ERROR("Channel '" << mName << "': Driver '" << busKey << "' wasn't instantiated. Resolve with: (1) fl::enableDrivers<fl::Bus::" << busKey << ">() (links only this driver), (2) FastLED.enableAllDrivers() (links every driver), or (3) FastLED.addLeds<..., fl::Bus::" << busKey << ">(...) (legacy API; pins Bus + triggers linker keep-alive). Defaulting to AUTO/priority dispatch.");
         } else {
-            // Registered, but canHandle() said no — bus/chipset mismatch.
-            FL_ERROR("Channel '" << mName << "': Driver '" << busKey
-                << "' is registered but cannot handle this channel's chipset "
-                << "(bus/chipset mismatch). Defaulting to AUTO/priority dispatch.");
+            // Registered, but canHandle() said no â€” bus/chipset mismatch.
+            FL_ERROR("Channel '" << mName << "': Driver '" << busKey << "' is registered but cannot handle this channel's chipset (bus/chipset mismatch). Defaulting to AUTO/priority dispatch.");
         }
         mBusWarned = true;
     }
     if (!driver) {
         FL_ERROR("Channel '" << mName << "': No compatible driver found - cannot transmit");
     }
-#endif  // FASTLED_LOG_RUNTIME_ENABLED — release skips the per-frame
+#endif  // FASTLED_LOG_RUNTIME_ENABLED â€” release skips the per-frame
         // driver->getName() != busKey compare + the silent
         // findDriverByName probe (used only to differentiate the
         // FL_ERROR message). The functional return value below is
@@ -446,188 +875,137 @@ fl::shared_ptr<IChannelDriver> Channel::resolveDynamicDriver() {
 #endif  // !FASTLED_DISABLE_DYNAMIC_DRIVER
 }
 
-void Channel::showPixels(PixelController<RGB, 1, 0xFFFFFFFF> &pixels) {
+// Cold path of showPixels(): the previous frame's buffer is still owned by the
+// driver. Returns false when showPixels() must drop this frame (#4566).
+bool Channel::waitForInUseBuffer() FL_NO_EXCEPT {
+    FL_WARN("Channel '" << mName << "': showPixels() called while mChannelData is in use by driver, attempting to wait");
+    auto driver = mDriver.lock();
+    if (!driver) {
+        FL_ERROR("Channel '" << mName << "': No driver bound yet the mChannelData is in use - cannot transmit");
+        return false;
+    }
+    // wait until the driver is in a READY state.
+    bool ok = driver->waitForReady();
+    if (!ok) {
+        FL_ERROR("Channel '" << mName << "': Timeout occurred while waiting for driver to become READY");
+        return false;
+    }
+    FL_WARN("Channel '" << mName << "': Engine became READY after waiting");
+    return true;
+}
+
+// showPixels() is only a dispatcher (#4566): in-use wait, driver resolution,
+// encodeFrame(), submitFrame(). Each helper is FL_NO_INLINE so the entry
+// point stays small and the bodies exist exactly once.
+void Channel::showPixels(PixelController<RGB, 1, 0xFFFFFFFF> &pixels) FL_NO_EXCEPT {
     FL_SCOPED_TRACE;
 
     // Safety check: don't modify buffer if driver is currently transmitting it
-    if (mChannelData->isInUse()) {
-        FL_WARN("Channel '" << mName << "': showPixels() called while mChannelData is in use by driver, attempting to wait");
-        auto driver = mDriver.lock();
-        if (!driver) {
-            FL_ERROR("Channel '" << mName << "': No driver bound yet the mChannelData is in use - cannot transmit");
-            return;
-        }
-        // wait until the driver is in a READY state.
-        bool ok = driver->waitForReady();
-        if (!ok) {
-            FL_ERROR("Channel '" << mName << "': Timeout occurred while waiting for driver to become READY");
-            return;
-        }
-        FL_WARN("Channel '" << mName << "': Engine became READY after waiting");
-    }
-
-    // Phase 5b of #2428: if the driver was pre-bound via setDriver() (legacy
-    // addLeds<>-style controllers naming BusTraits<Bus::X>::instancePtr() in
-    // their constructor), bypass ChannelManager entirely. Channels created via
-    // the manager-based API (Channel::create(cfg) without affinity) keep their
-    // existing per-frame re-selection so users can swap drivers at runtime.
-    //
-    // **Fast path (#2773 item 2.1):** the legacy `addLeds<NEOPIXEL>` flow is
-    // by far the hot per-frame path on stock Blink. It needs no busKey
-    // construction, no dynamic driver lookup, no busKey-miss diagnostics,
-    // and no fallback `FL_ERROR` reporting — the driver was already pre-bound
-    // in the controller's constructor. Pulling all of that boilerplate out
-    // of `showPixels` lets the compiler keep the hot path compact and lets
-    // the slow path's `fl::string` ops / `ChannelManager::selectDriverForChannel`
-    // / diagnostic literals tree-shake on the slow-path branch's coldness.
-    fl::shared_ptr<IChannelDriver> driver;
-    if (mDriverPreBound) {
-        driver = mDriver.lock();
-        if (!driver) {
-            // Pre-bound driver got destroyed (singleton shutdown, etc.). Silent
-            // bail — this is unrecoverable from showPixels.
-            return;
-        }
-    } else {
-#if !defined(FASTLED_DISABLE_DYNAMIC_DRIVER) || !FASTLED_DISABLE_DYNAMIC_DRIVER
-        driver = resolveDynamicDriver();
-        if (!driver) {
-            return;
-        }
-#else
-        // Dynamic-driver lookup gated out via FASTLED_DISABLE_DYNAMIC_DRIVER
-        // (#2926). The else branch is dead at runtime for every legacy
-        // `addLeds<>` flavor — those pre-bind their driver in the ctor. The
-        // gate lets `--gc-sections` drop the resolveDynamicDriver body plus
-        // the ChannelManager::findDriverByName / selectDriverForChannel
-        // chain (~400-900 B). Channels created via `Channel::create(cfg)`
-        // without a pre-bound driver silently emit nothing under this flag —
-        // user accepts the constraint.
+    if (mChannelData->isInUse() && !waitForInUseBuffer()) {
         return;
-#endif
     }
 
+    // Channels created via the manager-based API (Channel::create(cfg))
+    // always resolve their driver dynamically through resolveDynamicDriver(),
+    // which handles the busKey construction, ChannelManager lookup, and
+    // diagnostics. Legacy addLeds<> controllers no longer go through Channel
+    // at all -- they route through fl::SlimBridgeController.
+    fl::shared_ptr<IChannelDriver> driver;
+#if !defined(FASTLED_DISABLE_DYNAMIC_DRIVER) || !FASTLED_DISABLE_DYNAMIC_DRIVER
+    driver = resolveDynamicDriver();
+    if (!driver) {
+        return;
+    }
+#else
+    // Dynamic-driver lookup gated out via FASTLED_DISABLE_DYNAMIC_DRIVER
+    // (#2926). The gate lets `--gc-sections` drop the resolveDynamicDriver
+    // body plus the ChannelManager::findDriverByName /
+    // selectDriverForChannel chain (~400-900 B). Under this flag, runtime
+    // Channels emit nothing -- user accepts the constraint.
+    return;
+#endif
+
+    encodeFrame(pixels);
+    submitFrame(driver);
+}
+
+// Encode `pixels` into mChannelData with the construction-bound encoder and
+// fire onChannelDataEncoded (#4566: out of line from showPixels()).
+void Channel::encodeFrame(PixelController<RGB, 1, 0xFFFFFFFF> &pixels) FL_NO_EXCEPT {
     // Build pixel iterator with optional addressing transformation
-    // (#2558) Pass both Rgbw and Rgbww from the channel options; the iterator
+    // (#2558) Pass both Rgbw and Rgbww from the current rendering settings; the iterator
     // carries both, and the encoder dispatch below picks the right path based
-    // on which variant alternative ChannelOptions::mWhiteCfg holds.
+    // on which white-channel variant the controller currently holds.
+#if FL_COLOR_PROFILE_RUNTIME
+    // Brightness reaches the pipeline as C4's flux scalar and nowhere else.
+    // `premixed` is the brightness on this path: binding a profile sets
+    // correction and temperature to identity, so nothing else is folded into
+    // it -- and reading it rather than `ColorAdjustment::brightness` keeps
+    // this working when FASTLED_HD_COLOR_MIXING is off, where that field
+    // does not exist.
+    //
+    // The shared pipeline is never written after it is built (#4440): this
+    // managed iterator takes a reference, copies it, and sets flux on the copy, so a
+    // concurrent reader -- the power estimate copies the same pipeline --
+    // never sees a half-written flux, and a reconfiguration replaces
+    // `mPipeline` without touching what this frame encodes through. Small
+    // tiers encode synchronously and keep single ownership, mutated in place.
+#if FL_COLOR_PIPELINE_SHARED
+    const ColorPipelineStorage pipeline_ref = mPipeline;
+    const StreamingPipelineQ16* pipeline = pipeline_ref.get();
+#else
+    StreamingPipelineQ16* pipeline = mPipeline.get();
+#endif
+#else
+    StreamingPipelineQ16* pipeline = nullptr;
+#endif
+    // Dither advances on presentation, not on attempt (#4347, R8): this
+    // channel's phase moves only when its driver accepts a frame (submitFrame()), so
+    // a dropped submission -- no driver, a disabled one, a busy buffer --
+    // does not consume a phase and the cycle's average stays unbiased. Both
+    // the legacy offsets and the colour-managed temporal dither read it.
+    if (pixels.ditherActive()) {
+        pixels.reseed_binary_dithering(mDitherPhase);
+    }
+#ifdef FL_IS_AVR
+    // AVR omits base settings notifications, so base setters are authoritative.
+    const auto& whiteSettings = mLegacySettings;
+#else
+    const auto& whiteSettings = mSettings;
+#endif
     ReorderingPixelIteratorAny iterator(pixels, mScreenMap.getXYMap(), mRgbOrder,
-                                        mSettings.rgbw(), mSettings.rgbww(),
-                                        mName);
+                                        whiteSettings.rgbw(), whiteSettings.rgbww(),
+                                        mName, pipeline, mDitherPhase,
+                                        pixels.mColorAdjustment.premixed.r);
     PixelIterator& pixelIterator = iterator.get();
 
-    // Encode pixels based on chipset type
+    // Encode pixels with the writer selected once from the immutable chipset.
     auto& data = mChannelData->getData();
     data.clear();
-
-    if (mChipset.is<ClocklessChipset>()) {
-        // Clockless chipsets: dispatch based on encoder type
-        const ClocklessChipset* clockless = mChipset.ptr<ClocklessChipset>();
-        switch (clockless->encoder) {
-            case ClocklessEncoder::CLOCKLESS_ENCODER_WS2812:
-                pixelIterator.writeWS2812(&data);
-                break;
-#if !defined(FASTLED_DISABLE_UCS7604) || !FASTLED_DISABLE_UCS7604
-            // Gated by FASTLED_DISABLE_UCS7604 (#2920). For WS2812-only
-            // sketches the UCS7604 case is dead at runtime, but each
-            // `writeUCS7604(...)` reference is statically reachable,
-            // keeping the encoder bodies linked. Setting
-            // `-DFASTLED_DISABLE_UCS7604=1` drops the case + the
-            // `encodeUCS7604_16bit_RGB` / `encodeUCS7604_16bit_RGBW`
-            // template instantiations (~400-600 B). When the gate is
-            // enabled, calling showPixels() on a UCS7604 channel
-            // silently emits nothing.
-            case ClocklessEncoder::CLOCKLESS_ENCODER_UCS7604_8BIT:
-            case ClocklessEncoder::CLOCKLESS_ENCODER_UCS7604_16BIT:
-            case ClocklessEncoder::CLOCKLESS_ENCODER_UCS7604_16BIT_1600:
-                writeUCS7604(&data, pixelIterator, clockless->encoder,
-                             mSettings, mRgbOrder);
-                break;
-#endif  // !FASTLED_DISABLE_UCS7604
-        }
-#if !defined(FASTLED_DISABLE_SPI_CHIPSETS) || !FASTLED_DISABLE_SPI_CHIPSETS
-    } else if (mChipset.is<SpiChipsetConfig>()) {
-        // SPI chipsets: dispatch based on chipset type (zero allocation).
-        //
-        // Gated by FASTLED_DISABLE_SPI_CHIPSETS (#2913). For NEOPIXEL-only
-        // sketches on ESP32-S3 the SPI branch is dead at runtime, but the
-        // compiler cannot prove that — each pixelIterator.writeXXX(...)
-        // reference below is statically reachable, keeping ~720 B of
-        // encoder bodies (writeAPA102, writeSK9822, writeLPD8806,
-        // writeSM16716) plus the 11-case switch table linked. Setting
-        // `-DFASTLED_DISABLE_SPI_CHIPSETS=1` in build_flags drops the
-        // whole branch and recovers ~1.0-1.2 KB on a NEOPIXEL Blink.
-        //
-        // When the gate is enabled, calling showPixels() on an
-        // SpiChipsetConfig channel silently emits nothing — the user
-        // accepts that constraint by setting the flag.
-        const SpiChipsetConfig* spi = mChipset.ptr<SpiChipsetConfig>();
-        const SpiEncoder& config = spi->timing;
-
-        // Switch on enum WITHOUT default case - compiler will warn if new enum values are added
-        // TODO: Consolidate these PixelIterator methods with template controllers in src/fl/chipsets/
-        switch (config.chipset) {
-            case SpiChipset::APA102:
-            case SpiChipset::DOTSTAR:
-            case SpiChipset::HD107:
-                pixelIterator.writeAPA102(&data, false);
-                break;
-
-            case SpiChipset::APA102HD:
-            case SpiChipset::DOTSTARHD:
-            case SpiChipset::HD107HD:
-                pixelIterator.writeAPA102(&data, true);
-                break;
-
-            case SpiChipset::SK9822:
-                pixelIterator.writeSK9822(&data, false);
-                break;
-
-            case SpiChipset::SK9822HD:
-                pixelIterator.writeSK9822(&data, true);
-                break;
-
-            case SpiChipset::WS2801:
-                pixelIterator.writeWS2801(&data);
-                break;
-
-            case SpiChipset::WS2803:
-                pixelIterator.writeWS2803(&data);
-                break;
-
-            case SpiChipset::P9813:
-                pixelIterator.writeP9813(&data);
-                break;
-
-            case SpiChipset::LPD8806:
-                pixelIterator.writeLPD8806(&data);
-                break;
-
-            case SpiChipset::LPD6803:
-                pixelIterator.writeLPD6803(&data);
-                break;
-
-            case SpiChipset::SM16716:
-                pixelIterator.writeSM16716(&data);
-                break;
-
-            case SpiChipset::HD108:
-                pixelIterator.writeHD108(&data);
-                break;
-        }
-        // No default case - compiler will error if any enum value is missing
+    const auto* rgbww = whiteSettings.mWhiteCfg.ptr<Rgbww>();
+    const auto* rgbw = whiteSettings.mWhiteCfg.ptr<Rgbw>();
+    if (rgbww != nullptr && rgbww->active()) {
+        mChannelData->setPixelFormat(ChannelPixelFormat::RGBWW);
+    } else if (rgbw != nullptr && rgbw->active()) {
+        mChannelData->setPixelFormat(ChannelPixelFormat::RGBW);
+    } else {
+        mChannelData->setPixelFormat(ChannelPixelFormat::RGB);
     }
-#endif  // !FASTLED_DISABLE_SPI_CHIPSETS
+
+    if (mPixelEncoder != nullptr) {
+        mPixelEncoder(*this, pixelIterator, iterator.isManaged(), data);
+    }
 
     // Fire event after encoding completes
     {
         auto& events = ChannelEvents::instance();
         events.onChannelDataEncoded(*this, *mChannelData);
     }
+}
 
-
-
-    // #2517: detect the silent-drop scenario before enqueuing — if the
+// Submit the encoded frame to `driver` (#4566: out of line from showPixels()).
+void Channel::submitFrame(const fl::shared_ptr<IChannelDriver>& driver) FL_NO_EXCEPT {
+    // #2517: detect the silent-drop scenario before enqueuing â€” if the
     // resolved driver is registered with ChannelManager but currently
     // disabled (typically by `FastLED.setExclusiveDriver<OtherBus>()`),
     // `ChannelManager::onEndFrame()` will skip its `show()` call and the
@@ -648,7 +1026,7 @@ void Channel::showPixels(PixelController<RGB, 1, 0xFFFFFFFF> &pixels) {
             mDisabledDriverWarned = true;
         }
 #endif
-        // Skip the enqueue — the data wouldn't be sent anyway, and dropping
+        // Skip the enqueue â€” the data wouldn't be sent anyway, and dropping
         // it here matches the existing behaviour (rather than leaving stale
         // bytes in the driver's pending queue across an enable/disable flip).
         // The drop happens in both debug and release; only the diagnostic
@@ -664,15 +1042,18 @@ void Channel::showPixels(PixelController<RGB, 1, 0xFFFFFFFF> &pixels) {
     }
     // NOT_REGISTERED: driver is not managed by ChannelManager (e.g. a custom
     // test driver, or one that was removed). Fall through to enqueue and let
-    // the driver decide what to do — this is the historic behaviour.
+    // the driver decide what to do â€” this is the historic behaviour.
 
     // Enqueue for transmission (will be sent when driver->show() is called)
     driver->enqueue(mChannelData);
+    // Presented, per the driver contract: an accepted enqueue is the frame.
+    ++mDitherPhase;
     auto& events = ChannelEvents::instance();
-    events.onChannelEnqueued(*this, driver->getName());
+    // Reuse the name fetched for driverStatus() instead of a second getName().
+    events.onChannelEnqueued(*this, driverName);
 }
 
-void Channel::init() {
+void Channel::init() FL_NO_EXCEPT {
     // TODO: Implement initialization
 }
 
@@ -680,14 +1061,14 @@ void Channel::init() {
 namespace {
 class StubChannelEngine : public IChannelDriver {
 public:
-    virtual ~StubChannelEngine() FL_NOEXCEPT = default;
+    virtual ~StubChannelEngine() FL_NO_EXCEPT = default;
 
-    virtual bool canHandle(const ChannelDataPtr& data) const override {
+    virtual bool canHandle(const ChannelDataPtr& data) const FL_NO_EXCEPT override {
         (void)data;
         return true;  // Test driver accepts all channel types
     }
 
-    virtual void enqueue(ChannelDataPtr /*channelData*/) override {
+    virtual void enqueue(ChannelDataPtr /*channelData*/) FL_NO_EXCEPT override {
         // No-op: stub driver does nothing
         static bool warned = false;
         if (!warned) {
@@ -696,32 +1077,32 @@ public:
         }
     }
 
-    virtual void show() override {
+    virtual void show() FL_NO_EXCEPT override {
         // No-op: no hardware to drive
     }
 
-    virtual DriverState poll() override {
+    virtual DriverState poll() FL_NO_EXCEPT override {
         return DriverState(DriverState::READY);  // Always "ready" (does nothing)
     }
 
-    virtual fl::string getName() const override {
+    virtual fl::string getName() const FL_NO_EXCEPT override {
         return fl::string::from_literal("STUB");
     }
 
-    virtual Capabilities getCapabilities() const override {
+    virtual Capabilities getCapabilities() const FL_NO_EXCEPT override {
         return Capabilities(true, true);  // Stub accepts both clockless and SPI
     }
 };
 
 } // anonymous namespace
 
-IChannelDriver* getStubChannelEngine() {
+IChannelDriver* getStubChannelEngine() FL_NO_EXCEPT {
     static StubChannelEngine instance;
     return &instance;
 }
 
 // Re-exposed protected base class methods
-void Channel::addToDrawList() {
+void Channel::addToDrawList() FL_NO_EXCEPT {
     if (isInList()) {
         FL_WARN("Channel '" << mName << "': Skipping addToDrawList() - already in draw list");
         return;
@@ -732,7 +1113,7 @@ void Channel::addToDrawList() {
     events.onChannelAdded(*this);
 }
 
-void Channel::removeFromDrawList() {
+void Channel::removeFromDrawList() FL_NO_EXCEPT {
     if (!isInList()) {
         FL_WARN("Channel '" << mName << "': Skipping removeFromDrawList() - not in draw list");
         return;
@@ -746,52 +1127,62 @@ void Channel::removeFromDrawList() {
     mDriver.reset();
 }
 
-int Channel::size() const {
+int Channel::size() const FL_NO_EXCEPT {
     return CPixelLEDController<RGB>::size();
 }
 
-void Channel::showLeds(u8 brightness) {
+void Channel::showLeds(u8 brightness) FL_NO_EXCEPT {
     CPixelLEDController<RGB>::showLeds(brightness);
 }
 
-bool Channel::isInDrawList() const {
+u8 Channel::ditherPhase() const FL_NO_EXCEPT {
+    return mDitherPhase;
+}
+
+bool Channel::isInDrawList() const FL_NO_EXCEPT {
     return CPixelLEDController<RGB>::isInList();
 }
 
-fl::span<CRGB> Channel::leds() {
+fl::span<CRGB> Channel::leds() FL_NO_EXCEPT {
     return fl::span<CRGB>(CPixelLEDController<RGB>::leds(), CPixelLEDController<RGB>::size());
 }
 
-fl::span<const CRGB> Channel::leds() const {
+fl::span<const CRGB> Channel::leds() const FL_NO_EXCEPT {
     return fl::span<const CRGB>(CPixelLEDController<RGB>::leds(), CPixelLEDController<RGB>::size());
 }
 
-CRGB Channel::getCorrection() {
+CRGB Channel::getCorrection() FL_NO_EXCEPT {
     return CPixelLEDController<RGB>::getCorrection();
 }
 
-CRGB Channel::getTemperature() {
+CRGB Channel::getTemperature() FL_NO_EXCEPT {
     return CPixelLEDController<RGB>::getTemperature();
 }
 
-u8 Channel::getDither() {
+u8 Channel::getDither() FL_NO_EXCEPT {
     return CPixelLEDController<RGB>::getDither();
 }
 
-Rgbw Channel::getRgbw() const {
+#if FL_COLOR_PIPELINE_SHARED
+fl::shared_ptr<StreamingPipelineQ16> Channel::colorPipeline() const FL_NO_EXCEPT {
+    return mPipeline;
+}
+#endif
+
+Rgbw Channel::getRgbw() const FL_NO_EXCEPT {
     return CPixelLEDController<RGB>::getRgbw();
 }
 
-Channel& Channel::setGamma(float gamma) {
+Channel& Channel::setGamma(float gamma) FL_NO_EXCEPT {
     mSettings.mGamma = gamma;
     return *this;
 }
 
-fl::optional<float> Channel::getGamma() const {
+fl::optional<float> Channel::getGamma() const FL_NO_EXCEPT {
     return mSettings.mGamma;
 }
 
-fl::string Channel::getEngineName() const {
+fl::string Channel::getEngineName() const FL_NO_EXCEPT {
     // Lock the weak_ptr to get a shared_ptr
     auto driver = mDriver.lock();
     if (driver) {
@@ -800,7 +1191,7 @@ fl::string Channel::getEngineName() const {
     return fl::string();  // Return empty string if no driver bound
 }
 
-Channel& Channel::setScreenMap(const fl::XYMap& map, float diameter) {
+Channel& Channel::setScreenMap(const fl::XYMap& map, float diameter) FL_NO_EXCEPT {
     fl::ScreenMap screenmap = map.toScreenMap();
     if (diameter <= 0.0f) {
         screenmap.setDiameter(.15f);  // Default diameter for small matrices
@@ -812,28 +1203,28 @@ Channel& Channel::setScreenMap(const fl::XYMap& map, float diameter) {
     return *this;
 }
 
-Channel& Channel::setScreenMap(const fl::ScreenMap& map) {
+Channel& Channel::setScreenMap(const fl::ScreenMap& map) FL_NO_EXCEPT {
     mScreenMap = map;
     fl::EngineEvents::onCanvasUiSet(asController(), map);
     return *this;
 }
 
-Channel& Channel::setScreenMap(fl::u16 width, fl::u16 height, float diameter) {
+Channel& Channel::setScreenMap(fl::u16 width, fl::u16 height, float diameter) FL_NO_EXCEPT {
     fl::XYMap xymap = fl::XYMap::constructRectangularGrid(width, height);
     return setScreenMap(xymap, diameter);
 }
 
-Channel& Channel::setScreenMap(const fl::XMap& map) {
+Channel& Channel::setScreenMap(const fl::XMap& map) FL_NO_EXCEPT {
     // Convert 1D XMap to 2D XYMap (width=length, height=1) and reuse existing logic
     fl::XYMap xymap = fl::XYMap::fromXMap(map);
     return setScreenMap(xymap, .15f);  // Use default diameter for 1D strips
 }
 
-const fl::ScreenMap& Channel::getScreenMap() const {
+const fl::ScreenMap& Channel::getScreenMap() const FL_NO_EXCEPT {
     return mScreenMap;
 }
 
-bool Channel::hasScreenMap() const {
+bool Channel::hasScreenMap() const FL_NO_EXCEPT {
     return mScreenMap.getLength() > 0;
 }
 

@@ -22,20 +22,20 @@ struct ServerClientConnection {
     u32 clientId;  // Unique identifier for this client
 
     // Default constructor (required for fl::vector operations)
-    ServerClientConnection() FL_NOEXCEPT
+    ServerClientConnection() FL_NO_EXCEPT
         : connection(ConnectionConfig())
         , clientId(0)
     {
     }
 
-    ServerClientConnection(ServerClientConnection&& other) FL_NOEXCEPT
+    ServerClientConnection(ServerClientConnection&& other) FL_NO_EXCEPT
         : socket(fl::move(other.socket))
         , connection(other.connection)
         , clientId(other.clientId)
     {
     }
 
-    ServerClientConnection& operator=(ServerClientConnection&& other) FL_NOEXCEPT {
+    ServerClientConnection& operator=(ServerClientConnection&& other) FL_NO_EXCEPT {
         if (this != &other) {
             socket = fl::move(other.socket);
             connection = other.connection;
@@ -45,8 +45,8 @@ struct ServerClientConnection {
     }
 
     // Not copyable (socket is not copyable)
-    ServerClientConnection(const ServerClientConnection&) FL_NOEXCEPT = delete;
-    ServerClientConnection& operator=(const ServerClientConnection&) FL_NOEXCEPT = delete;
+    ServerClientConnection(const ServerClientConnection&) FL_NO_EXCEPT = delete;
+    ServerClientConnection& operator=(const ServerClientConnection&) FL_NO_EXCEPT = delete;
 };
 
 // Native HTTP server using POSIX sockets
@@ -54,42 +54,42 @@ struct ServerClientConnection {
 class NativeHttpServer {
 public:
     // Constructor
-    NativeHttpServer(u16 port, const ConnectionConfig& config = ConnectionConfig());
-    ~NativeHttpServer() FL_NOEXCEPT;
+    NativeHttpServer(u16 port, const ConnectionConfig& config = ConnectionConfig()) FL_NO_EXCEPT;
+    ~NativeHttpServer() FL_NO_EXCEPT;
 
     // Disable copy (socket ownership)
-    NativeHttpServer(const NativeHttpServer&) FL_NOEXCEPT = delete;
-    NativeHttpServer& operator=(const NativeHttpServer&) FL_NOEXCEPT = delete;
+    NativeHttpServer(const NativeHttpServer&) FL_NO_EXCEPT = delete;
+    NativeHttpServer& operator=(const NativeHttpServer&) FL_NO_EXCEPT = delete;
 
     // Server lifecycle
-    bool start();             // Start listening for connections
-    void stop();              // Stop server and disconnect all clients
-    bool isListening() const;
-    u16 port() const { return mPort; }  // Actual port (useful when constructed with port 0)
+    bool start() FL_NO_EXCEPT;             // Start listening for connections
+    void stop() FL_NO_EXCEPT;              // Stop server and disconnect all clients
+    bool isListening() const FL_NO_EXCEPT;
+    u16 port() const FL_NO_EXCEPT { return mPort; }  // Actual port (useful when constructed with port 0)
 
     // Client management
-    void acceptClients();     // Accept new client connections (non-blocking)
-    size_t getClientCount() const;
-    bool hasClient(u32 clientId) const;
-    void disconnectClient(u32 clientId);
-    void disconnectAllClients();
+    void acceptClients() FL_NO_EXCEPT;     // Accept new client connections (non-blocking)
+    size_t getClientCount() const FL_NO_EXCEPT;
+    bool hasClient(u32 clientId) const FL_NO_EXCEPT;
+    void disconnectClient(u32 clientId) FL_NO_EXCEPT;
+    void disconnectAllClients() FL_NO_EXCEPT;
 
     // Socket I/O (per-client)
-    int send(u32 clientId, fl::span<const u8> data);
-    int recv(u32 clientId, fl::span<u8> buffer);
+    int send(u32 clientId, fl::span<const u8> data) FL_NO_EXCEPT;
+    int recv(u32 clientId, fl::span<u8> buffer) FL_NO_EXCEPT;
 
     // Broadcast to all clients
-    void broadcast(fl::span<const u8> data);
+    void broadcast(fl::span<const u8> data) FL_NO_EXCEPT;
 
     // Update loop (handles disconnections, heartbeat)
-    void update(u32 currentTimeMs);
+    void update(u32 currentTimeMs) FL_NO_EXCEPT;
 
     // Get list of active client IDs
-    fl::vector<u32> getClientIds() const;
+    fl::vector<u32> getClientIds() const FL_NO_EXCEPT;
 
     // Access the underlying acceptor
-    asio::ip::tcp::acceptor& acceptorRef() { return mAcceptor; }
-    const asio::ip::tcp::acceptor& acceptorRef() const { return mAcceptor; }
+    asio::ip::tcp::acceptor& acceptorRef() FL_NO_EXCEPT { return mAcceptor; }
+    const asio::ip::tcp::acceptor& acceptorRef() const FL_NO_EXCEPT { return mAcceptor; }
 
 private:
     u16 mPort;
@@ -100,14 +100,14 @@ private:
     fl::vector<ServerClientConnection> mClients;
 
     // Platform-specific server operations
-    bool platformStartListening();
-    void platformStopListening();
+    bool platformStartListening() FL_NO_EXCEPT;
+    void platformStopListening() FL_NO_EXCEPT;
 
     // Client helpers
-    ServerClientConnection* findClient(u32 clientId);
-    const ServerClientConnection* findClient(u32 clientId) const;
-    void removeClient(u32 clientId);
-    bool isSocketConnected(const asio::ip::tcp::socket& sock) const;
+    ServerClientConnection* findClient(u32 clientId) FL_NO_EXCEPT;
+    const ServerClientConnection* findClient(u32 clientId) const FL_NO_EXCEPT;
+    void removeClient(u32 clientId) FL_NO_EXCEPT;
+    bool isSocketConnected(const asio::ip::tcp::socket& sock) const FL_NO_EXCEPT;
 };
 
 } // namespace fl

@@ -26,7 +26,7 @@ class HashMapLru {
         T value;
         u32 last_access_time;
 
-        ValueWithTimestamp() FL_NOEXCEPT : last_access_time(0) {}
+        ValueWithTimestamp() FL_NO_EXCEPT : last_access_time(0) {}
         ValueWithTimestamp(const T &v, u32 time)
             : value(v), last_access_time(time) {}
     };
@@ -101,7 +101,7 @@ class HashMapLru {
     }
 
     // Access operator - creates entry if not exists
-    T &operator[](const Key &key) {
+    T &operator[](const Key &key) FL_NO_EXCEPT {
         // If we're at capacity and this is a new key, evict oldest
         auto curr = mCurrentTime++;
 

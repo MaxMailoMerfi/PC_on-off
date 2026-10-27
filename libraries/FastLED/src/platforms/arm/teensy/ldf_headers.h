@@ -4,11 +4,12 @@
 
 // ok no namespace fl
 
+#include "platforms/arm/teensy/audio_input_teensy_config.h"
+
 /// @file platforms/arm/teensy/ldf_headers.h
 /// Teensy PlatformIO Library Dependency Finder (LDF) hints
 ///
-/// This file contains #if 0 blocks with library includes to hint dependencies
-/// to PlatformIO's LDF scanner without actually compiling the code.
-
-// Teensy platform - no additional LDF hints needed currently
-// Add library includes here if LDF issues are discovered
+/// FastLED's Teensy I2S implementation is private platform code.  Do not add
+/// the external PJRC Audio.h umbrella here: that header causes both PlatformIO
+/// LDF and fbuild to select the full Audio, SD, and SerialFlash stacks for a
+/// sketch that merely includes FastLED.h.

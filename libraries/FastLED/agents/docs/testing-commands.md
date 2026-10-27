@@ -76,6 +76,71 @@ rm -rf .build && bash test                 # WRONG - use bash test --clean
 
 **The build system is self-healing and revalidates automatically. Manual cache deletion is highly discouraged.** See `agents/docs/build-system.md` for details.
 
+## Precompiled Header Invariant
+
+Debugging a PCH failure? Use the `/pch-debug` skill
+(`.claude/skills/pch-debug/`). Its `pch_probe.py` shows which header was
+ingested twice and why, before anything is cleaned.
+
+**Rule: shared source headers keep their timestamps.** zccache supplies
+private, content-verified header snapshots with the timestamps recorded by
+the PCH. Every PCH producer and consumer must run through zccache. Rebuild
+on real content or compiler flag changes; identical content can reuse the PCH
+without changing the source tree.
+
+**Never disable PCH timestamps: `-fno-pch-timestamp` is banned, permanently.**
+It makes clang stop checking input mtimes, so a stale PCH stops failing. That
+is unsafe and it masks the real problem, the staleness guard that missed a
+change. FastLED keeps strict PCH settings (`-Werror=invalid-pch`,
+`-verify-pch`, timestamps on). Fix the guard; never relax the validation.
+
+Why: FastLED builds and uses PCHs with `-fpch-validate-input-files-content`.
+With that flag, clang (seen on 21.1.x) accepts a PCH whose input header is
+byte-identical but has a newer mtime. It then fails to match that header to
+the copy inside the PCH, so `#pragma once` lets it be parsed a second time.
+Every TU that recompiles fails with `redefinition of ...` or `template
+parameter redefines default argument`. Touching a header (`git checkout`,
+editing a line and then reverting it, or a formatter) is enough to trigger it.
+
+Minimal repro, no FastLED needed:
+
+```bash
+printf '#pragma once\ntemplate<class T=int> T f(T x){return x;}\n' > a.h
+echo '#include "a.h"' > pch.h
+printf '#include "a.h"\nint main(){return f(0);}\n' > t.cpp
+F="-Werror=invalid-pch -fpch-validate-input-files-content"
+clang++ -x c++-header pch.h -o pch.h.pch $F
+clang++ -include-pch pch.h.pch $F -c t.cpp   # OK
+touch a.h
+clang++ -include-pch pch.h.pch $F -c t.cpp   # error: redefinition of 'f'
+```
+
+The earlier upstream report was retracted. Do not file upstream bugs without
+the maintainer's approval; diagnose the actual build plumbing first.
+
+Where it is enforced:
+- `ci/compile_pch.py`: content and compiler flag hashes control PCH reuse.
+  `invalidate_stale_pch()` runs before every native compile and rejects real
+  input changes. Native and WASM producers and consumers run through zccache,
+  which supplies private input snapshots rather than restoring source mtimes.
+  A compiler version change wipes the build in `ci/meson/build_config.py`.
+- WASM: `ci/wasm_compile_pch.py` compares dependency content hashes;
+  `compute_flags_hash` tracks flag order and project root.
+  `ci/wasm_compile_native.py` recompiles an object older than its PCH.
+- Fail-safe: Clang redefinitions in a recorded PCH header and zccache
+  rebuild refusals naming a PCH in this build trigger `purge_pch_artifacts`.
+  Both native runners retry once within the original deadline and print
+  `STALE PCH DETECTED`. This also migrates legacy chained PCHs that lack
+  zccache import provenance; repeated refusals remain visible failures.
+- Regression tests: `ci/tests/test_pch_e2e.py`, which uses the real
+  toolchain, also covers WASM, and is in the routine CI Python smoke list.
+
+Source timestamps are never replayed, so ordinary Ninja dependencies remain
+valid across build directories. The native input guard still invalidates objects
+after real content changes hidden by preserved timestamps; it never changes source mtimes.
+Early test-result, fingerprint and Ninja skip caches still verify source
+content, including `src/fl/build/`, to detect edits that preserve timestamps.
+
 ## Performance: Never Disable Fingerprint Caching
 
 **DO NOT use `--no-fingerprint`. This flag disables critical performance optimizations and makes builds 10-100x slower.**
@@ -94,49 +159,23 @@ bash test --clean                            # Clean rebuild, preserves fingerpr
 
 **LAST RESORT ONLY**: Only use `--no-fingerprint` if you have concrete evidence that fingerprint caching itself is broken (not just a stale build). This should be extremely rare. See `agents/docs/build-system.md` for details.
 
-## Docker Testing (Linux Environment)
-Run tests inside a Docker container for consistent Linux environment with ASAN/LSAN sanitizers:
+## Docker Testing (retired)
 
-```bash
-# Run all C++ tests in Docker (implies --debug with sanitizers)
-bash test --docker
-
-# Run specific unit test in Docker
-bash test --docker tests/fl/async
-
-# Run with quick mode (no sanitizers, faster)
-bash test --docker --quick
-
-# Run with release mode (optimized)
-bash test --docker --build-mode release
-
-# Run only unit tests
-bash test --docker --unit
-
-# Run only examples
-bash test --docker --examples
-```
-
-**Notes:**
-- `--docker` implies `--debug` mode (ASAN/LSAN sanitizers enabled) unless `--quick` or `--build-mode` is specified
-- Warning shown: `--docker implies --debug mode (sanitizers enabled). Use --quick or --build-mode release for faster builds.`
-- First run downloads Docker image and Python packages (cached for subsequent runs)
-- Uses named volumes for `.venv` and `.build` to persist between runs
-
-**AI AGENTS: Avoid `bash test --docker` unless necessary** - Docker testing is slow (3-5 minutes per test). Use `uv run test.py` for quick local testing. Only use Docker when:
-- You need Linux-specific sanitizers (ASAN/LSAN) that aren't working locally
-- Reproducing CI failures that only occur in the Linux environment
-- Testing cross-platform compatibility issues
+`bash test --docker` was retired along with the host `docker/unit-tests` image
+in the same sweep as the platform-Docker retirement. C++ tests run natively via
+Meson — sanitizers (ASAN/LSAN/UBSAN) are available on any host that ships them
+(`bash test --debug` opts in). To reproduce a Linux-specific CI failure on
+Windows, use WSL2 rather than Docker.
 
 ## fbuild (Default for Board Builds)
-The project uses `fbuild` as the build system for all board compiles. New board targets must take the fbuild path by default; do not add board allowlists or PlatformIO fallbacks for board compatibility issues. Fix those in fbuild instead.
+The project uses `fbuild` as the build system for all board compiles. New board targets must take the fbuild path by default; do not add board allowlists or legacy-backend fallbacks for board compatibility issues. Fix those in fbuild instead.
 
 File board build compatibility problems at https://github.com/FastLED/fbuild/issues.
 
 fbuild provides:
 - **Daemon-based compilation** - Background process handles builds, survives agent interrupts
 - **Cached toolchains/frameworks** - Downloads and caches ESP32 toolchain, Arduino framework
-- **Direct esptool integration** - Fast uploads without PlatformIO overhead
+- **Direct esptool integration** - Fast uploads with no extra tooling layer
 
 **Default behavior:**
 - **All boards**: fbuild is used automatically (no flag needed)
@@ -167,6 +206,9 @@ FastLED supports fast host-based compilation of `.ino` examples using Meson buil
 
 **Debug Mode (Full Symbols + Sanitizers):**
 - `uv run test.py --examples --debug` - Compile all examples with debug symbols and sanitizers
+- `bash test --unit --debug-thin` - Linux-only PR preset: ASan+UBSan on FastLED core, lean symbols, unsanitized test DLLs and PCH, ASan-capable runner
+- `bash test --examples --debug-thin` - Compile examples with the same core-only sanitizer preset
+- `bash test --unit --build-mode debug-thin` - Equivalent spelling of `--debug-thin`
 - `uv run test.py --examples Blink --debug` - Compile specific example in debug mode
 - `uv run test.py --examples Blink --debug --full` - Debug mode with execution
 - `uv run python ci/util/meson_example_runner.py Blink --debug` - Direct invocation (debug)
@@ -177,17 +219,21 @@ FastLED supports fast host-based compilation of `.ino` examples using Meson buil
 - `uv run python ci/util/meson_example_runner.py Blink --build-mode release` - Direct invocation (release)
 
 **Build Modes:**
-- **quick** (default): Light optimization with minimal debug info (`-O1 -g1`)
+- **quick** (default): Fast compilation without debug info (`-O0 -g0`)
   - Build directory: `.build/meson-quick/examples/`
   - Binary size: Baseline (e.g., Blink: 2.8M)
   - Use case: Fast iteration and testing
 
-- **debug**: Full symbols and sanitizers (`-O0 -g3 -fsanitize=address,undefined`)
+- **debug**: Full symbols and sanitizers (`-Og -g3 -fsanitize=address,undefined`)
   - Build directory: `.build/meson-debug/examples/`
   - Binary size: 3.3x larger (e.g., Blink: 9.1M)
   - Sanitizers: AddressSanitizer (ASan) + UndefinedBehaviorSanitizer (UBSan)
   - Use case: Debugging crashes, memory issues, undefined behavior
   - Benefits: Detects buffer overflows, use-after-free, memory leaks, integer overflow, null dereference
+
+- **debug-thin** (Linux only): FastLED core receives ASan+UBSan and line-level symbols; the runner loads the sanitizer runtime, while test/example DLLs and PCH are unsanitized.
+  - Build directory: `.build/meson-debug-thin/examples/`
+  - Header/template code instantiated in consumer DLLs is not checked by ASan in this mode. Use `--debug` for full coverage; CI also runs it on a scheduled/manual path.
 
 - **release**: Optimized production build (`-O2 -DNDEBUG`)
   - Build directory: `.build/meson-release/examples/`
@@ -195,12 +241,12 @@ FastLED supports fast host-based compilation of `.ino` examples using Meson buil
   - Use case: Performance testing
 
 **Mode-Specific Directories:**
-- All three modes use separate build directories to enable caching and prevent flag conflicts
+- All build modes use separate build directories to enable caching and prevent flag conflicts
 - Switching modes does not invalidate other mode's cache (no cleanup overhead)
-- All modes can coexist simultaneously: `.build/meson-{quick,debug,release}/examples/`
+- All modes can coexist simultaneously: `.build/meson-{quick,debug,debug-thin,release}/examples/`
 
 **Performance Notes:**
-- Host compilation is 60x+ faster than PlatformIO (2.2s vs 137s for single example)
+- Host compilation is 60x+ faster than a board build (2.2s vs 137s for single example)
 - All 80 examples compile in ~0.24s (394 examples/second) with PCH caching in quick/release modes
 - Debug mode is slower due to sanitizer instrumentation but maintains reasonable performance
 - PCH (precompiled headers) dramatically speeds up compilation by caching 986 dependencies
@@ -226,43 +272,36 @@ FastLED supports fast host-based compilation of `.ino` examples using Meson buil
 **Requirements:**
 - Install live-server: `npm install -g live-server`
 
-## AVR8JS Emulator (Local, No Docker)
+## AVR8JS Emulator
 
-Run AVR firmware in the avr8js emulator locally using Node.js — no Docker needed.
+The maintained AVR8JS runner compiles with fbuild, locates the generated
+firmware, and runs the AVR emulator in its dedicated Docker image:
 
-**One-time setup:**
 ```bash
-cd ci/docker_utils/avr8js && npm install && cd -
+bash test --run uno Blink
 ```
 
-**Workflow: Compile → Run**
-```bash
-# 1. Compile sketch for UNO (uses PlatformIO, may use Docker for compilation)
-bash compile uno --examples Blink --local
-
-# 2. Run hex in avr8js emulator (pure Node.js, no Docker)
-npx --prefix ci/docker_utils/avr8js tsx ci/docker_utils/avr8js/main.ts \
-  .build/pio/uno/.pio/build/uno/firmware.hex --timeout 5 --verbose
-```
-
-**Options:**
-- `--timeout <seconds>` — Simulated time limit (default: 30)
-- `--verbose` — Show execution stats (wall time, cycles, performance %)
-
-**Performance:** avr8js runs at ~140-180% of real 16MHz clock speed.
-
-**Output:** Serial (UART) output prints to stdout. The emulator checks for "Test loop" in output by default (exit code 1 if missing — safe to ignore for non-test sketches).
-
-**Supported boards:** uno (ATmega328P), nano_every (ATmega4809). ATtiny85/88 lack hardware UART so serial output won't work.
-
-**Hex file location:** `.build/pio/<board>/.pio/build/<board>/firmware.hex`
-
-**Files:**
-- `ci/docker_utils/avr8js/main.ts` — Entry point
-- `ci/docker_utils/avr8js/execute.ts` — AVR CPU emulator wrapper
-- `ci/docker_utils/avr8js/package.json` — Node dependencies (avr8js, tsx)
+This Docker path is AVR8JS-specific. ESP32 QEMU uses fbuild's native runner
+described below.
 
 ## QEMU Commands
-- `uv run ci/install-qemu.py` - Install QEMU for ESP32 emulation (standalone)
-- `uv run test.py --qemu esp32s3` - Run QEMU tests (installs QEMU automatically)
-- `FASTLED_QEMU_SKIP_INSTALL=true uv run test.py --qemu esp32s3` - Skip QEMU installation step
+
+QEMU runs through fbuild directly. The exact invocation matches what CI runs in `.github/workflows/qemu_template.yml`:
+
+```bash
+# 1. Stage source/config only; this does not compile firmware.
+uv run ci/stage_fbuild_project.py \
+    --board esp32s3 \
+    --example Blink \
+    --define FASTLED_ESP32_IS_QEMU \
+    --build-dir .build/fbuild/esp32s3
+
+# 2. Emulate with fbuild (auto-downloads the Espressif QEMU binary).
+uv run fbuild test-emu \
+    --emulator qemu \
+    --environment esp32s3 \
+    --timeout 120 \
+    --halt-on-success "Blink setup complete - starting blink loop" \
+    --halt-on-error "Guru Meditation|abort\\(\\)|Backtrace:|TEST_SUITE_COMPLETE: FAIL|QEMU_LCD_CLOCKLESS_REGISTRATION: FAIL" \
+    .build/fbuild/esp32s3
+```

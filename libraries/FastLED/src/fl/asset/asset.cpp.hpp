@@ -11,7 +11,7 @@
 /// TODO(#2284): ESP32 LittleFS / SD-card resolution is future work.
 
 #include "fl/asset/asset.h"
-#include "fl/stl/fstream.h"
+#include "fl/fs/fstream.h"
 #include "fl/stl/noexcept.h"
 #include "fl/stl/string.h"
 #include "fl/stl/string_view.h"
@@ -39,7 +39,7 @@ struct AssetEntry {
     fl::url url;      ///< Resolved URL (or file:// for host).
 };
 
-inline fl::vector<AssetEntry>& registry() FL_NOEXCEPT {
+inline fl::vector<AssetEntry>& registry() FL_NO_EXCEPT {
     // Construct-on-first-use avoids static-init ordering issues with the
     // generated asset table (which also uses static init).
     static fl::vector<AssetEntry> s_registry;
@@ -47,7 +47,7 @@ inline fl::vector<AssetEntry>& registry() FL_NOEXCEPT {
 }
 
 /// Look up an asset path in the registry. Returns invalid url() on miss.
-inline fl::url lookup_registry(fl::string_view path) FL_NOEXCEPT {
+inline fl::url lookup_registry(fl::string_view path) FL_NO_EXCEPT {
     auto& r = registry();
     for (fl::size i = 0; i < r.size(); ++i) {
         // Compare as string_view on both sides to avoid any ambiguity in the
@@ -71,7 +71,7 @@ inline fl::url lookup_registry(fl::string_view path) FL_NOEXCEPT {
 ///   - Otherwise if `<cwd>/<path>.lnk` exists, return the URL from the
 ///     `.lnk` file (same fallback as WASM).
 ///   - Otherwise return invalid url().
-inline fl::url resolve_host(fl::string_view path) FL_NOEXCEPT {
+inline fl::url resolve_host(fl::string_view path) FL_NO_EXCEPT {
     // Try raw file on disk.
     fl::string pathStr(path.data(), path.size());
     {
@@ -103,7 +103,7 @@ inline fl::url resolve_host(fl::string_view path) FL_NOEXCEPT {
     fl::string content;
     content.resize(sz);
     if (sz > 0) {
-        lnk.read(&content[0], sz);
+        lnk.read(content.c_str_mutable(), sz);
     }
     lnk.close();
     return parse_lnk(fl::string_view(content.data(), content.size()));
@@ -115,12 +115,12 @@ inline fl::url resolve_host(fl::string_view path) FL_NOEXCEPT {
 /// Public helper: plug an asset mapping at runtime. Used by:
 ///   - Generated C++ from `ci/compiler/asset_scanner.py`.
 ///   - Unit tests that want to simulate a manifest without fbuild.
-void register_asset(fl::string_view path, const fl::url& u) FL_NOEXCEPT {
+void register_asset(fl::string_view path, const fl::url& u) FL_NO_EXCEPT {
     asset_detail::registry().push_back(
         {fl::string(path.data(), path.size()), u});
 }
 
-fl::url resolve_asset(const asset_ref& a) FL_NOEXCEPT {
+fl::url resolve_asset(const asset_ref& a) FL_NO_EXCEPT {
     if (!a) {
         return fl::url();
     }

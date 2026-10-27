@@ -8,7 +8,7 @@
 /// Protocol:
 /// - Start frame: 4 bytes of 0x00
 /// - LED data: [0xE0|brightness][B][G][R] (4 bytes per LED)
-/// - End frame: ⌈num_leds/32⌉ DWords of 0xFF
+/// - End frame: (num_leds / 32) + 1 DWords of 0xFF
 ///
 /// Brightness modes:
 /// - Global: All LEDs use same 5-bit brightness (from first pixel)
@@ -43,7 +43,7 @@ namespace fl {
 /// @note APA102 uses BGR wire order: pixel[0]=Blue, pixel[1]=Green, pixel[2]=Red
 template <typename InputIterator, typename OutputIterator>
 void encodeAPA102(InputIterator first, InputIterator last, OutputIterator out,
-                  u8 global_brightness = 31) FL_NOEXCEPT {
+                  u8 global_brightness = 31) FL_NO_EXCEPT {
     // Clamp brightness to 5-bit range
     global_brightness = global_brightness & 0x1F;
 
@@ -65,7 +65,7 @@ void encodeAPA102(InputIterator first, InputIterator last, OutputIterator out,
         ++num_leds;
     }
 
-    // End frame: ⌈num_leds/32⌉ DWords of 0xFF
+    // End frame: (num_leds / 32) + 1 DWords of 0xFF
     size_t end_dwords = (num_leds / 32) + 1;
     for (size_t i = 0; i < end_dwords * 4; i++) {
         *out++ = 0xFF;
@@ -84,7 +84,7 @@ void encodeAPA102(InputIterator first, InputIterator last, OutputIterator out,
 /// @note APA102 uses BGR wire order: pixel[0]=Blue, pixel[1]=Green, pixel[2]=Red
 template <typename InputIterator, typename BrightnessIterator, typename OutputIterator>
 void encodeAPA102_HD(InputIterator first, InputIterator last,
-                     BrightnessIterator brightness_first, OutputIterator out) FL_NOEXCEPT {
+                     BrightnessIterator brightness_first, OutputIterator out) FL_NO_EXCEPT {
     // Start frame: 4 bytes of 0x00
     *out++ = 0x00;
     *out++ = 0x00;
@@ -108,7 +108,7 @@ void encodeAPA102_HD(InputIterator first, InputIterator last,
         ++num_leds;
     }
 
-    // End frame: ⌈num_leds/32⌉ DWords of 0xFF
+    // End frame: (num_leds / 32) + 1 DWords of 0xFF
     size_t end_dwords = (num_leds / 32) + 1;
     for (size_t i = 0; i < end_dwords * 4; i++) {
         *out++ = 0xFF;
@@ -129,10 +129,12 @@ template <typename InputIterator, typename OutputIterator>
 FL_NO_INLINE_IF_AVR
 FL_OPTIMIZE_O2
 void encodeAPA102_AutoBrightness(InputIterator first, InputIterator last,
-                                 OutputIterator out) FL_NOEXCEPT {
+                                 OutputIterator out) FL_NO_EXCEPT {
     if (first == last) {
-        // Empty range - just write start frame (no end frame needed for 0 LEDs)
+        // Preserve a complete frame even at zero LEDs. This matters when a
+        // previously longer cascade is reconfigured through the public API.
         *out++ = 0x00; *out++ = 0x00; *out++ = 0x00; *out++ = 0x00;
+        *out++ = 0xFF; *out++ = 0xFF; *out++ = 0xFF; *out++ = 0xFF;
         return;
     }
 

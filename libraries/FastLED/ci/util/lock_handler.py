@@ -10,10 +10,11 @@ terminates them to enable cleanup of corrupted package directories.
 """
 
 import platform
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
+
+from running_process import PIPE, RunningProcess
 
 
 try:
@@ -40,7 +41,7 @@ def find_processes_locking_path(
     Returns:
         Set of process IDs holding locks on the path
     """
-    if not is_psutil_available():
+    if psutil is None:
         print("Warning: psutil not available, cannot detect lock holders")
         return set()
 
@@ -159,7 +160,7 @@ def kill_processes(pids: set[int], force: bool = True) -> bool:
     if not pids:
         return True
 
-    if not is_psutil_available():
+    if psutil is None:
         print("Warning: psutil not available, cannot kill processes")
         return False
 
@@ -255,17 +256,21 @@ def force_remove_path(path: Path, max_retries: int = 3) -> bool:
                         print("  Trying Windows-specific removal...")
                         try:
                             if path.is_dir():
-                                result = subprocess.run(
+                                result = RunningProcess.run(
                                     ["cmd", "/c", "rmdir", "/S", "/Q", str(path)],
-                                    capture_output=True,
-                                    text=True,
+                                    stdout=PIPE,
+                                    stderr=PIPE,
+                                    encoding="utf-8",
+                                    errors="replace",
                                     timeout=30,
                                 )
                             else:
-                                result = subprocess.run(
+                                result = RunningProcess.run(
                                     ["cmd", "/c", "del", "/F", "/Q", str(path)],
-                                    capture_output=True,
-                                    text=True,
+                                    stdout=PIPE,
+                                    stderr=PIPE,
+                                    encoding="utf-8",
+                                    errors="replace",
                                     timeout=30,
                                 )
 
@@ -298,7 +303,7 @@ def get_process_info(pids: set[int]) -> list[dict[str, Any]]:
     Returns:
         List of dictionaries with process information
     """
-    if not is_psutil_available():
+    if psutil is None:
         return []
 
     process_info: list[dict[str, Any]] = []

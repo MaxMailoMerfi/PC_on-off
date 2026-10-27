@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include "fl/stl/vector.h"
+
 // WiFi AP configuration constants for OTA autoresearch
 #define AUTORESEARCH_OTA_SSID "FastLED-OTA-Test"
 #define AUTORESEARCH_OTA_PASSWORD "otavalid8"
@@ -36,6 +38,33 @@ fl::json startOta();
 /// @brief Stop OTA server and WiFi AP, release all resources.
 /// @return JSON with {success: true}
 fl::json stopOta();
+
+/// @brief Stage one RP2350W firmware artifact on the ESP32-C6 fixture.
+/// These functions are used only by the device-to-device peer OTA test.
+fl::json beginOtaArtifact(size_t expected_size, const char* sha256);
+fl::json writeOtaArtifact(fl::vector<fl::u8> bytes);
+fl::json finishOtaArtifact();
+fl::json startOtaArtifactServer();
+fl::json otaArtifactStatus();
+
+/// @brief Queue an RP2350W HTTP update so the RPC response can be sent first.
+fl::json queueOtaArtifactUpdate(const char* host, uint16_t port);
+
+/// Outcome of the last `pollOtaArtifactUpdate` fetch, readable after the
+/// host reconnects. The fetch runs with the RPC link closed, so without this
+/// a failure leaves no reason anywhere. See FastLED#3956.
+fl::json rpOtaUpdateStatus();
+
+/// @brief Execute a queued RP2350W update from the sketch loop.
+///
+/// The HTTP update blocks for the whole firmware download, which routinely
+/// outruns the sketch's watchdog window. The window is widened for the
+/// duration and restored to @p watchdog_restore_ms afterwards, so a genuinely
+/// wedged loop still reboots (FastLED#3956).
+///
+/// @param watchdog_restore_ms timeout to re-arm the watchdog with once the
+///        update returns — pass the sketch's normal loop timeout.
+void pollOtaArtifactUpdate(uint32_t watchdog_restore_ms);
 
 /// @brief Get current OTA autoresearch state.
 /// @return Reference to the global OTA state

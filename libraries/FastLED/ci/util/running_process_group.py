@@ -11,7 +11,6 @@ to fully-buffered mode when stdout is not a TTY, which can cause multi-second de
 """
 
 import os
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -20,6 +19,7 @@ from enum import Enum
 from typing import Optional, cast
 
 from running_process import RunningProcess
+from running_process.command_render import list2cmdline
 
 from ci.util.test_exceptions import (
     TestExecutionFailedException,
@@ -33,7 +33,6 @@ from ci.util.test_runner import (
     ProcessStuckMonitor,
     ProcessTiming,
     StuckProcessSignal,
-    _extract_test_name,
     _get_friendly_test_name,
     _handle_stuck_processes,
     extract_error_snippet,
@@ -310,12 +309,12 @@ class RunningProcessGroup:
                     failures: list[TestFailureInfo] = []
                     for p in active_processes:
                         failed_processes.append(
-                            subprocess.list2cmdline(p.command)
+                            p.get_command_str()
                         )  # Track all active processes as failed
                         p.kill()
                         failures.append(
                             TestFailureInfo(
-                                test_name=_extract_test_name(p.command),
+                                test_name=_get_friendly_test_name(p.command),
                                 command=str(p.command),
                                 return_code=1,
                                 output="Process killed due to global timeout",
@@ -395,7 +394,7 @@ class RunningProcessGroup:
 
                 failures.append(
                     TestFailureInfo(
-                        test_name=_extract_test_name(proc.command),
+                        test_name=_get_friendly_test_name(proc.command),
                         command=str(proc.command),
                         return_code=exit_code,
                         output=error_snippet,
@@ -418,7 +417,7 @@ class RunningProcessGroup:
             for cmd in failed_processes:
                 failures.append(
                     TestFailureInfo(
-                        test_name=_extract_test_name(cmd),
+                        test_name=_get_friendly_test_name(cmd),
                         command=str(cmd),
                         return_code=1,
                         output="Process was killed due to timeout/stuck detection",
@@ -531,7 +530,7 @@ class RunningProcessGroup:
             error_snippet = extract_error_snippet(_get_output_lines(proc))
             failures.append(
                 TestFailureInfo(
-                    test_name=_extract_test_name(proc.command),
+                    test_name=_get_friendly_test_name(proc.command),
                     command=str(proc.command),
                     return_code=exit_code,
                     output=error_snippet,
@@ -541,12 +540,12 @@ class RunningProcessGroup:
 
         for cmd in failed_processes:
             if isinstance(cmd, list):
-                cmd_str = subprocess.list2cmdline(cmd)
+                cmd_str = list2cmdline(cmd)
             else:
                 cmd_str = str(cmd)
             failures.append(
                 TestFailureInfo(
-                    test_name=_extract_test_name(cmd_str),
+                    test_name=_get_friendly_test_name(cmd_str),
                     command=cmd_str,
                     return_code=1,
                     output="Process was killed due to timeout/stuck detection",
@@ -572,10 +571,15 @@ class RunningProcessGroup:
             proc = active_processes[i]
 
             if self.config.verbose:
-                with proc.line_iter(timeout=60) as line_iter:
-                    for line in line_iter:
-                        print(line)
-                        any_activity = True
+                try:
+                    with proc.line_iter(timeout=60) as line_iter:
+                        for line in line_iter:
+                            print(line)
+                            any_activity = True
+                except TimeoutError:
+                    # A quiet process is still active. Completion, stuck-output,
+                    # and explicit process deadlines are checked separately.
+                    pass
 
             # Check if process has finished
             if proc.finished:
@@ -661,7 +665,7 @@ class RunningProcessGroup:
                             _get_output_lines(process)
                         )
                         failure = TestFailureInfo(
-                            test_name=_extract_test_name(process.command),
+                            test_name=_get_friendly_test_name(process.command),
                             command=str(process.command),
                             return_code=exit_code,
                             output=error_snippet,
@@ -741,7 +745,7 @@ class RunningProcessGroup:
                             _get_output_lines(process)
                         )
                         failure = TestFailureInfo(
-                            test_name=_extract_test_name(process.command),
+                            test_name=_get_friendly_test_name(process.command),
                             command=str(process.command),
                             return_code=exit_code,
                             output=error_snippet,

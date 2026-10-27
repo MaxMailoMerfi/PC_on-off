@@ -13,7 +13,7 @@ This module provides an async/await RPC client that automatically manages reques
 
 Usage (IDs are managed internally, async/await required):
     async with RpcClient("/dev/ttyUSB0") as client:
-        response = await client.send("ping")
+        response = await client.send("ping", {})
         print(response.data)  # {"timestamp": ..., "uptimeMs": ...}
         print(response.success)  # True/False
         # Note: response._id exists but is internal - don't use it
@@ -22,7 +22,7 @@ Usage (IDs are managed internally, async/await required):
     from ci.util.serial_interface import create_serial_interface
     iface = create_serial_interface("/dev/ttyUSB0", use_pyserial=True)
     async with RpcClient("/dev/ttyUSB0", serial_interface=iface) as client:
-        response = await client.send("ping")
+        response = await client.send("ping", {})
 
     # Or with explicit connection management:
     client = RpcClient("/dev/ttyUSB0")
@@ -57,13 +57,13 @@ class RpcResponse:
     """
 
     success: bool
-    data: dict[str, Any]
+    data: Any
     raw_line: str
     _id: int = 0  # Internal: Request ID from JSON-RPC 2.0 (always present, hidden from public API)
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get value from response data."""
-        return self.data.get(key, default)
+        return self.data.get(key, default) if isinstance(self.data, dict) else default
 
     def __getitem__(self, key: str) -> Any:
         """Allow dict-like access to response data."""
@@ -71,7 +71,7 @@ class RpcResponse:
 
     def __contains__(self, key: str) -> bool:
         """Check if key exists in response data."""
-        return key in self.data
+        return isinstance(self.data, dict) and key in self.data
 
 
 class RpcTimeoutError(TimeoutError):
@@ -80,10 +80,59 @@ class RpcTimeoutError(TimeoutError):
     pass
 
 
-class RpcError(Exception):
-    """RPC operation failed."""
+class RpcError(RuntimeError):
+    """RPC operation failed.
 
-    pass
+    Deliberately a `RuntimeError` rather than a bare `Exception`, so that
+    `send` can normalize transport failures into it without breaking the
+    callers that report those failures by catching `RuntimeError` (#4191).
+
+    `PyserialMonitor.write` raises `RuntimeError("Serial write error: ...")`,
+    and `send` used to let it straight through -- past its own documented
+    contract of `RpcTimeoutError` or `RpcError`, so every caller handling
+    `(RpcError, RpcTimeoutError)` missed a failed write. Normalizing it is
+    only safe because this widening keeps the existing `except RuntimeError`
+    handlers working; the four that RPC errors can actually reach
+    (`ci/autoresearch/gpio.py`, `ci/autoresearch/decode.py`) all report a
+    transport failure and return, which is exactly what an `RpcError`
+    arriving there should do -- today it escapes them as a traceback.
+
+    `RpcTimeoutError` sets the precedent in this file by subclassing the
+    builtin `TimeoutError`.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        data: Any = None,
+    ) -> None:
+        self.code = code
+        self.message = message
+        self.data = data
+        display_message = message
+        if code is not None:
+            display_message = f"RPC Error {code}: {message}"
+            if data is not None:
+                display_message += f" (data: {json.dumps(data)})"
+        super().__init__(display_message)
+
+
+class RpcTransportError(RpcError):
+    """The request never reached the device.
+
+    A subclass rather than a flag so the widening in `RpcError` above still
+    holds: every existing `except RpcError` and `except RuntimeError` handler
+    keeps catching this unchanged.
+
+    The distinction it restores matters to anyone asking "did the device
+    answer?". Normalizing a failed write into `RpcError` (#4191) made a
+    transport failure the same type as an error *reply*, and an error reply is
+    proof the link round-trips while a failed write is proof it does not.
+    `RpcBench`'s liveness probe reads exactly that difference, and without this
+    type it accepted a client whose every write failed (#4207).
+    """
 
 
 class RpcCrashError(RpcError):
@@ -161,12 +210,29 @@ class RpcClient:
         self._next_id: int = (
             1  # Request ID counter for JSON-RPC 2.0 correlation (uint32 range)
         )
+        # Wrapper-side RPC send counter (fbuild#755 follow-up). Increments
+        # on every send() / send_and_match() attempt. Surfaces via the
+        # `sent_count` property; printed in verbose mode when the wrapper
+        # session exits. Lets us correlate session-end "wrapper saw N
+        # responses" against the device's reported "Remote handled M
+        # requests" to detect daemon/wrapper drops.
+        self._sent_count: int = 0
         self._crash_decoder: CrashTraceDecoder | None = crash_decoder
 
     @property
     def is_connected(self) -> bool:
         """Check if serial connection is open."""
         return self._serial is not None and self._connected
+
+    @property
+    def sent_count(self) -> int:
+        """Total RPC send attempts this session (fbuild#755 follow-up).
+
+        Increments on every `send()` / `send_and_match()` attempt,
+        including retries. Use to correlate against device-reported
+        receive counts when diagnosing daemon-side drops.
+        """
+        return self._sent_count
 
     async def connect(
         self,
@@ -283,9 +349,21 @@ class RpcClient:
     async def close(self) -> None:
         """Close serial connection (async)."""
         self._connected = False
+        if self.verbose and self._sent_count > 0:
+            # fbuild#755 follow-up: surface the session's RPC traffic
+            # volume so drops can be correlated against device-reported
+            # receive counts.
+            print(f"📊 [RPC] Session sent {self._sent_count} request(s)")
         if self._serial is not None:
             await self._serial.close()
-            self._serial = None
+            # Keep a *borrowed* interface. `connect()` fabricates a default
+            # fbuild backend whenever `_serial` is None, so dropping an
+            # injected one here means a caller that closes and reconnects --
+            # every retry loop -- silently stops using the transport it was
+            # given. `_owns_serial` already records which case this is; it
+            # just was not consulted (#4233).
+            if self._owns_serial:
+                self._serial = None
             await asyncio.sleep(0)  # Yield control
 
     async def drain_boot_output(
@@ -334,15 +412,19 @@ class RpcClient:
     async def send(
         self,
         function: str,
-        args: list[Any] | None = None,
+        args: str | list[Any] | dict[str, Any] | None,
         timeout: float | None = None,
         retries: int = 1,
+        return_on_ack: bool = False,
     ) -> RpcResponse:
         """Send JSON-RPC command and wait for response with mandatory ID correlation (async).
 
         Args:
             function: RPC function name
-            args: Function arguments as list (default: [])
+            args: Function arguments passed as the single `fl::json` RPC
+                parameter — a scalar string, list for positional handlers, or
+                dict for object-param handlers. Wrapped verbatim
+                into `params` as `[args]`.
             timeout: Override default timeout for this call
             retries: Number of retry attempts (default: 1 = no retries)
 
@@ -351,7 +433,11 @@ class RpcClient:
 
         Raises:
             RpcTimeoutError: If no response within timeout
-            RpcError: If not connected
+            RpcError: If not connected, or if the serial transport failed.
+                Transport failures arrive as `RuntimeError` from
+                `PyserialMonitor.write` and are normalized here, so this
+                contract holds rather than leaking the transport's own type
+                (#4191).
         """
         if not self.is_connected:
             raise RpcError("Not connected")
@@ -385,16 +471,32 @@ class RpcClient:
             try:
                 # Write command via serial interface
                 await self._serial.write(cmd_str + "\n")
+                self._sent_count += 1  # fbuild#755 follow-up: track sent RPCs
 
                 # Await response with ID matching (mandatory)
                 response = await self._wait_for_response(
-                    attempt_timeout, expected_id=request_id
+                    attempt_timeout,
+                    expected_id=request_id,
+                    return_on_ack=return_on_ack,
                 )
                 return response
 
             except RpcTimeoutError as e:
                 last_error = e
                 continue
+            except RpcError:
+                # Already this contract's currency; retrying a transport that
+                # reported a definite failure is not the same as retrying a
+                # timeout, so it propagates.
+                raise
+            except RuntimeError as e:
+                # `PyserialMonitor.write` reports a failed write this way.
+                # Letting it through would break `send`'s contract and every
+                # caller that handles `(RpcError, RpcTimeoutError)` (#4191).
+                # Typed so callers that need to tell "no reply" from "an error
+                # reply" still can -- normalizing lost that, and the liveness
+                # probe in `RpcBench` depends on it (#4207).
+                raise RpcTransportError(f"{function}: {e}") from e
 
         raise last_error or RpcTimeoutError(
             f"No response after {retries} attempts (total timeout: {effective_timeout}s)"
@@ -457,6 +559,7 @@ class RpcClient:
 
             # Write command via serial interface
             await self._serial.write(cmd_str + "\n")
+            self._sent_count += 1  # fbuild#755 follow-up: track sent RPCs
 
             start = time.time()
             try:
@@ -555,7 +658,9 @@ class RpcClient:
             f"No response with key '{match_key}' after {retries} attempts"
         )
 
-    async def _wait_for_response(self, timeout: float, expected_id: int) -> RpcResponse:
+    async def _wait_for_response(
+        self, timeout: float, expected_id: int, return_on_ack: bool = False
+    ) -> RpcResponse:
         """Wait for and parse JSON-RPC response with mandatory ID matching (async).
 
         Args:
@@ -571,9 +676,20 @@ class RpcClient:
         assert self._serial is not None
 
         start = time.time()
+        saw_ack = False
+        # The caller's `timeout` IS the wall. Do not inflate it with
+        # `max(timeout, ASYNC_POST_ACK_TIMEOUT)` -- that silently bought
+        # every RPC up to 600 s regardless of `--timeout`, and made the
+        # wrapper accumulate time across calls. The outer
+        # `ctx.remaining_seconds()` machinery + the watchdog thread
+        # together enforce the hard ceiling; the wrapper's job is just
+        # to honor whatever budget it was handed. See #3219 goal session
+        # 2026-06-22 (post-design overhaul).
+        producer_budget = timeout
+        current_deadline = start + timeout
 
         try:
-            async for line in self._serial.read_lines(timeout=timeout):
+            async for line in self._serial.read_lines(timeout=producer_budget):
                 self._check_interrupt()
 
                 if not line.startswith(self.RESPONSE_PREFIX):
@@ -589,8 +705,9 @@ class RpcClient:
                                 "Device crashed during RPC operation",
                                 decoded_lines=decoded,
                             )
-                    # Check timeout for non-REMOTE lines
-                    if time.time() - start >= timeout:
+                    # Check active deadline (caller-timeout pre-ACK,
+                    # post-ACK timeout after ACK has landed).
+                    if time.time() >= current_deadline:
                         break
                     continue
 
@@ -617,19 +734,18 @@ class RpcClient:
                         # Extract error details (code and message are standard fields)
                         if isinstance(error_obj, dict):
                             error_code = error_obj.get("code")  # type: ignore[assignment]
-                            error_message = error_obj.get(  # type: ignore[assignment]
-                                "message", "Unknown error"
+                            error_message = str(
+                                error_obj.get("message", "Unknown error")
                             )
                             error_data = error_obj.get("data")  # type: ignore[assignment]
 
-                            # Build detailed error message
-                            msg = f"RPC Error {error_code}: {error_message}"
-                            if error_data:
-                                import json as json_module
-
-                                msg += f" (data: {json_module.dumps(error_data)})"
-
-                            raise RpcError(msg)
+                            raise RpcError(
+                                error_message,
+                                code=(
+                                    error_code if isinstance(error_code, int) else None
+                                ),
+                                data=error_data,
+                            )
                         else:
                             # Malformed error object (should be dict)
                             raise RpcError(f"Malformed error object: {error_obj}")
@@ -647,28 +763,34 @@ class RpcClient:
                         and "acknowledged" in response_data
                         and response_data["acknowledged"] is True
                     ):
-                        # Async RPCs (Phase 3: runSingleTest, runParallelTest,
-                        # all testCoroutine*, the net/ble test runners) can run
-                        # for tens of seconds — the runSingleTest path through
-                        # 100 LEDs × 4 patterns takes ~80s on Teensy 4. Folding
-                        # both the ACK-wait and the result-wait into the single
-                        # caller-supplied `timeout` caused
-                        # `RpcTimeoutError('No response with ID N within 60s')`
-                        # for tests that genuinely needed 70-90s of post-ACK
-                        # time. Restart the wait with a budget large enough to
-                        # cover any reasonable test: the caller's own timeout
-                        # if they bumped it above the async floor, else
-                        # `ASYNC_POST_ACK_TIMEOUT` (10 min). See FastLED#3060.
-                        post_ack_timeout = max(timeout, self.ASYNC_POST_ACK_TIMEOUT)
-                        if self.verbose:
-                            print(
-                                f"[RPC] ACK received for request {expected_id}, "
-                                f"restarting wait for final response "
-                                f"(post-ACK timeout={post_ack_timeout}s)..."
+                        if return_on_ack:
+                            return RpcResponse(
+                                success=True,
+                                data=response_data,
+                                raw_line=line,
+                                _id=response_id,
                             )
-                        return await self._wait_for_response(
-                            post_ack_timeout, expected_id
-                        )
+                        # ACK -> keep iterating the SAME generator so the
+                        # final REMOTE response line goes to the SAME
+                        # consumer. (Pre-#3219 fix recursed into a fresh
+                        # `_wait_for_response` here, which spawned a 2nd
+                        # producer behind the 1st in the single-worker
+                        # executor and lost the in-flight response.)
+                        # The previous post-ACK timeout extension was
+                        # removed -- the caller's deadline is the wall.
+                        # If a test legitimately needs more time, the
+                        # caller (autoresearch.phases) must pass a larger
+                        # `--timeout` rather than letting the wrapper
+                        # silently add 10 minutes of grace.
+                        if not saw_ack:
+                            saw_ack = True
+                            if self.verbose:
+                                print(
+                                    f"[RPC] ACK received for request {expected_id}, "
+                                    f"continuing wait for final response within "
+                                    f"caller deadline..."
+                                )
+                        continue
 
                     # Determine success: void functions return null, treat as success
                     success: bool  # Explicit type declaration
@@ -680,12 +802,13 @@ class RpcClient:
                         # Void functions return null - treat as successful execution
                         success = True
 
-                    # Ensure response_data is always a dict for consistent API
-                    final_response_data: dict[str, Any]
-                    if response_data is None or not isinstance(response_data, dict):
-                        final_response_data = {}
-                    else:
-                        final_response_data = response_data  # type: ignore[assignment]
+                    # Preserve array/scalar results as well as object results.
+                    # JSON-RPC discovery/help return arrays; collapsing those
+                    # to {} made it impossible for acceptance modes to validate
+                    # the actual manifest.
+                    final_response_data: Any = (
+                        {} if response_data is None else response_data
+                    )
 
                     return RpcResponse(
                         success=success,
@@ -701,6 +824,8 @@ class RpcClient:
             raise
         except RpcCrashError:
             raise  # Re-raise crash errors without masking them
+        except RpcError:
+            raise  # Preserve structured JSON-RPC errors for the caller.
         except Exception as e:
             if self.verbose:
                 print(f"⚠️  [RPC] Exception during read_lines: {e}")

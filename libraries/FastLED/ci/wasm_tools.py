@@ -11,7 +11,7 @@ PATH in os.environ. Subsequent get_emcc()/get_emar()/get_wasm_ld() calls
 return direct paths to the tools, bypassing the Python wrapper entirely.
 
 For maximum speed, run_emcc() calls emcc.py in-process via importlib,
-eliminating subprocess + Python startup overhead entirely (~0.5s per call).
+eliminating child-process + Python startup overhead entirely (~0.5s per call).
 
 Benchmarks (Windows, per invocation):
   - clang-tool-chain-emcc wrapper:  ~5000ms
@@ -24,10 +24,11 @@ Benchmarks (Windows, per invocation):
 import importlib.util
 import os
 import platform
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+
+from running_process import RunningProcess
 
 
 _env_setup_done = False
@@ -276,7 +277,7 @@ def _load_emcc_module():
 
 
 def run_emcc(args: list[str], cwd: Optional[str] = None) -> int:
-    """Run emcc with the given args, trying in-process first, falling back to subprocess.
+    """Run emcc with the given args, trying in-process first, falling back to a child process.
 
     Args:
         args: Command-line arguments (WITHOUT the 'emcc' prefix — just flags and files).
@@ -285,6 +286,13 @@ def run_emcc(args: list[str], cwd: Optional[str] = None) -> int:
     Returns:
         Process return code (0 = success).
     """
+    if "-include-pch" in args:
+        from ci.meson.native_launchers import wrap_compiler_with_zccache
+
+        # In-process emcc would bypass zccache's private PCH snapshots.
+        command = wrap_compiler_with_zccache([get_emcc(), *args])
+        return RunningProcess.run(command, cwd=cwd).returncode
+
     # Verify the EMCC_WASM_LD patch is applied to the bundled emscripten
     # install. This was previously in _render_wasm_cross_file (called on every
     # warm build) — moved here in 2026-05 so the cost is paid only when emcc.py
@@ -313,7 +321,7 @@ def run_emcc(args: list[str], cwd: Optional[str] = None) -> int:
             sys.argv = old_argv
             os.chdir(old_cwd)
 
-    # Fallback: subprocess
+    # Fallback: child process
     emcc = get_emcc()
-    result = subprocess.run([emcc] + args, cwd=cwd)
+    result = RunningProcess.run([emcc] + args, cwd=cwd)
     return result.returncode

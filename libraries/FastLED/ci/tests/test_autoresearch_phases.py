@@ -9,28 +9,92 @@ Tests the refactored phase decomposition:
 """
 
 import asyncio
+import contextlib
+import io
 import os
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from serial.tools.list_ports_common import ListPortInfo
 
 from ci.autoresearch.args import Args
-from ci.autoresearch.build_driver import BuildDriver
+from ci.autoresearch.build_driver import BuildDriver, DeployResult
 from ci.autoresearch.context import QuietContext, RunContext
 from ci.autoresearch.phases import (
+    RP2XXX_ENVIRONMENTS,
+    _build_environment_for_mode,
+    _is_valid_rp_concurrency_result,
+    _is_valid_rp_pio_parallel_result,
+    _legacy_command_max_lanes,
+    _legacy_lane_rx_overlap,
+    _lpc_rx_defines,
     _parse_args_and_build_commands,
+    _prune_to_device_drivers,
+    _prune_unavailable_drivers,
     _resolve_port_and_environment,
     _run_build_deploy,
+    _run_lpc_dma_spi_tests,
+    _run_lpc_pin_toggle_rx_tests,
+    _run_lpc_pwm_dma_cl_tests,
+    _run_lpc_ws2812_loopback_tests,
+    _run_rp_spi_loopback_tests,
+    _run_rp_spi_public_api_tests,
     _run_schema_and_pin_setup,
     _run_tests_or_special_mode,
+    _run_watchdog_soak,
+    _validate_test_rpc_response,
+    coroutine_exit_code,
+    kCoroutineUnsupportedExit,
+    stop_autoresearch_watchdog,
 )
+from ci.rpc_client import RpcError, RpcTimeoutError
+from ci.util import port_utils, serial_probe
 from ci.util.port_utils import ChipDetectionResult, auto_detect_upload_port
 
 
 # Module path for patching symbols imported into phases.py
 _PATCH_MOD = "ci.autoresearch.phases"
+
+
+@pytest.mark.parametrize(
+    "counters",
+    [
+        {},
+        {"actual": None, "expected": None},
+        {"actual": True, "expected": True},
+        {"actual": 0, "expected": 0},
+        {"actual": -1, "expected": -1},
+        {"actual": 199, "expected": 200},
+    ],
+)
+def test_rp_concurrency_gate_requires_matching_integer_counters(
+    counters: dict[str, object],
+) -> None:
+    result: dict[str, object] = {
+        "success": True,
+        "supported": True,
+        "core1Ready": True,
+        "core1Done": True,
+        "recursiveMutexReady": True,
+        **counters,
+    }
+    assert _is_valid_rp_concurrency_result(result) is False
+
+
+def test_rp_concurrency_gate_accepts_matching_integer_counters() -> None:
+    assert _is_valid_rp_concurrency_result(
+        {
+            "success": True,
+            "supported": True,
+            "core1Ready": True,
+            "core1Done": True,
+            "recursiveMutexReady": True,
+            "actual": 200,
+            "expected": 200,
+        }
+    )
 
 
 # ============================================================
@@ -40,7 +104,7 @@ _PATCH_MOD = "ci.autoresearch.phases"
 
 def _make_args(**overrides) -> Args:
     """Create Args with sensible defaults for testing."""
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         environment_positional=None,
         parlio=True,
         rmt=False,
@@ -55,6 +119,11 @@ def _make_args(**overrides) -> Args:
         all=False,
         simd=False,
         coroutine=False,
+        ieee754=False,
+        math=False,
+        fft=False,
+        rpc_smoke=False,
+        perf_wave2d=None,
         environment=None,
         verbose=False,
         skip_lint=True,
@@ -68,6 +137,7 @@ def _make_args(**overrides) -> Args:
         tx_pin=None,
         rx_pin=None,
         auto_discover_pins=False,
+        contaminate_tx_mux=False,
         use_fbuild=False,
         no_fbuild=True,
         clean=False,
@@ -78,10 +148,15 @@ def _make_args(**overrides) -> Args:
         lane_counts=None,
         color_pattern=None,
         legacy=False,
+        legacy_mixed_timings=False,
+        legacy_rgbw_small_counts=False,
         chipset="ws2812",
         net_server=False,
         net_client=False,
         net=False,
+        net_peer=False,
+        peer_environment="esp32c6",
+        peer_upload_port=None,
         ota=False,
         ble=False,
         parallel=False,
@@ -92,6 +167,18 @@ def _make_args(**overrides) -> Args:
         tight_timing_max_overhead_us=2000,
         pin_toggle_rx=False,
         ws2812_loopback=False,
+        pwm_dma_cl=False,
+        dma_spi=False,
+        dma_uart=False,
+        rp_spi_loopback=False,
+        rp_spi_index=0,
+        rp_spi_public_api=False,
+        rp_spi_chipset="apa102",
+        bitbang=False,
+        rp_uart_index=0,
+        rp_pio_index=1,
+        rp_pio_both=False,
+        test_fault_emit=False,
     )
     defaults.update(overrides)
     return Args(**defaults)
@@ -113,7 +200,7 @@ def _make_mock_driver(
 
 def _make_ctx(**overrides) -> RunContext:
     """Create RunContext with sensible defaults for testing."""
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         args=_make_args(),
         drivers=["PARLIO"],
         json_rpc_commands=[
@@ -134,9 +221,15 @@ def _make_ctx(**overrides) -> RunContext:
         build_dir=Path("/fake/project"),
         simd_test_mode=False,
         coroutine_test_mode=False,
+        ieee754_test_mode=False,
+        math_test_mode=False,
+        fft_test_mode=False,
+        rpc_smoke_mode=False,
+        perf_wave2d_grid=None,
         net_server_mode=False,
         net_client_mode=False,
         net_loopback_mode=False,
+        net_peer_mode=False,
         ota_mode=False,
         ble_mode=False,
         decode_mode=False,
@@ -161,7 +254,7 @@ def _make_ctx(**overrides) -> RunContext:
 
 @pytest.fixture
 def fake_project_dir(tmp_path: Path) -> Path:
-    """Create a minimal PlatformIO project structure."""
+    """Create a minimal project structure with a root platformio.ini."""
     (tmp_path / "platformio.ini").write_text("[env:esp32s3]\n")
     (tmp_path / "examples" / "AutoResearch").mkdir(parents=True)
     return tmp_path
@@ -205,8 +298,953 @@ class TestParseArgsAndBuildCommands:
             "LCD_RGB",
             "OBJECT_FLED",
             "FLEX_IO",
-            "LPUART",
         }
+
+    def test_perf_wave2d_is_not_classified_as_gpio_only(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            perf_wave2d="32x32",
+            project_dir=fake_project_dir,
+        )
+        result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.perf_wave2d_grid == (32, 32)
+        assert result.gpio_only_mode is False
+
+    def test_all_drivers_teensy4_only_real_teensy_drivers(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            all=True,
+            parlio=False,
+            environment_positional="teensy40",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["OBJECT_FLED", "FLEX_IO"]
+        assert {cmd["method"] for cmd in result.json_rpc_commands} == {"runSingleTest"}
+        assert not any("__skip_with_pass" in cmd for cmd in result.json_rpc_commands)
+        assert all("pinTx" not in cmd["params"] for cmd in result.json_rpc_commands)
+
+    def test_contaminate_tx_mux_sets_run_single_test_field(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            object_fled=True,
+            parlio=False,
+            contaminate_tx_mux=True,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.json_rpc_commands[0]["method"] == "runSingleTest"
+        assert result.json_rpc_commands[0]["params"]["contaminateTxMux"] is True
+
+    def test_object_fled_legacy_one_strip_command(self, fake_project_dir: Path) -> None:
+        args = _make_args(
+            object_fled=True,
+            parlio=False,
+            legacy=True,
+            strip_sizes="1",
+            tx_pin=22,
+            rx_pin=8,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["OBJECT_FLED"]
+
+        run_commands = [
+            cmd for cmd in result.json_rpc_commands if cmd["method"] == "runSingleTest"
+        ]
+        assert len(run_commands) == 1
+        params = run_commands[0]["params"]
+        assert params["driver"] == "OBJECT_FLED"
+        assert params["laneSizes"] == [1]
+        assert params["useLegacyApi"] is True
+
+    def test_object_fled_legacy_same_timing_multistrip_command(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            object_fled=True,
+            parlio=False,
+            legacy=True,
+            lanes="2",
+            strip_sizes="3",
+            tx_pin=0,
+            rx_pin=8,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["OBJECT_FLED"]
+
+        run_commands = [
+            cmd for cmd in result.json_rpc_commands if cmd["method"] == "runSingleTest"
+        ]
+        assert len(run_commands) == 1
+        params = run_commands[0]["params"]
+        assert params["driver"] == "OBJECT_FLED"
+        assert params["laneSizes"] == [3, 3]
+        assert params["useLegacyApi"] is True
+        assert "legacyChipsets" not in params
+
+    def test_object_fled_legacy_mixed_timing_multistrip_command(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            object_fled=True,
+            parlio=False,
+            legacy=True,
+            legacy_mixed_timings=True,
+            lanes="2",
+            strip_sizes="3",
+            tx_pin=0,
+            rx_pin=8,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["OBJECT_FLED"]
+
+        run_commands = [
+            cmd for cmd in result.json_rpc_commands if cmd["method"] == "runSingleTest"
+        ]
+        assert len(run_commands) == 1
+        params = run_commands[0]["params"]
+        assert params["driver"] == "OBJECT_FLED"
+        assert params["laneSizes"] == [3, 3]
+        assert params["useLegacyApi"] is True
+        assert params["legacyChipsets"] == ["WS2812B", "SK6812"]
+
+    def test_object_fled_legacy_rgbw_small_counts_commands(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            object_fled=True,
+            parlio=False,
+            legacy=True,
+            legacy_rgbw_small_counts=True,
+            tx_pin=22,
+            rx_pin=8,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["OBJECT_FLED"]
+
+        run_commands = [
+            cmd for cmd in result.json_rpc_commands if cmd["method"] == "runSingleTest"
+        ]
+        assert len(run_commands) == 4
+        assert [cmd["params"]["laneSizes"] for cmd in run_commands] == [
+            [1],
+            [2],
+            [3],
+            [4],
+        ]
+        for cmd in run_commands:
+            params = cmd["params"]
+            assert params["driver"] == "OBJECT_FLED"
+            assert params["useLegacyApi"] is True
+            assert params["legacyRgbw"] is True
+            assert "legacyChipsets" not in params
+
+    def test_ws2814_chipset_requires_legacy(self, fake_project_dir: Path) -> None:
+        args = _make_args(
+            parlio=False,
+            rmt=True,
+            chipset="ws2814",
+            project_dir=fake_project_dir,
+        )
+        assert _parse_args_and_build_commands(args) == 1
+
+    def test_ws2814_rejects_legacy_parallel(self, fake_project_dir: Path) -> None:
+        args = _make_args(
+            parlio=True,
+            rmt=True,
+            legacy=True,
+            chipset="ws2814",
+            parallel=True,
+            project_dir=fake_project_dir,
+        )
+        assert _parse_args_and_build_commands(args) == 1
+
+    def test_ws2814_rejects_legacy_rgbw_override(self, fake_project_dir: Path) -> None:
+        args = _make_args(
+            parlio=False,
+            rmt=True,
+            legacy=True,
+            legacy_rgbw_small_counts=True,
+            chipset="ws2814",
+            project_dir=fake_project_dir,
+        )
+        assert _parse_args_and_build_commands(args) == 1
+
+    def test_ws2814_esp32c6_rmt_legacy_canonical_command(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            rmt=True,
+            legacy=True,
+            chipset="ws2814",
+            strip_sizes="1,2,3,4",
+            environment_positional="esp32c6",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ) as mock_synth:
+            result = _parse_args_and_build_commands(args)
+
+        assert isinstance(result, RunContext)
+        mock_synth.assert_called_once_with(
+            "esp32c6",
+            project_root=fake_project_dir.resolve(),
+            verbose=False,
+            extra_defines=["FL_ESP32_LEGACY_CLOCKLESS_USE_RMT=1"],
+        )
+        assert result.drivers == ["RMT"]
+        assert len(result.json_rpc_commands) == 4
+        for strip_size, command in zip(
+            [1, 2, 3, 4], result.json_rpc_commands, strict=True
+        ):
+            assert command["method"] == "runSingleTest"
+            assert command["params"] == {
+                "driver": "RMT",
+                "laneSizes": [strip_size],
+                "pattern": "MSB_LSB_A",
+                "iterations": 1,
+                "timing": "WS2814",
+                "useLegacyApi": True,
+                "legacyChipsets": ["WS2814"],
+            }
+            assert "legacyRgbw" not in command["params"]
+
+    def test_default_chipset_esp32c6_rmt_legacy_binds_rmt(
+        self, fake_project_dir: Path
+    ) -> None:
+        # Without the define, C6 legacy templates bind PARLIO and every
+        # `--rmt --legacy` request fails with LegacyDriverMismatch.
+        args = _make_args(
+            parlio=False,
+            rmt=True,
+            legacy=True,
+            strip_sizes="1,2",
+            environment_positional="esp32c6",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ) as mock_synth:
+            result = _parse_args_and_build_commands(args)
+
+        assert isinstance(result, RunContext)
+        mock_synth.assert_called_once_with(
+            "esp32c6",
+            project_root=fake_project_dir.resolve(),
+            verbose=False,
+            extra_defines=["FL_ESP32_LEGACY_CLOCKLESS_USE_RMT=1"],
+        )
+        assert result.drivers == ["RMT"]
+
+    def test_ws2814_legacy_chipset_repeats_for_each_lane(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            rmt=True,
+            legacy=True,
+            chipset="ws2814",
+            lanes="3",
+            tx_pin=0,
+            environment_positional="esp32c6",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+
+        assert isinstance(result, RunContext)
+        params = result.json_rpc_commands[0]["params"]
+        assert params["laneSizes"] == [100, 100, 100]
+        assert params["legacyChipsets"] == ["WS2814", "WS2814", "WS2814"]
+        assert "legacyRgbw" not in params
+
+    def test_legacy_multi_lane_rejects_rx_pin_inside_tx_lanes(
+        self, fake_project_dir: Path
+    ) -> None:
+        # 4 lanes from TX 0 drive GPIO 0-3; RX on GPIO 1 would be driven too.
+        args = _make_args(
+            parlio=False,
+            rmt=True,
+            legacy=True,
+            lanes="4",
+            tx_pin=0,
+            rx_pin=1,
+            environment_positional="esp32c6",
+            project_dir=fake_project_dir,
+        )
+        assert _parse_args_and_build_commands(args) == 1
+
+    @pytest.mark.parametrize(
+        ("rx_pin", "environment", "rejected"),
+        [
+            (3, "esp32c6", True),  # last lane pin
+            (4, "esp32c6", False),  # just past the lanes
+            (0, "esp32c6", False),  # lane 0 itself: RMT internal loopback
+            (None, "esp32s3", True),  # default RX 2 is lane 2
+            (None, "esp32c6", False),  # default RX 0 is lane 0
+        ],
+    )
+    def test_legacy_multi_lane_rx_pin_bounds(
+        self,
+        fake_project_dir: Path,
+        rx_pin: int | None,
+        environment: str,
+        rejected: bool,
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            rmt=True,
+            legacy=True,
+            lanes="4",
+            tx_pin=0,
+            rx_pin=rx_pin,
+            environment_positional=environment,
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert (result == 1) is rejected
+
+    def test_legacy_lane_rx_overlap_rechecks_after_auto_detect(self) -> None:
+        # Parse time with no board: the default RX is unknown, so it passes.
+        # After detection resolves esp32s3 (default RX 2), lane 2 conflicts.
+        args = _make_args(legacy=True, tx_pin=0, rx_pin=None)
+        assert not _legacy_lane_rx_overlap(args, 4, None)
+        assert _legacy_lane_rx_overlap(args, 4, "esp32s3")
+        assert not _legacy_lane_rx_overlap(args, 1, "esp32s3")
+
+    def test_legacy_command_max_lanes(self) -> None:
+        commands = [
+            {"method": "setPins", "params": [{"txPin": 0}]},
+            {"method": "runSingleTest", "params": {"laneSizes": [10, 10]}},
+            {"method": "runSingleTest", "params": {"laneSizes": [10] * 4}},
+        ]
+        assert _legacy_command_max_lanes(commands) == 4
+        assert _legacy_command_max_lanes([]) == 1
+
+    def test_ws2818_esp32s3_rmt_legacy_canonical_command(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            rmt=True,
+            legacy=True,
+            chipset="ws2818",
+            strip_sizes="1,4",
+            environment_positional="esp32s3",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ) as mock_synth:
+            result = _parse_args_and_build_commands(args)
+
+        assert isinstance(result, RunContext)
+        mock_synth.assert_called_once_with(
+            "esp32s3",
+            project_root=fake_project_dir.resolve(),
+            verbose=False,
+            extra_defines=["FL_ESP32_LEGACY_CLOCKLESS_USE_RMT=1"],
+        )
+        assert result.drivers == ["RMT"]
+        assert [command["params"] for command in result.json_rpc_commands] == [
+            {
+                "driver": "RMT",
+                "laneSizes": [strip_size],
+                "pattern": "MSB_LSB_A",
+                "iterations": 1,
+                "timing": "WS2818",
+                "useLegacyApi": True,
+                "legacyChipsets": ["WS2818"],
+            }
+            for strip_size in (1, 4)
+        ]
+
+    def test_ws2814_failure_response_requires_four_byte_total(self) -> None:
+        command = {
+            "method": "runSingleTest",
+            "params": {
+                "driver": "RMT",
+                "laneSizes": [2],
+                "useLegacyApi": True,
+                "legacyChipsets": ["WS2814"],
+            },
+        }
+        response = {
+            "success": True,
+            "passed": False,
+            "totalTests": 4,
+            "passedTests": 0,
+            "driver": "RMT",
+            "patterns": [
+                {
+                    "totalLeds": 2,
+                    "totalBytes": 8,
+                    "capturedBytes": 0,
+                }
+            ],
+        }
+        assert (
+            _validate_test_rpc_response("runSingleTest", command, response, None, None)
+            == []
+        )
+
+        del response["patterns"][0]["totalBytes"]
+        assert _validate_test_rpc_response(
+            "runSingleTest", command, response, None, None
+        ) == ["patterns[0] missing integer totalBytes for WS2814"]
+
+        response["patterns"] = []
+        assert _validate_test_rpc_response(
+            "runSingleTest", command, response, None, None
+        ) == ["WS2814 response requires a non-empty patterns list"]
+
+        response["patterns"] = ["malformed"]
+        assert _validate_test_rpc_response(
+            "runSingleTest", command, response, None, None
+        ) == ["patterns[0] must be an object for WS2814"]
+
+        response["patterns"] = [{"totalBytes": 8}]
+        assert _validate_test_rpc_response(
+            "runSingleTest", command, response, None, None
+        ) == ["patterns[0] missing integer totalLeds for WS2814"]
+
+    @pytest.mark.parametrize(
+        ("field", "value", "expected"),
+        (
+            ("rpUartStartAttempted", "yes", "rpUartStartAttempted must be boolean"),
+            ("rpUartStartSucceeded", 1, "rpUartStartSucceeded must be boolean"),
+            (
+                "rpUartEncodedSize",
+                -1,
+                "rpUartEncodedSize must be a nonnegative integer",
+            ),
+            (
+                "rpUartActualBaud",
+                True,
+                "rpUartActualBaud must be a nonnegative integer",
+            ),
+            ("rpUartLastError", None, "rpUartLastError must be a string"),
+        ),
+    )
+    def test_rp_uart_diagnostics_require_typed_contract(
+        self, field: str, value: object, expected: str
+    ) -> None:
+        command = {
+            "method": "runSingleTest",
+            "params": {"driver": "UART", "laneSizes": [1]},
+        }
+        response = {
+            "success": True,
+            "passed": False,
+            "totalTests": 1,
+            "passedTests": 0,
+            "driver": "UART",
+            "rpUartStartAttempted": True,
+            "rpUartStartSucceeded": False,
+            "rpUartEncodedSize": 0,
+            "rpUartActualBaud": 0,
+            "rpUartLastError": "RP UART: peripheral configure failed",
+        }
+        response[field] = value
+
+        errors = _validate_test_rpc_response(
+            "runSingleTest", command, response, None, None
+        )
+
+        assert expected in errors
+
+    def test_rp_uart_response_requires_complete_diagnostic_bundle(self) -> None:
+        command = {
+            "method": "runSingleTest",
+            "params": {"driver": "UART0", "laneSizes": [1]},
+        }
+        response = {
+            "success": True,
+            "passed": False,
+            "totalTests": 1,
+            "passedTests": 0,
+            "driver": "UART0",
+        }
+
+        errors = _validate_test_rpc_response(
+            "runSingleTest", command, response, None, None
+        )
+
+        assert errors == [
+            "rpUartStartAttempted must be boolean",
+            "rpUartStartSucceeded must be boolean",
+            "rpUartEncodedSize must be a nonnegative integer",
+            "rpUartActualBaud must be a nonnegative integer",
+            "rpUartLastError must be a string",
+        ]
+
+    def test_legacy_mixed_timings_requires_legacy(self, fake_project_dir: Path) -> None:
+        args = _make_args(
+            object_fled=True,
+            parlio=False,
+            legacy=False,
+            legacy_mixed_timings=True,
+            lanes="2",
+            strip_sizes="3",
+            tx_pin=0,
+            rx_pin=8,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        result = _parse_args_and_build_commands(args)
+        assert result == 1
+
+    def test_legacy_mixed_timings_requires_multiple_lanes(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            object_fled=True,
+            parlio=False,
+            legacy=True,
+            legacy_mixed_timings=True,
+            lanes="1",
+            strip_sizes="3",
+            tx_pin=0,
+            rx_pin=8,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        result = _parse_args_and_build_commands(args)
+        assert result == 1
+
+    def test_legacy_rgbw_small_counts_requires_legacy(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            object_fled=True,
+            parlio=False,
+            legacy=False,
+            legacy_rgbw_small_counts=True,
+            tx_pin=22,
+            rx_pin=8,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        result = _parse_args_and_build_commands(args)
+        assert result == 1
+
+    def test_legacy_rgbw_small_counts_requires_single_lane(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            object_fled=True,
+            parlio=False,
+            legacy=True,
+            legacy_rgbw_small_counts=True,
+            lanes="2",
+            tx_pin=0,
+            rx_pin=8,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        result = _parse_args_and_build_commands(args)
+        assert result == 1
+
+    def test_legacy_rgbw_small_counts_rejects_strip_size_override(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            object_fled=True,
+            parlio=False,
+            legacy=True,
+            legacy_rgbw_small_counts=True,
+            strip_sizes="3",
+            tx_pin=22,
+            rx_pin=8,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        result = _parse_args_and_build_commands(args)
+        assert result == 1
+
+    def test_object_fled_legacy_current_pin_rejects_multistrip(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            object_fled=True,
+            parlio=False,
+            legacy=True,
+            lanes="2",
+            strip_sizes="3",
+            tx_pin=22,
+            rx_pin=8,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        result = _parse_args_and_build_commands(args)
+        assert result == 1
+
+    def test_spi_driver_name_remains_spi_on_esp32(self, fake_project_dir: Path) -> None:
+        args = _make_args(parlio=False, spi=True, project_dir=fake_project_dir)
+        result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["SPI"]
+        assert result.json_rpc_commands[0]["params"]["driver"] == "SPI"
+
+    def test_spi_driver_name_maps_to_spi_unified_on_teensy4(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            spi=True,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["SPI_UNIFIED"]
+        assert result.json_rpc_commands[0]["params"]["driver"] == "SPI_UNIFIED"
+
+    def test_flex_io_does_not_hide_tx_pin_override(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            flex_io=True,
+            environment_positional="teensy41",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["FLEX_IO"]
+        command = result.json_rpc_commands[0]
+        assert command["method"] == "runSingleTest"
+        assert command["params"]["driver"] == "FLEX_IO"
+        assert "pinTx" not in command["params"]
+
+    @pytest.mark.parametrize(
+        "environment",
+        (
+            "rp2040",
+            "rpipico",
+            "rpipicow",
+            "rp2350",
+            "rpipico2",
+            "rp2350w",
+            "rpipico2w",
+        ),
+    )
+    def test_flex_io_driver_name_maps_to_pio1_on_rp2xxx_aliases(
+        self, fake_project_dir: Path, environment: str
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            flex_io=True,
+            environment_positional=environment,
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["PIO1"]
+        assert result.json_rpc_commands[0]["params"]["driver"] == "PIO1"
+
+    def test_flex_io_selects_pio0_on_rp2040(self, fake_project_dir: Path) -> None:
+        args = _make_args(
+            parlio=False,
+            flex_io=True,
+            rp_pio_index=0,
+            environment_positional="rp2040",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["PIO0"]
+        assert result.json_rpc_commands[0]["params"]["driver"] == "PIO0"
+
+    def test_flex_io_selects_pio2_on_rp2350(self, fake_project_dir: Path) -> None:
+        args = _make_args(
+            parlio=False,
+            flex_io=True,
+            rp_pio_index=2,
+            environment_positional="rp2350w",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["PIO2"]
+        assert result.json_rpc_commands[0]["params"]["driver"] == "PIO2"
+
+    @pytest.mark.parametrize(
+        ("environment", "uart_index", "driver"),
+        (
+            ("rp2040", 0, "UART0"),
+            ("rpipico", 1, "UART1"),
+            ("rp2350", 0, "UART0"),
+            ("rp2350w", 1, "UART1"),
+            ("rpipico2w", 0, "UART0"),
+        ),
+    )
+    def test_uart_selects_concrete_rp_uart_driver(
+        self,
+        fake_project_dir: Path,
+        environment: str,
+        uart_index: int,
+        driver: str,
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            uart=True,
+            rp_uart_index=uart_index,
+            environment_positional=environment,
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == [driver]
+        assert result.json_rpc_commands[0]["params"]["driver"] == driver
+
+    @pytest.mark.parametrize("environment", ("rp2040", "rp2350"))
+    def test_legacy_flex_io_defaults_to_pio0_on_rp(
+        self, fake_project_dir: Path, environment: str
+    ) -> None:
+        # #4623: legacy addLeds<> templates are compile-time bound to PIO0
+        # (BusTraits<Bus::FLEX_IO, 0>); the channel default PIO1 made the run
+        # transmit on PIO0 while diagnosing PIO1, failing with zero_capture.
+        args = _make_args(
+            parlio=False,
+            flex_io=True,
+            legacy=True,
+            rp_pio_index=None,
+            environment_positional=environment,
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["PIO0"]
+        assert result.json_rpc_commands[0]["params"]["driver"] == "PIO0"
+
+    def test_flex_io_defaults_to_pio1_on_rp_without_legacy(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            flex_io=True,
+            rp_pio_index=None,
+            environment_positional="rp2350",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["PIO1"]
+
+    def test_legacy_flex_io_rejects_non_pio0_on_rp(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            flex_io=True,
+            legacy=True,
+            rp_pio_index=1,
+            environment_positional="rp2350",
+            project_dir=fake_project_dir,
+        )
+        assert _parse_args_and_build_commands(args) == 1
+
+    def test_flex_io_rejects_pio2_on_rp2040(self, fake_project_dir: Path) -> None:
+        args = _make_args(
+            parlio=False,
+            flex_io=True,
+            rp_pio_index=2,
+            environment_positional="rp2040",
+            project_dir=fake_project_dir,
+        )
+        assert _parse_args_and_build_commands(args) == 1
+
+    @pytest.mark.parametrize(
+        "environment",
+        (
+            "rp2040",
+            "rpipico",
+            "rpipicow",
+            "rp2350",
+            "rpipico2",
+            "rp2350w",
+            "rpipico2w",
+        ),
+    )
+    def test_rp_pio_both_generates_one_parallel_command_for_rp2xxx_aliases(
+        self, fake_project_dir: Path, environment: str
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            flex_io=True,
+            rp_pio_both=True,
+            parallel=True,
+            environment_positional=environment,
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["PIO0", "PIO1"]
+        assert result.json_rpc_commands[0]["method"] == "runParallelTest"
+
+    def test_rp_pio_parallel_response_uses_resource_evidence(self) -> None:
+        command = {
+            "method": "runParallelTest",
+            "params": {
+                "drivers": [
+                    {"driver": "PIO0", "laneSizes": [100]},
+                    {"driver": "PIO1", "laneSizes": [100]},
+                ]
+            },
+        }
+        response = {
+            "success": True,
+            "passed": True,
+            "totalTests": 1,
+            "passedTests": 1,
+            "drivers": [
+                {"driver": "PIO0", "pinTx": 11},
+                {"driver": "PIO1", "pinTx": 12},
+            ],
+            "captureBackend": "PIO_RX",
+            "captureEvidenceBytes": 0,
+            "captureEvidenceRawEdges": 0,
+            "requestedTxPin": 11,
+            "requestedRxPin": 8,
+            "actualTxPin": 11,
+            "actualRxPin": 8,
+            "concurrent_resource_test": True,
+            "show_success": True,
+        }
+        assert (
+            _validate_test_rpc_response("runParallelTest", command, response, 11, 8)
+            == []
+        )
+
+    def test_lpuart_is_deprecated_alias_for_uart(
+        self, fake_project_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            lpuart=True,
+            project_dir=fake_project_dir,
+        )
+        result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["UART"]
+        assert result.json_rpc_commands[0]["params"]["driver"] == "UART"
+        assert args.uart is True
+        assert args.lpuart is False
+        assert "--lpuart is deprecated; use --uart" in capsys.readouterr().err
+
+    def test_flexio_alias_defaults_to_zero_when_present(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        args = Args.parse_args(["--flexio"])
+        assert args.flex_io is False
+        assert "omit it or use --flex-io" in capsys.readouterr().err
+
+    def test_flexio_alias_one_enables_flex_io(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        args = Args.parse_args(["--flexio", "1"])
+        assert args.flex_io is True
+        assert "--flexio is deprecated; use --flex-io" in capsys.readouterr().err
+
+    def test_flexio_alias_zero_is_noop(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        args = Args.parse_args(["--flexio", "0"])
+        assert args.flex_io is False
+        assert "omit it or use --flex-io" in capsys.readouterr().err
 
     def test_multiple_drivers(self, fake_project_dir: Path) -> None:
         args = _make_args(parlio=True, rmt=True, spi=True, project_dir=fake_project_dir)
@@ -251,6 +1289,47 @@ class TestParseArgsAndBuildCommands:
         assert isinstance(result, int)
         assert result == 1
 
+    def test_net_peer_requires_explicit_rp2350w_and_c6_ports(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            net_peer=True,
+            environment_positional="rp2350w",
+            upload_port="COM17",
+            peer_upload_port="COM9",
+            project_dir=fake_project_dir,
+        )
+        result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.net_peer_mode is True
+        assert result.gpio_only_mode is False
+
+    def test_net_peer_rejects_missing_companion_port(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            net_peer=True,
+            environment_positional="rp2350w",
+            upload_port="COM17",
+            project_dir=fake_project_dir,
+        )
+        assert _parse_args_and_build_commands(args) == 1
+
+    def test_net_peer_rejects_wrong_primary_environment(
+        self, fake_project_dir: Path
+    ) -> None:
+        args = _make_args(
+            parlio=False,
+            net_peer=True,
+            environment_positional="esp32c6",
+            upload_port="COM17",
+            peer_upload_port="COM9",
+            project_dir=fake_project_dir,
+        )
+        assert _parse_args_and_build_commands(args) == 1
+
     def test_lane_range_parsing(self, fake_project_dir: Path) -> None:
         args = _make_args(lanes="1-4", project_dir=fake_project_dir)
         result = _parse_args_and_build_commands(args)
@@ -270,6 +1349,32 @@ class TestParseArgsAndBuildCommands:
         assert isinstance(result, RunContext)
         assert result.gpio_only_mode is True
         assert result.drivers == []
+
+    def test_rp_spi_loopback_is_not_gpio_only(self, fake_project_dir: Path) -> None:
+        args = _make_args(
+            parlio=False,
+            rp_spi_loopback=True,
+            environment_positional="rp2040",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.gpio_only_mode is False
+        assert result.drivers == []
+
+    def test_rp_spi_loopback_flag_parses(self) -> None:
+        args = Args.parse_args(["--rp-spi-loopback", "--rp-spi-index", "1"])
+        assert args.rp_spi_loopback is True
+        assert args.rp_spi_index == 1
+
+    def test_rp_uart_index_flag_parses(self) -> None:
+        args = Args.parse_args(["--uart", "--rp-uart-index", "1"])
+        assert args.uart is True
+        assert args.rp_uart_index == 1
 
     def test_simd_mode(self, fake_project_dir: Path) -> None:
         args = _make_args(parlio=False, simd=True, project_dir=fake_project_dir)
@@ -337,13 +1442,6 @@ class TestParseArgsAndBuildCommands:
         assert isinstance(result, int)
         assert result == 1
 
-    def test_missing_platformio_ini(self, tmp_path: Path) -> None:
-        # No platformio.ini in tmp_path
-        args = _make_args(project_dir=tmp_path)
-        result = _parse_args_and_build_commands(args)
-        assert isinstance(result, int)
-        assert result == 1
-
     def test_staged_project_dir_uses_src_sketch(
         self, staged_project_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -362,6 +1460,104 @@ class TestParseArgsAndBuildCommands:
         assert isinstance(result, RunContext)
         assert result.final_environment == "esp32s3"
         assert "LCD_CLOCKLESS" in result.drivers
+
+    # ============================================================
+    # #3281: synthesised .build/fbuild/<board>/platformio.ini path
+    # ============================================================
+
+    def test_synthesised_path_calls_staging_when_board_known(
+        self, tmp_path: Path
+    ) -> None:
+        """When the board is known up-front, ``_parse_args_and_build_commands``
+        should synthesise the staged ``.build/fbuild/<board>/`` project and
+        use it as ``build_dir`` — NO root ``./platformio.ini`` is required."""
+        # Note: NO platformio.ini in tmp_path on purpose. The synthesis path
+        # must NOT require one to exist.
+        (tmp_path / "examples" / "AutoResearch").mkdir(parents=True)
+
+        fake_build_dir = tmp_path / ".build" / "fbuild" / "esp32s3"
+        fake_build_dir.mkdir(parents=True)
+
+        args = _make_args(
+            environment_positional="esp32s3",
+            project_dir=tmp_path,
+        )
+
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_build_dir,
+        ) as mock_synth:
+            result = _parse_args_and_build_commands(args)
+
+        assert isinstance(result, RunContext), result
+        mock_synth.assert_called_once_with(
+            "esp32s3",
+            project_root=tmp_path.resolve(),
+            verbose=False,
+            extra_defines=[],
+        )
+        assert result.build_dir == fake_build_dir
+
+    @pytest.mark.parametrize(
+        ("requested_environment", "canonical_environment"),
+        (
+            ("rpipico", "rp2040"),
+            ("rpipico2", "rp2350"),
+            ("rpipico2w", "rp2350w"),
+        ),
+    )
+    def test_rp_board_alias_stages_the_canonical_environment(
+        self,
+        tmp_path: Path,
+        requested_environment: str,
+        canonical_environment: str,
+    ) -> None:
+        (tmp_path / "examples" / "AutoResearch").mkdir(parents=True)
+        fake_build_dir = tmp_path / ".build" / "fbuild" / canonical_environment
+        fake_build_dir.mkdir(parents=True)
+        args = _make_args(
+            environment_positional=requested_environment,
+            project_dir=tmp_path,
+        )
+
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_build_dir,
+        ) as mock_synth:
+            result = _parse_args_and_build_commands(args)
+
+        assert isinstance(result, RunContext)
+        assert result.final_environment == canonical_environment
+        mock_synth.assert_called_once_with(
+            canonical_environment,
+            project_root=tmp_path.resolve(),
+            verbose=False,
+            extra_defines=[],
+        )
+
+    def test_synthesised_path_defers_when_board_unknown(self, tmp_path: Path) -> None:
+        """When the board is NOT known up-front (no positional, no --env,
+        no --lcd*), parse-time synthesis must NOT happen — synthesis is
+        deferred to ``_resolve_port_and_environment`` after chip auto-detect."""
+        # No platformio.ini in tmp_path — synthesised path must tolerate that.
+        (tmp_path / "examples" / "AutoResearch").mkdir(parents=True)
+
+        args = _make_args(
+            environment_positional=None,
+            project_dir=tmp_path,
+        )
+
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project"
+        ) as mock_synth:
+            result = _parse_args_and_build_commands(args)
+
+        assert isinstance(result, RunContext), result
+        mock_synth.assert_not_called()
+        # build_dir falls back to project_root so the sketch resolver still
+        # finds examples/AutoResearch/.
+        assert result.build_dir == tmp_path.resolve()
+        assert result.final_environment is None
 
     def test_timeout_parsing(self, fake_project_dir: Path) -> None:
         args = _make_args(timeout="2m", project_dir=fake_project_dir)
@@ -386,48 +1582,201 @@ class TestParseArgsAndBuildCommands:
 class TestResolvePortAndEnvironment:
     """Test _resolve_port_and_environment (mocks port detection)."""
 
-    def test_auto_detect_port_success(self) -> None:
-        ctx = _make_ctx(upload_port=None)
-        ctx.args = _make_args(upload_port=None)
-        mock_result = MagicMock(ok=True, selected_port="COM5")
-        with (
-            patch(
-                f"{_PATCH_MOD}.auto_detect_upload_port", return_value=mock_result
-            ) as auto_detect,
-            patch(
-                f"{_PATCH_MOD}.select_build_driver", return_value=_make_mock_driver()
-            ),
-            patch(
-                "ci.util.pio_package_daemon.get_default_environment",
-                return_value=None,
-            ),
-        ):
-            rc = asyncio.run(_resolve_port_and_environment(ctx))
-        assert rc is None
-        assert ctx.upload_port == "COM5"
-        assert ctx.final_environment == "esp32s3"
-        auto_detect.assert_called_once_with(expected_environment="esp32s3")
+    def test_auto_detected_rp_normalizes_uart_driver_name(self, tmp_path: Path) -> None:
+        (tmp_path / "examples" / "AutoResearch").mkdir(parents=True)
+        staged_dir = tmp_path / ".build" / "fbuild" / "rp2350w"
+        staged_dir.mkdir(parents=True)
+        args = _make_args(
+            upload_port=None,
+            environment_positional=None,
+            parlio=False,
+            uart=True,
+            rp_uart_index=1,
+            project_dir=tmp_path,
+        )
+        ctx = _parse_args_and_build_commands(args)
+        assert isinstance(ctx, RunContext)
+        assert ctx.drivers == ["UART"]
+        assert ctx.json_rpc_commands[0]["params"]["driver"] == "UART"
 
-    def test_auto_detect_port_uses_requested_environment(self) -> None:
-        ctx = _make_ctx(upload_port=None, final_environment="esp32c6")
-        ctx.args = _make_args(upload_port=None, environment="esp32c6")
-        mock_result = MagicMock(ok=True, selected_port="COM9")
+        port_result = MagicMock(ok=True, selected_port="COM17")
+        chip_result = MagicMock(
+            ok=True,
+            chip_type="RP2350",
+            environment="rp2350w",
+        )
         with (
             patch(
-                f"{_PATCH_MOD}.auto_detect_upload_port", return_value=mock_result
-            ) as auto_detect,
-            patch(
-                f"{_PATCH_MOD}.select_build_driver", return_value=_make_mock_driver()
+                f"{_PATCH_MOD}.auto_detect_upload_port",
+                return_value=port_result,
             ),
             patch(
-                "ci.util.pio_package_daemon.get_default_environment",
-                return_value=None,
+                f"{_PATCH_MOD}.detect_attached_chip",
+                return_value=chip_result,
+            ),
+            patch(
+                "ci.autoresearch.staging.synthesise_autoresearch_project",
+                return_value=staged_dir,
+            ),
+            patch(
+                f"{_PATCH_MOD}.select_build_driver",
+                return_value=_make_mock_driver(),
+            ),
+        ):
+            rc = asyncio.run(_resolve_port_and_environment(ctx))
+
+        assert rc is None
+        assert ctx.final_environment == "rp2350w"
+        assert ctx.drivers == ["UART1"]
+        assert ctx.json_rpc_commands[0]["params"]["driver"] == "UART1"
+
+    @pytest.mark.parametrize(
+        "environment",
+        ("esp32s3", "lpc845brk", "lpc845", "lpcxpresso845max", "lpcxpresso804"),
+    )
+    def test_known_environment_defers_port_selection_to_fbuild(
+        self, environment: str
+    ) -> None:
+        ctx = _make_ctx(upload_port=None, final_environment=environment)
+        ctx.args = _make_args(upload_port=None, environment=environment)
+        with (
+            patch(f"{_PATCH_MOD}.auto_detect_upload_port") as auto_detect,
+            patch(
+                f"{_PATCH_MOD}.select_build_driver", return_value=_make_mock_driver()
             ),
         ):
             rc = asyncio.run(_resolve_port_and_environment(ctx))
         assert rc is None
-        assert ctx.upload_port == "COM9"
-        auto_detect.assert_called_once_with(expected_environment="esp32c6")
+        assert ctx.upload_port is None
+        auto_detect.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "environment", ("rp2350", "rpipico2", "rp2350w", "rpipico2w")
+    )
+    def test_rp2xxx_rpc_smoke_allows_fbuild_no_port_transport(
+        self, environment: str
+    ) -> None:
+        args = _make_args(
+            environment=environment,
+            upload_port=None,
+            parlio=False,
+            rpc_smoke=True,
+        )
+        ctx = _make_ctx(
+            args=args,
+            final_environment=environment,
+            upload_port=None,
+            rpc_smoke_mode=True,
+        )
+
+        with (
+            patch(f"{_PATCH_MOD}.auto_detect_upload_port") as auto_detect,
+            patch(
+                f"{_PATCH_MOD}.select_build_driver",
+                return_value=_make_mock_driver(),
+            ),
+        ):
+            rc = asyncio.run(_resolve_port_and_environment(ctx))
+
+        assert rc is None
+        assert ctx.upload_port is None
+        auto_detect.assert_not_called()
+
+    @pytest.mark.parametrize("environment", sorted(RP2XXX_ENVIRONMENTS))
+    def test_rp2xxx_driver_mode_delegates_port_selection_to_fbuild(
+        self, environment: str
+    ) -> None:
+        """Driver runs defer RP port selection to fbuild too (#3836).
+
+        RP USB identities are published by FastLED/boards and reach us
+        through fbuild, so a local ``auto_detect_upload_port`` scan would be
+        re-deriving data we already have. Deferral was once granted only to
+        ``--rpc-smoke``/``--watchdog-soak``, which left driver modes such as
+        ``--parlio`` resolving the port locally.
+        """
+        args = _make_args(
+            environment=environment,
+            upload_port=None,
+            parlio=True,
+            rpc_smoke=False,
+        )
+        ctx = _make_ctx(
+            args=args,
+            final_environment=environment,
+            upload_port=None,
+            rpc_smoke_mode=False,
+        )
+
+        with (
+            patch(f"{_PATCH_MOD}.auto_detect_upload_port") as auto_detect,
+            patch(
+                f"{_PATCH_MOD}.select_build_driver",
+                return_value=_make_mock_driver(),
+            ),
+        ):
+            rc = asyncio.run(_resolve_port_and_environment(ctx))
+
+        assert rc is None
+        assert ctx.upload_port is None
+        auto_detect.assert_not_called()
+
+    @pytest.mark.parametrize("chipset", ["ws2814", "ws2812"])
+    def test_legacy_rmt_deferred_synthesis_injects_rmt_binding(
+        self, tmp_path: Path, chipset: str
+    ) -> None:
+        (tmp_path / "examples" / "AutoResearch").mkdir(parents=True)
+        staged_dir = tmp_path / ".build" / "fbuild" / "esp32c6"
+        staged_dir.mkdir(parents=True)
+        args = _make_args(
+            upload_port=None,
+            environment_positional=None,
+            parlio=False,
+            rmt=True,
+            legacy=True,
+            chipset=chipset,
+            project_dir=tmp_path,
+        )
+        ctx = _make_ctx(
+            args=args,
+            upload_port=None,
+            final_environment=None,
+            build_dir=tmp_path.resolve(),
+        )
+        port_result = MagicMock(ok=True, selected_port="COM9")
+        chip_result = MagicMock(
+            ok=True,
+            chip_type="ESP32-C6",
+            environment="esp32c6",
+        )
+        with (
+            patch(
+                f"{_PATCH_MOD}.auto_detect_upload_port",
+                return_value=port_result,
+            ),
+            patch(
+                f"{_PATCH_MOD}.detect_attached_chip",
+                return_value=chip_result,
+            ),
+            patch(
+                "ci.autoresearch.staging.synthesise_autoresearch_project",
+                return_value=staged_dir,
+            ) as synth,
+            patch(
+                f"{_PATCH_MOD}.select_build_driver",
+                return_value=_make_mock_driver(),
+            ),
+        ):
+            rc = asyncio.run(_resolve_port_and_environment(ctx))
+
+        assert rc is None
+        assert ctx.final_environment == "esp32c6"
+        assert ctx.build_dir == staged_dir
+        synth.assert_called_once_with(
+            "esp32c6",
+            project_root=tmp_path.resolve(),
+            verbose=False,
+            extra_defines=["FL_ESP32_LEGACY_CLOCKLESS_USE_RMT=1"],
+        )
 
     def test_cli_upload_port(self) -> None:
         ctx = _make_ctx(upload_port=None)
@@ -435,10 +1784,6 @@ class TestResolvePortAndEnvironment:
         with (
             patch(
                 f"{_PATCH_MOD}.select_build_driver", return_value=_make_mock_driver()
-            ),
-            patch(
-                "ci.util.pio_package_daemon.get_default_environment",
-                return_value=None,
             ),
         ):
             rc = asyncio.run(_resolve_port_and_environment(ctx))
@@ -495,7 +1840,10 @@ class TestAutoDetectUploadPort:
 
         assert result.ok is True
         assert result.selected_port == "COM9"
-        detect_chip.assert_called_once_with("COM9", timeout=3.0)
+        # FastLED #3446: the 3.0s explicit timeout override was removed so
+        # the call picks up `detect_attached_chip`'s richer default. Test
+        # now just asserts the call happened with the port name.
+        detect_chip.assert_called_once_with("COM9")
 
     def test_expected_environment_positive_mismatch_fails(self) -> None:
         port = ListPortInfo("COM9")
@@ -525,6 +1873,42 @@ class TestAutoDetectUploadPort:
             result.error_message or ""
         )
 
+    def test_non_esp_environment_does_not_guess_from_usb_descriptor(self) -> None:
+        port = ListPortInfo("COM9")
+        port.description = "CP210x USB to UART Bridge"
+        port.hwid = "USB VID:PID=10C4:EA60"
+
+        with patch(
+            "ci.util.port_utils.serial.tools.list_ports.comports",
+            return_value=[port],
+        ):
+            result = auto_detect_upload_port("rp2040")
+
+        assert result.ok is False
+        assert result.selected_port is None
+        assert "cannot be identified safely" in (result.error_message or "")
+
+    def test_expected_serial_number_selects_reenumerated_non_esp_port(self) -> None:
+        wrong_port = ListPortInfo("COM8")
+        wrong_port.description = "USB Serial Device"
+        wrong_port.hwid = "USB VID:PID=FFFF:0001"
+        wrong_port.serial_number = "OTHER"
+        expected_port = ListPortInfo("COM9")
+        expected_port.description = "USB Serial Device"
+        expected_port.hwid = "USB VID:PID=2E8A:F00F"
+        expected_port.serial_number = "BOARD-123"
+
+        with patch(
+            "ci.util.port_utils.serial.tools.list_ports.comports",
+            return_value=[wrong_port, expected_port],
+        ):
+            result = auto_detect_upload_port(
+                "rp2350w", expected_serial_number="BOARD-123"
+            )
+
+        assert result.ok is True
+        assert result.selected_port == "COM9"
+
 
 # ============================================================
 # Tests: _run_build_deploy
@@ -534,6 +1918,15 @@ class TestAutoDetectUploadPort:
 class TestRunBuildDeploy:
     """Test _run_build_deploy (uses mock BuildDriver)."""
 
+    @pytest.fixture(autouse=True)
+    def disable_host_watchdog_for_unit_deploys(self):
+        """Direct phase tests do not own host watchdog or USB inventory state."""
+        with (
+            patch(f"{_PATCH_MOD}.start_autoresearch_watchdog"),
+            patch(f"{_PATCH_MOD}.absent_port_error", return_value=None),
+        ):
+            yield
+
     def test_build_deploy_success(self) -> None:
         mock_driver = _make_mock_driver()
         ctx = _make_ctx(build_driver=mock_driver)
@@ -542,6 +1935,48 @@ class TestRunBuildDeploy:
         assert rc is None
         mock_driver.install_packages.assert_called_once()
         mock_driver.deploy.assert_called_once()
+
+    def test_canonical_rp2350w_environment_is_used_for_fbuild_deploy(self) -> None:
+        mock_driver = _make_mock_driver()
+        ctx = _make_ctx(
+            args=_make_args(skip_lint=True),
+            build_driver=mock_driver,
+            final_environment="rp2350w",
+        )
+        qctx = QuietContext(quiet=False)
+
+        rc = asyncio.run(_run_build_deploy(ctx, qctx))
+
+        assert rc is None
+        assert mock_driver.deploy.call_args.kwargs["environment"] == "rp2350w"
+
+    def test_net_peer_deploys_c6_through_fbuild_on_explicit_port(self) -> None:
+        mock_driver = _make_mock_driver()
+        ctx = _make_ctx(
+            args=_make_args(
+                skip_lint=True,
+                net_peer=True,
+                environment_positional="rp2350w",
+                upload_port="COM17",
+                peer_upload_port="COM9",
+            ),
+            build_driver=mock_driver,
+            final_environment="rp2350w",
+            upload_port="COM17",
+            net_peer_mode=True,
+        )
+        qctx = QuietContext(quiet=False)
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=Path("/fake/peer-project"),
+        ) as stage_peer:
+            rc = asyncio.run(_run_build_deploy(ctx, qctx))
+
+        assert rc is None
+        stage_peer.assert_called_once()
+        assert mock_driver.deploy.call_count == 2
+        assert mock_driver.deploy.call_args.kwargs["environment"] == "esp32c6"
+        assert mock_driver.deploy.call_args.kwargs["upload_port"] == "COM9"
 
     def test_build_deploy_install_failure(self) -> None:
         mock_driver = _make_mock_driver(install_ok=False)
@@ -577,6 +2012,84 @@ class TestRunBuildDeploy:
             rc = asyncio.run(_run_build_deploy(ctx, qctx))
         assert rc == 1
 
+    def test_lpc_ieee754_uses_dedicated_build_environment(self) -> None:
+        """LPC deploys use the mode environment and accept fbuild's port."""
+        mock_driver = _make_mock_driver()
+        mock_driver.deploy.return_value = DeployResult(success=True, port="COM7")
+        ctx = _make_ctx(
+            args=_make_args(skip_lint=True, ieee754=True),
+            build_driver=mock_driver,
+            final_environment="lpc845brk",
+            upload_port=None,
+            ieee754_test_mode=True,
+            math_test_mode=False,
+            fft_test_mode=False,
+        )
+        qctx = QuietContext(quiet=False)
+        rc = asyncio.run(_run_build_deploy(ctx, qctx))
+        assert rc is None
+        assert _build_environment_for_mode(ctx) == "lpc845brk_ieee754"
+        mock_driver.install_packages.assert_called_once_with(
+            Path("/fake/project"), "lpc845brk_ieee754"
+        )
+        mock_driver.deploy.assert_called_once()
+        assert mock_driver.deploy.call_args.kwargs["environment"] == (
+            "lpc845brk_ieee754"
+        )
+        assert ctx.upload_port == "COM7"
+
+    def test_deferred_deploy_without_application_port_fails(self, capsys) -> None:
+        """A deferred non-RP deploy must fail before serial phases run."""
+        mock_driver = _make_mock_driver()
+        mock_driver.deploy.return_value = DeployResult(success=True, port=None)
+        ctx = _make_ctx(
+            args=_make_args(skip_lint=True),
+            build_driver=mock_driver,
+            final_environment="esp32s3",
+            upload_port=None,
+        )
+
+        rc = asyncio.run(_run_build_deploy(ctx, QuietContext(quiet=False)))
+
+        assert rc == 1
+        output = capsys.readouterr().out
+        assert "No application serial port" in output
+        assert "esp32s3" in output
+
+    def test_stock_rp_deploy_without_application_port_fails_closed(self) -> None:
+        """RP smoke runs must not rediscover a potentially different board."""
+        mock_driver = _make_mock_driver()
+        mock_driver.deploy.return_value = DeployResult(success=True, port=None)
+        ctx = _make_ctx(
+            args=_make_args(skip_lint=True, rpc_smoke=True),
+            build_driver=mock_driver,
+            final_environment="rp2350",
+            upload_port=None,
+            rpc_smoke_mode=True,
+        )
+
+        rc = asyncio.run(_run_build_deploy(ctx, QuietContext(quiet=False)))
+
+        assert rc == 1
+        assert ctx.upload_port is None
+
+    def test_stopping_host_watchdog_signals_and_clears_the_runner_handle(self) -> None:
+        ctx = _make_ctx()
+        cancel_event = MagicMock()
+        ctx._watchdog_task = cancel_event
+
+        stop_autoresearch_watchdog(ctx)
+
+        cancel_event.set.assert_called_once_with()
+        assert ctx._watchdog_task is None
+
+
+def test_legacy_usb_identity_tables_are_absent() -> None:
+    """Runtime port selection and labels no longer expose local tables."""
+    assert not hasattr(port_utils, "ENVIRONMENT_TO_VCOM_VID_PIDS")
+    assert not hasattr(port_utils, "ENVIRONMENT_TO_VCOM_VID_PID")
+    assert not hasattr(serial_probe, "BOARD_FINGERPRINTS")
+
 
 # ============================================================
 # Tests: _run_schema_and_pin_setup
@@ -585,6 +2098,24 @@ class TestRunBuildDeploy:
 
 class TestRunSchemaAndPinSetup:
     """Test _run_schema_and_pin_setup (mocks RPC client)."""
+
+    def test_rp2350_missing_deploy_port_fails_closed_without_rescan(self) -> None:
+        ctx = _make_ctx(
+            final_environment="rp2350",
+            upload_port=None,
+            use_fbuild=True,
+            rpc_smoke_mode=True,
+        )
+
+        with patch(
+            f"{_PATCH_MOD}.auto_detect_upload_port",
+            side_effect=AssertionError("must not guess after deploy"),
+        ) as auto_detect:
+            rc = asyncio.run(_run_schema_and_pin_setup(ctx))
+
+        assert rc == 1
+        assert ctx.upload_port is None
+        auto_detect.assert_not_called()
 
     def test_cli_pin_override(self) -> None:
         args = _make_args(tx_pin=3, rx_pin=4, skip_schema=True)
@@ -598,7 +2129,10 @@ class TestRunSchemaAndPinSetup:
         assert rc is None
         assert ctx.effective_tx_pin == 3
         assert ctx.effective_rx_pin == 4
-        assert ctx.json_rpc_commands[0]["method"] == "setPins"
+        assert ctx.json_rpc_commands[0] == {
+            "method": "setPins",
+            "params": [{"txPin": 3, "rxPin": 4}],
+        }
 
     def test_default_pins(self) -> None:
         args = _make_args(skip_schema=True)
@@ -610,8 +2144,114 @@ class TestRunSchemaAndPinSetup:
         ):
             rc = asyncio.run(_run_schema_and_pin_setup(ctx))
         assert rc is None
-        assert ctx.effective_tx_pin == 1  # PIN_TX default
-        assert ctx.effective_rx_pin == 0  # PIN_RX default
+        assert ctx.effective_tx_pin == 1
+        assert ctx.effective_rx_pin == 2
+        assert ctx.json_rpc_commands[0] == {
+            "method": "setPins",
+            "params": [{"txPin": 1, "rxPin": 2}],
+        }
+
+    def test_teensy_default_pins_match_firmware(self) -> None:
+        args = _make_args(skip_schema=True)
+        ctx = _make_ctx(args=args, final_environment="teensy41")
+        with patch(
+            f"{_PATCH_MOD}.run_gpio_pretest",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            rc = asyncio.run(_run_schema_and_pin_setup(ctx))
+        assert rc is None
+        assert ctx.effective_tx_pin == 1
+        assert ctx.effective_rx_pin == 2
+        assert ctx.json_rpc_commands[0] == {
+            "method": "setPins",
+            "params": [{"txPin": 1, "rxPin": 2}],
+        }
+
+    def test_teensy_flex_io_default_tx_pin_is_visible(self) -> None:
+        args = _make_args(parlio=False, flex_io=True, skip_schema=True)
+        ctx = _make_ctx(
+            args=args,
+            drivers=["FLEX_IO"],
+            final_environment="teensy41",
+        )
+        with patch(
+            f"{_PATCH_MOD}.run_gpio_pretest",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as pretest:
+            rc = asyncio.run(_run_schema_and_pin_setup(ctx))
+        assert rc is None
+        assert ctx.effective_tx_pin == 6
+        assert ctx.effective_rx_pin == 2
+        assert ctx.json_rpc_commands[0] == {
+            "method": "setPins",
+            "params": [{"txPin": 6, "rxPin": 2}],
+        }
+        pretest.assert_awaited_once_with(
+            "COM5", 6, 2, serial_interface=ctx.serial_iface
+        )
+
+    def test_teensy_flex_io_explicit_pin_override_wins(self) -> None:
+        args = _make_args(
+            parlio=False,
+            flex_io=True,
+            tx_pin=22,
+            rx_pin=8,
+            skip_schema=True,
+        )
+        ctx = _make_ctx(
+            args=args,
+            drivers=["FLEX_IO"],
+            final_environment="teensy41",
+        )
+        with patch(
+            f"{_PATCH_MOD}.run_gpio_pretest",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            rc = asyncio.run(_run_schema_and_pin_setup(ctx))
+        assert rc is None
+        assert ctx.effective_tx_pin == 22
+        assert ctx.effective_rx_pin == 8
+        assert ctx.json_rpc_commands[0] == {
+            "method": "setPins",
+            "params": [{"txPin": 22, "rxPin": 8}],
+        }
+
+    def test_esp32p4_default_pins_match_firmware(self) -> None:
+        args = _make_args(skip_schema=True)
+        ctx = _make_ctx(args=args, final_environment="esp32p4")
+        with patch(
+            f"{_PATCH_MOD}.run_gpio_pretest",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            rc = asyncio.run(_run_schema_and_pin_setup(ctx))
+        assert rc is None
+        assert ctx.effective_tx_pin == 5
+        assert ctx.effective_rx_pin == 6
+        assert ctx.json_rpc_commands[0] == {
+            "method": "setPins",
+            "params": [{"txPin": 5, "rxPin": 6}],
+        }
+
+    def test_teensy_cli_half_override_uses_firmware_default_complement(self) -> None:
+        args = _make_args(tx_pin=22, skip_schema=True)
+        ctx = _make_ctx(args=args, final_environment="teensy41")
+        with patch(
+            f"{_PATCH_MOD}.run_gpio_pretest",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            rc = asyncio.run(_run_schema_and_pin_setup(ctx))
+        assert rc is None
+        assert ctx.effective_tx_pin == 22
+        assert ctx.effective_rx_pin == 2
+        assert ctx.json_rpc_commands[0] == {
+            "method": "setPins",
+            "params": [{"txPin": 22, "rxPin": 2}],
+        }
 
     def test_gpio_pretest_failure(self) -> None:
         args = _make_args(skip_schema=True)
@@ -632,12 +2272,48 @@ class TestRunSchemaAndPinSetup:
         assert ctx.effective_tx_pin is None
         assert ctx.effective_rx_pin is None
 
+    def test_perf_wave2d_skips_all_pin_setup(self) -> None:
+        args = _make_args(skip_schema=True, parlio=False, perf_wave2d="32x32")
+        ctx = _make_ctx(
+            args=args,
+            drivers=[],
+            json_rpc_commands=[],
+            perf_wave2d_grid=(32, 32),
+        )
+        with patch(
+            f"{_PATCH_MOD}.run_gpio_pretest",
+            new_callable=AsyncMock,
+        ) as pretest:
+            rc = asyncio.run(_run_schema_and_pin_setup(ctx))
+        assert rc is None
+        assert ctx.effective_tx_pin is None
+        assert ctx.effective_rx_pin is None
+        assert ctx.json_rpc_commands == []
+        pretest.assert_not_awaited()
+
+    def test_lpc_fbuild_uses_pyserial_for_rpc(self) -> None:
+        args = _make_args(skip_schema=True)
+        ctx = _make_ctx(
+            args=args,
+            final_environment="lpc845brk",
+            use_fbuild=True,
+        )
+        mock_serial = MagicMock()
+        with patch(
+            "ci.util.serial_interface.create_serial_interface",
+            return_value=mock_serial,
+        ) as create_serial:
+            rc = asyncio.run(_run_schema_and_pin_setup(ctx))
+        assert rc is None
+        assert ctx.serial_iface is mock_serial
+        create_serial.assert_called_once_with(port="COM5", use_pyserial=True)
+
     def test_auto_discover_pins_success(self) -> None:
         args = _make_args(auto_discover_pins=True, skip_schema=True)
         ctx = _make_ctx(args=args)
         mock_discovery = MagicMock(success=True, tx_pin=5, rx_pin=6, client=AsyncMock())
         with patch(
-            f"{_PATCH_MOD}.run_pin_discovery",
+            f"{_PATCH_MOD}.run_pin_discovery_segmented",
             new_callable=AsyncMock,
             return_value=mock_discovery,
         ):
@@ -647,6 +2323,39 @@ class TestRunSchemaAndPinSetup:
         assert ctx.effective_rx_pin == 6
         assert ctx.discovery_client is not None
         assert ctx.pins_discovered is True
+        assert ctx.json_rpc_commands[0] == {
+            "method": "setPins",
+            "params": [{"txPin": 5, "rxPin": 6}],
+        }
+
+    def test_auto_discover_pins_failure_uses_platform_defaults(self) -> None:
+        args = _make_args(auto_discover_pins=True, skip_schema=True)
+        ctx = _make_ctx(args=args, final_environment="esp32p4")
+        mock_client = AsyncMock()
+        mock_discovery = MagicMock(
+            success=False, tx_pin=None, rx_pin=None, client=mock_client
+        )
+        with (
+            patch(
+                f"{_PATCH_MOD}.run_pin_discovery_segmented",
+                new_callable=AsyncMock,
+                return_value=mock_discovery,
+            ),
+            patch(
+                f"{_PATCH_MOD}.run_gpio_pretest",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            rc = asyncio.run(_run_schema_and_pin_setup(ctx))
+        assert rc is None
+        assert ctx.effective_tx_pin == 5
+        assert ctx.effective_rx_pin == 6
+        assert ctx.json_rpc_commands[0] == {
+            "method": "setPins",
+            "params": [{"txPin": 5, "rxPin": 6}],
+        }
+        mock_client.close.assert_awaited_once()
 
 
 # ============================================================
@@ -662,6 +2371,59 @@ class TestRunTestsOrSpecialMode:
         qctx = QuietContext(quiet=False)
         rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
         assert rc == 0
+
+    def test_rp_spi_loopback_delegates_on_rp2040(self) -> None:
+        ctx = _make_ctx(
+            args=_make_args(parlio=False, rp_spi_loopback=True),
+            drivers=[],
+            gpio_only_mode=False,
+            final_environment="rp2040",
+        )
+        qctx = QuietContext(quiet=False)
+        with patch(
+            f"{_PATCH_MOD}._run_rp_spi_loopback_tests",
+            new_callable=AsyncMock,
+            return_value=0,
+        ) as loopback:
+            rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
+        assert rc == 0
+        loopback.assert_awaited_once_with(ctx)
+
+    @pytest.mark.parametrize("environment", ("rp2350", "rp2350w", "rpipico2w"))
+    def test_rp_spi_loopback_runs_on_rp2350_aliases(self, environment: str) -> None:
+        ctx = _make_ctx(
+            args=_make_args(parlio=False, rp_spi_loopback=True),
+            drivers=[],
+            gpio_only_mode=False,
+            final_environment=environment,
+            upload_port="COM17",
+        )
+        completed = MagicMock(returncode=0)
+        with patch(f"{_PATCH_MOD}.RunningProcess.run", return_value=completed) as run:
+            rc = asyncio.run(_run_rp_spi_loopback_tests(ctx))
+        assert rc == 0
+        command = run.call_args.args[0]
+        assert command[:4] == ["uv", "run", "python", "-m"]
+        assert command[4] == "ci.autoresearch.test_rp_spi_loopback"
+        assert run.call_args.kwargs == {"check": False, "timeout": 60.0}
+
+    @pytest.mark.parametrize("environment", ("rp2350", "rp2350w", "rpipico2w"))
+    def test_rp_spi_public_api_runs_on_rp2350_aliases(self, environment: str) -> None:
+        ctx = _make_ctx(
+            args=_make_args(parlio=False, rp_spi_public_api=True),
+            drivers=[],
+            gpio_only_mode=False,
+            final_environment=environment,
+            upload_port="COM17",
+        )
+        completed = MagicMock(returncode=0)
+        with patch(f"{_PATCH_MOD}.RunningProcess.run", return_value=completed) as run:
+            rc = asyncio.run(_run_rp_spi_public_api_tests(ctx))
+        assert rc == 0
+        command = run.call_args.args[0]
+        assert command[:4] == ["uv", "run", "python", "-m"]
+        assert command[4] == "ci.autoresearch.test_rp_spi_public_api"
+        assert run.call_args.kwargs == {"check": False, "timeout": 60.0}
 
     def test_simd_mode_pass(self) -> None:
         ctx = _make_ctx(simd_test_mode=True)
@@ -690,6 +2452,468 @@ class TestRunTestsOrSpecialMode:
         with patch(f"{_PATCH_MOD}.RpcClient", return_value=mock_client):
             rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
         assert rc == 0
+
+    def test_rpc_smoke_mode_validates_core_surface(self) -> None:
+        ctx = _make_ctx(rpc_smoke_mode=True, final_environment="rp2350w")
+        qctx = QuietContext(quiet=False)
+        expected_payload = {
+            "text": "rp2350w-rpc-smoke",
+            "number": 2350,
+            "nested": {"ok": True, "values": [1, 2, 3]},
+        }
+
+        required_methods = [
+            "help",
+            "ping",
+            "debugTest",
+            "status",
+            "drivers",
+            "testNoSerial",
+            "testRpConcurrency",
+            "testRpPioContention",
+            "testRpPioParallelResources",
+        ]
+
+        def response(data):
+            item = MagicMock()
+            item.success = True
+            item.data = data
+            return item
+
+        mock_client = AsyncMock()
+        mock_client.send = AsyncMock(
+            side_effect=[
+                response({"schema": [[name] for name in required_methods]}),
+                response(
+                    {
+                        "success": True,
+                        "functions": [
+                            {"name": name}
+                            for name in ["rpc.discover", *required_methods]
+                        ],
+                    }
+                ),
+                response({"uptimeMs": 1}),
+                response({"uptimeMs": 2}),
+                response({"received": expected_payload}),
+                response(
+                    {
+                        "ready": True,
+                        "platform": "Raspberry Pi Pico 2 W (RP2350)",
+                        "rpcReady": True,
+                        "ledRxAvailable": False,
+                    }
+                ),
+                response([]),
+                response(
+                    {
+                        "success": True,
+                        "message": "RPC works from task context",
+                        "serial_safe": False,
+                    }
+                ),
+                response(
+                    {
+                        "success": True,
+                        "supported": True,
+                        "backend": "pico-sdk-mutex+arduino-core1",
+                        "core1Ready": True,
+                        "core1Done": True,
+                        "recursiveMutexReady": True,
+                        "expected": 2000,
+                        "actual": 2000,
+                    }
+                ),
+                response(
+                    {
+                        "success": True,
+                        "noLeak": True,
+                        "control": {
+                            "proxyValid": True,
+                            "claimedOne": True,
+                            "released": True,
+                        },
+                        "contention": {
+                            "starvedSms": 10,
+                            "freeAfterStarve": 0,
+                            "claimsIntact": True,
+                            "noTheft": True,
+                            "survivedShow": True,
+                        },
+                    }
+                ),
+                response(
+                    {
+                        "success": True,
+                        "collisionFree": True,
+                        "showsCompleted": True,
+                        "noResidueBetweenFrames": True,
+                        "noLeak": True,
+                    }
+                ),
+                RpcError(
+                    "Method not found",
+                    code=-32601,
+                    data={"method": "__autoresearch_missing_method__"},
+                ),
+            ]
+        )
+        mock_client.connect = AsyncMock()
+        mock_client.drain_boot_output = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        with patch(f"{_PATCH_MOD}.RpcClient", return_value=mock_client):
+            rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
+
+        assert rc == 0
+        assert mock_client.send.await_count == 12
+        debug_test_call = mock_client.send.await_args_list[4]
+        assert debug_test_call.args == ("debugTest",)
+        assert debug_test_call.kwargs["args"] == expected_payload
+
+    def test_rpc_smoke_rejects_missing_required_discovery_method(self) -> None:
+        ctx = _make_ctx(rpc_smoke_mode=True, final_environment="rp2350w")
+        qctx = QuietContext(quiet=False)
+
+        def response(data):
+            item = MagicMock()
+            item.success = True
+            item.data = data
+            return item
+
+        mock_client = AsyncMock()
+        mock_client.send = AsyncMock(
+            return_value=response({"schema": [["ping"], ["status"]]})
+        )
+        mock_client.connect = AsyncMock()
+        mock_client.drain_boot_output = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        with patch(f"{_PATCH_MOD}.RpcClient", return_value=mock_client):
+            rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
+
+        assert rc == 1
+
+    def test_rpc_smoke_non_rp_target_skips_rp_concurrency(self) -> None:
+        ctx = _make_ctx(rpc_smoke_mode=True, final_environment="esp32s3")
+        qctx = QuietContext(quiet=False)
+        required_methods = [
+            "help",
+            "ping",
+            "debugTest",
+            "status",
+            "drivers",
+            "testNoSerial",
+        ]
+
+        def response(data):
+            item = MagicMock()
+            item.success = True
+            item.data = data
+            return item
+
+        payload = {
+            "text": "rp2040-rpc-smoke",
+            "number": 2040,
+            "nested": {"ok": True, "values": [1, 2, 3]},
+        }
+        mock_client = AsyncMock()
+        mock_client.send = AsyncMock(
+            side_effect=[
+                response({"schema": [[name] for name in required_methods]}),
+                response(
+                    {
+                        "functions": [
+                            {"name": name}
+                            for name in ["rpc.discover", *required_methods]
+                        ]
+                    }
+                ),
+                response({"uptimeMs": 1}),
+                response({"uptimeMs": 2}),
+                response({"received": payload}),
+                response(
+                    {
+                        "ready": True,
+                        "platform": "ESP32-S3",
+                        "rpcReady": True,
+                        "ledRxAvailable": False,
+                    }
+                ),
+                response([]),
+                response(
+                    {
+                        "success": True,
+                        "message": "RPC works from task context",
+                        "serial_safe": False,
+                    }
+                ),
+                RpcError("Method not found", code=-32601),
+            ]
+        )
+        mock_client.connect = AsyncMock()
+        mock_client.drain_boot_output = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        with patch(f"{_PATCH_MOD}.RpcClient", return_value=mock_client):
+            rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
+
+        assert rc == 0
+        assert mock_client.send.await_count == 9
+        assert all(
+            call.args[0] != "testRpConcurrency"
+            for call in mock_client.send.await_args_list
+        )
+
+    def test_rpc_smoke_rejects_timeout_for_unknown_method(self) -> None:
+        ctx = _make_ctx(rpc_smoke_mode=True, final_environment="rp2350w")
+        qctx = QuietContext(quiet=False)
+        methods = [
+            "help",
+            "ping",
+            "debugTest",
+            "status",
+            "drivers",
+            "testNoSerial",
+            "testRpConcurrency",
+            "testRpPioContention",
+            "testRpPioParallelResources",
+        ]
+
+        def response(data):
+            item = MagicMock()
+            item.success = True
+            item.data = data
+            return item
+
+        payload = {
+            "text": "rp2350w-rpc-smoke",
+            "number": 2350,
+            "nested": {"ok": True, "values": [1, 2, 3]},
+        }
+        mock_client = AsyncMock()
+        mock_client.send = AsyncMock(
+            side_effect=[
+                response({"schema": [[name] for name in methods]}),
+                response(
+                    {
+                        "functions": [
+                            {"name": name} for name in ["rpc.discover", *methods]
+                        ]
+                    }
+                ),
+                response({"uptimeMs": 1}),
+                response({"uptimeMs": 2}),
+                response({"received": payload}),
+                response(
+                    {
+                        "ready": True,
+                        "platform": "Raspberry Pi Pico 2 W (RP2350)",
+                        "rpcReady": True,
+                        "ledRxAvailable": False,
+                    }
+                ),
+                response([]),
+                response(
+                    {
+                        "success": True,
+                        "message": "RPC works from task context",
+                        "serial_safe": False,
+                    }
+                ),
+                response(
+                    {
+                        "success": True,
+                        "supported": True,
+                        "core1Ready": True,
+                        "core1Done": True,
+                        "recursiveMutexReady": True,
+                        "expected": 2000,
+                        "actual": 2000,
+                    }
+                ),
+                response(
+                    {
+                        "success": True,
+                        "noLeak": True,
+                        "control": {
+                            "proxyValid": True,
+                            "claimedOne": True,
+                            "released": True,
+                        },
+                        "contention": {
+                            "starvedSms": 10,
+                            "freeAfterStarve": 0,
+                            "claimsIntact": True,
+                            "noTheft": True,
+                            "survivedShow": True,
+                        },
+                    }
+                ),
+                response(
+                    {
+                        "success": True,
+                        "collisionFree": True,
+                        "showsCompleted": True,
+                        "noResidueBetweenFrames": True,
+                        "noLeak": True,
+                    }
+                ),
+                RpcTimeoutError("missing method timed out"),
+            ]
+        )
+        mock_client.connect = AsyncMock()
+        mock_client.drain_boot_output = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        with patch(f"{_PATCH_MOD}.RpcClient", return_value=mock_client):
+            rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
+
+        assert rc == 1
+        assert mock_client.send.await_count == 12
+
+    def test_rp_coroutine_mode_reports_null_backend_as_unsupported(self) -> None:
+        ctx = _make_ctx(
+            coroutine_test_mode=True,
+            final_environment="rp2350w",
+        )
+        qctx = QuietContext(quiet=False)
+
+        response = MagicMock()
+        response.get = lambda key, default=None: {
+            "success": False,
+            "supported": False,
+            "backend": "null",
+            "reason": "RP2xxx currently selects the generic Arduino null coroutine backend",
+            "passed": 0,
+        }.get(key, default)
+
+        mock_client = AsyncMock()
+        mock_client.send_and_match = AsyncMock(return_value=response)
+        mock_client.connect = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        with patch(f"{_PATCH_MOD}.RpcClient", return_value=mock_client):
+            rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
+
+        # This asserted 0 until FastLED#3832: a null backend runs no coroutine
+        # test, so exiting 0 recorded a passing criterion on the strength of
+        # nothing having run. The code must reach the caller intact, which is
+        # what this end-to-end path proves that the unit test of
+        # coroutine_exit_code cannot.
+        assert rc == kCoroutineUnsupportedExit
+        assert rc != 0
+
+    def test_rp2350_watchdog_reacquires_active_environment_and_device(self) -> None:
+        ctx = _make_ctx(
+            final_environment="rp2350w",
+            upload_port="COM17",
+            use_fbuild=True,
+            watchdog_soak_mode=True,
+        )
+
+        def response(data):
+            item = MagicMock()
+            item.success = True
+            item.data = data
+            return item
+
+        initial_client = AsyncMock()
+        initial_client.send = AsyncMock(
+            side_effect=[
+                response({"uptimeMs": 100}),
+                response({"success": True}),
+            ]
+        )
+        recovery_client = AsyncMock()
+        recovery_client.send = AsyncMock(
+            return_value=response({"uptimeMs": 1, "lastResetWasWatchdog": True})
+        )
+        detected = MagicMock(selected_port="COM18")
+
+        with (
+            patch(
+                "ci.util.serial_interface.create_serial_interface",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{_PATCH_MOD}.RpcClient",
+                side_effect=[initial_client, recovery_client],
+            ),
+            patch(f"{_PATCH_MOD}.port_exists", return_value=False),
+            patch(
+                f"{_PATCH_MOD}.get_port_serial_number",
+                return_value="2DCB876B587EA334",
+            ),
+            patch(
+                f"{_PATCH_MOD}.auto_detect_upload_port", return_value=detected
+            ) as auto_detect,
+            patch(
+                f"{_PATCH_MOD}._run_rpc_smoke_tests",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+        ):
+            rc = asyncio.run(_run_watchdog_soak(ctx))
+
+        assert rc == 0
+        assert ctx.upload_port == "COM18"
+        auto_detect.assert_called_once_with(
+            "rp2350w", expected_serial_number="2DCB876B587EA334"
+        )
+
+    def test_rp2350_watchdog_rejects_reenumeration_without_watchdog_reset(self) -> None:
+        ctx = _make_ctx(
+            final_environment="rp2350w",
+            upload_port="COM17",
+            use_fbuild=True,
+            watchdog_soak_mode=True,
+        )
+
+        def response(data):
+            item = MagicMock()
+            item.success = True
+            item.data = data
+            return item
+
+        initial_client = AsyncMock()
+        initial_client.send = AsyncMock(
+            side_effect=[
+                response({"uptimeMs": 100}),
+                response({"success": True}),
+            ]
+        )
+        recovery_client = AsyncMock()
+        recovery_client.send = AsyncMock(
+            return_value=response({"uptimeMs": 1, "lastResetWasWatchdog": False})
+        )
+        detected = MagicMock(selected_port="COM18")
+
+        with (
+            patch(
+                "ci.util.serial_interface.create_serial_interface",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{_PATCH_MOD}.RpcClient",
+                side_effect=[initial_client, recovery_client],
+            ),
+            patch(f"{_PATCH_MOD}.port_exists", return_value=False),
+            patch(
+                f"{_PATCH_MOD}.get_port_serial_number",
+                return_value="2DCB876B587EA334",
+            ),
+            patch(f"{_PATCH_MOD}.auto_detect_upload_port", return_value=detected),
+            patch(
+                f"{_PATCH_MOD}._run_rpc_smoke_tests",
+                new_callable=AsyncMock,
+                return_value=0,
+            ) as rpc_smoke,
+        ):
+            rc = asyncio.run(_run_watchdog_soak(ctx))
+
+        assert rc == 1
+        rpc_smoke.assert_not_awaited()
 
     def test_ble_mode_delegates(self) -> None:
         ctx = _make_ctx(ble_mode=True)
@@ -745,8 +2969,26 @@ class TestRunTestsOrSpecialMode:
             rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
         assert rc == 0
 
-    def test_rpc_test_failure(self) -> None:
-        ctx = _make_ctx()
+    def test_rpc_test_failure_surfaces_rp_uart_diagnostics(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ctx = _make_ctx(
+            args=_make_args(parlio=False, uart=True),
+            drivers=["UART0"],
+            json_rpc_commands=[
+                {
+                    "method": "runSingleTest",
+                    "params": {
+                        "driver": "UART0",
+                        "laneSizes": [100],
+                        "pattern": "MSB_LSB_A",
+                        "iterations": 1,
+                        "timing": "WS2812B-V5",
+                    },
+                }
+            ],
+            final_environment="rp2350w",
+        )
         qctx = QuietContext(quiet=False)
 
         mock_client = AsyncMock()
@@ -754,10 +2996,17 @@ class TestRunTestsOrSpecialMode:
         mock_response.data = {
             "success": True,
             "passed": False,
-            "driver": "PARLIO",
+            "driver": "UART0",
             "laneCount": 1,
             "laneSizes": [100],
             "duration_ms": 42,
+            "totalTests": 1,
+            "passedTests": 0,
+            "rpUartStartAttempted": True,
+            "rpUartStartSucceeded": False,
+            "rpUartEncodedSize": 0,
+            "rpUartActualBaud": 0,
+            "rpUartLastError": "RP UART: peripheral configure failed",
         }
         mock_client.send = AsyncMock(return_value=mock_response)
         mock_client.connect = AsyncMock()
@@ -770,6 +3019,77 @@ class TestRunTestsOrSpecialMode:
         ):
             rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
         assert rc == 1
+        output = capsys.readouterr().out
+        assert "RP UART:" in output
+        assert "attempted=True" in output
+        assert "started=False" in output
+        assert "encodedBytes=0" in output
+        assert "actualBaud=0" in output
+        assert "lastError='RP UART: peripheral configure failed'" in output
+
+    def test_rpc_control_success_without_passed_field(self) -> None:
+        ctx = _make_ctx()
+        ctx.json_rpc_commands.insert(
+            0, {"method": "setPins", "params": [{"txPin": 8, "rxPin": 9}]}
+        )
+        qctx = QuietContext(quiet=False)
+
+        mock_client = AsyncMock()
+        set_pins_response = MagicMock()
+        set_pins_response.data = {
+            "success": True,
+            "txPin": 8,
+            "rxPin": 9,
+            "rxChannelRecreated": True,
+        }
+        driver_response = MagicMock()
+        driver_response.data = {
+            "success": True,
+            "passed": True,
+            "driver": "PARLIO",
+            "laneCount": 1,
+            "laneSizes": [100],
+            "duration_ms": 42,
+            "passedTests": 1,
+            "totalTests": 1,
+        }
+        mock_client.send = AsyncMock(side_effect=[set_pins_response, driver_response])
+        mock_client.connect = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        with (
+            patch(f"{_PATCH_MOD}.RpcClient", return_value=mock_client),
+            patch(f"{_PATCH_MOD}.kill_port_users"),
+            patch("time.sleep"),
+        ):
+            rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
+        assert rc == 0
+
+    def test_rpc_control_error_without_success_false_stops_run(self) -> None:
+        ctx = _make_ctx()
+        ctx.json_rpc_commands.insert(
+            0, {"method": "setPins", "params": [{"txPin": 8, "rxPin": 9}]}
+        )
+        qctx = QuietContext(quiet=False)
+
+        mock_client = AsyncMock()
+        set_pins_response = MagicMock()
+        set_pins_response.data = {
+            "error": "RxChannelCreationFailed",
+            "message": "Failed to create RX channel",
+        }
+        mock_client.send = AsyncMock(return_value=set_pins_response)
+        mock_client.connect = AsyncMock()
+        mock_client.close = AsyncMock()
+
+        with (
+            patch(f"{_PATCH_MOD}.RpcClient", return_value=mock_client),
+            patch(f"{_PATCH_MOD}.kill_port_users"),
+            patch("time.sleep"),
+        ):
+            rc = asyncio.run(_run_tests_or_special_mode(ctx, qctx))
+        assert rc == 1
+        assert mock_client.send.await_count == 1
 
     def test_discovery_client_reuse(self) -> None:
         """Verify that discovery_client is reused instead of creating a new one."""
@@ -800,3 +3120,349 @@ class TestRunTestsOrSpecialMode:
             mock_rpc_cls.assert_not_called()
         assert rc == 0
         mock_discovery.close.assert_called_once()
+
+    def test_all_plus_bitbang_keeps_the_explicit_driver(
+        self, fake_project_dir: Path
+    ) -> None:
+        """`--all --bitbang` must not silently drop the explicit request.
+
+        The args.all branch replaces the driver selection wholesale, so an
+        explicitly requested BIT_BANG used to vanish. It is appended rather
+        than folded into the curated --all sets, which name each platform's
+        real transmit engines.
+        """
+        args = _make_args(
+            all=True,
+            bitbang=True,
+            parlio=False,
+            environment_positional="teensy40",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+        assert result.drivers == ["OBJECT_FLED", "FLEX_IO", "BIT_BANG"]
+
+    def test_legacy_rejects_chipsets_without_a_legacy_template(
+        self, fake_project_dir: Path
+    ) -> None:
+        """--legacy silently ignores timing_name, so guard the combination.
+
+        The legacy path resolves timing from a LegacyClocklessChipset template.
+        A chipset with no template (ucs7604, ws2811-400) would run as WS2812B
+        and report a pass for timing that was never applied.
+        """
+        for chipset in ("ucs7604", "ws2811-400"):
+            args = _make_args(
+                legacy=True,
+                chipset=chipset,
+                flex_io=True,
+                parlio=False,
+                environment_positional="teensy40",
+                project_dir=fake_project_dir,
+            )
+            with patch(
+                "ci.autoresearch.staging.synthesise_autoresearch_project",
+                return_value=fake_project_dir,
+            ):
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    result = _parse_args_and_build_commands(args)
+            assert result == 1, chipset
+            # Assert on the reason, not just the code, so the test cannot pass
+            # on an unrelated rejection.
+            assert "has no legacy template" in buffer.getvalue(), chipset
+
+    def test_non_legacy_still_accepts_those_chipsets(
+        self, fake_project_dir: Path
+    ) -> None:
+        """The guard must not block them outside legacy mode."""
+        args = _make_args(
+            legacy=False,
+            chipset="ws2811-400",
+            flex_io=True,
+            parlio=False,
+            environment_positional="teensy40",
+            project_dir=fake_project_dir,
+        )
+        with patch(
+            "ci.autoresearch.staging.synthesise_autoresearch_project",
+            return_value=fake_project_dir,
+        ):
+            result = _parse_args_and_build_commands(args)
+        assert isinstance(result, RunContext)
+
+
+def test_spi_family_predicate_covers_every_platform_spelling() -> None:
+    """The two-frame SPI default must not skip RP's concrete block names.
+
+    RP registers "SPI0"/"SPI1" rather than the portable "SPI", so keying the
+    frame default off the bare literal silently gave RP SPI one frame and
+    dropped the #2254/#2288 second-frame degradation check.
+    """
+    from ci.autoresearch.phases import _is_spi_family_driver
+
+    for name in ("SPI", "SPI_UNIFIED", "SPI0", "SPI1"):
+        assert _is_spi_family_driver(name), name
+
+    for name in ("PARLIO", "RMT", "UART", "UART0", "LCD_SPI", "I2S_SPI", "SPIX", ""):
+        assert not _is_spi_family_driver(name), name
+
+
+def test_parallel_validator_rejects_an_oversized_request_error() -> None:
+    """An InvalidArgs refusal is a refusal, not a pass.
+
+    runRpPioParallelResources bounds numLeds and iterations and answers
+    oversized requests with success=False and error="InvalidArgs" rather than
+    allocating. The host validator must not be loosened into treating that
+    error envelope as a result -- a rejected request has proven nothing about
+    PIO0+PIO1 resource behaviour.
+    """
+    refusal = {
+        "success": False,
+        "error": "InvalidArgs",
+        "maxNumLeds": 2000,
+        "maxIterations": 256,
+    }
+    assert not _is_valid_rp_pio_parallel_result(refusal)
+
+    # And the same envelope carrying the resource flags must still fail: the
+    # flags are meaningless when the request was never run.
+    refusal_with_flags = dict(refusal)
+    refusal_with_flags.update(
+        {
+            "collisionFree": True,
+            "showsCompleted": True,
+            "noResidueBetweenFrames": True,
+            "noLeak": True,
+        }
+    )
+    assert not _is_valid_rp_pio_parallel_result(refusal_with_flags)
+
+
+def test_coroutine_unsupported_is_not_reported_as_a_pass() -> None:
+    """A device with no coroutine backend must not exit 0.
+
+    RP2xxx selects the generic Arduino null coroutine backend, so
+    `bash autoresearch rp2350 --coroutine` runs zero tests and the device
+    answers `supported=False`. That used to return 0, which recorded a
+    passing coroutine criterion in FastLED#3832 on the strength of no test
+    having run -- and made a genuine regression in a real backend
+    indistinguishable from the absent one.
+
+    The three outcomes must stay three distinct codes.
+    """
+    unsupported = coroutine_exit_code({"supported": False, "backend": "null"})
+    assert unsupported != 0, "an absent capability is not a pass"
+
+    failed = coroutine_exit_code({"supported": True, "success": False})
+    assert failed != 0
+
+    # Distinct from each other too: "nothing ran" and "something broke" are
+    # different findings, and a caller must be able to tell them apart.
+    assert unsupported != failed
+
+    passed = coroutine_exit_code({"supported": True, "success": True})
+    assert passed == 0
+
+
+def test_coroutine_exit_code_defaults_trust_older_firmware() -> None:
+    """Omitted keys read as the optimistic value, not as breakage.
+
+    Firmware predating the `supported` flag answers with neither key. Such a
+    response that also reports `success` is a real pass and must stay one;
+    absent `success` is a failure, matching what the caller printed before
+    this mapping was extracted.
+    """
+    assert coroutine_exit_code({"success": True}) == 0
+    assert coroutine_exit_code({}) == 1
+
+
+def test_lpc_rx_defines_per_mode():
+    """DMA loopback builds drop pinToggleRx unless it is requested too."""
+    assert _lpc_rx_defines(_make_args(pin_toggle_rx=True)) == ["FASTLED_LPC_RX_SCT=1"]
+    assert _lpc_rx_defines(_make_args(ws2812_loopback=True)) == [
+        "FASTLED_LPC_RX_SCT_DMA=1",
+        "FASTLED_AUTORESEARCH_LPC_DMA_LOOPBACK=1",
+        "FL_LPC_RX_SCT_DMA_RING_WORDS=128",
+    ]
+    assert _lpc_rx_defines(_make_args(ws2812_loopback=True, pin_toggle_rx=True)) == [
+        "FASTLED_LPC_RX_SCT=1",
+        "FASTLED_LPC_RX_SCT_DMA=1",
+        "FL_LPC_RX_SCT_DMA_RING_WORDS=128",
+    ]
+    assert _lpc_rx_defines(_make_args()) == []
+
+
+@pytest.mark.parametrize(
+    "bench",
+    [
+        _run_lpc_pin_toggle_rx_tests,
+        _run_lpc_ws2812_loopback_tests,
+        _run_lpc_pwm_dma_cl_tests,
+        _run_lpc_dma_spi_tests,
+    ],
+)
+def test_lpc_subprocess_benches_release_the_harness_port(bench):
+    """FastLED#4207: the child's RPC client is inert while the harness still
+    holds the port, so each LPC bench must release it before spawning."""
+    iface = MagicMock()
+    iface.close = AsyncMock()
+    ctx = _make_ctx(
+        args=_make_args(parlio=False),
+        drivers=[],
+        gpio_only_mode=False,
+        final_environment="lpc845",
+        upload_port="/dev/ttyACM3",
+        serial_iface=iface,
+    )
+    seen_open_iface = []
+
+    def fake_run(*_a, **_k):
+        seen_open_iface.append(ctx.serial_iface)
+        return MagicMock(returncode=0)
+
+    with patch(f"{_PATCH_MOD}.RunningProcess.run", side_effect=fake_run):
+        asyncio.run(bench(ctx))
+    iface.close.assert_awaited_once()
+    assert seen_open_iface == [None]
+
+
+def _single(driver: str) -> dict[str, Any]:
+    return {"method": "runSingleTest", "params": {"driver": driver, "laneSizes": [100]}}
+
+
+def test_prune_unavailable_drivers_drops_drivers_the_device_lacks():
+    """`--all` on an ESP32-C6 must not send LCD/Teensy drivers it never registers."""
+    ctx = _make_ctx(
+        drivers=["PARLIO", "RMT", "LCD_RGB", "OBJECT_FLED"],
+        json_rpc_commands=[
+            {"method": "setLaneSizes", "params": [100]},
+            _single("PARLIO"),
+            _single("RMT"),
+            _single("LCD_RGB"),
+            _single("OBJECT_FLED"),
+        ],
+    )
+
+    skipped = _prune_unavailable_drivers(ctx, {"PARLIO", "RMT", "SPI", "UART"})
+
+    assert skipped == ["LCD_RGB", "OBJECT_FLED"]
+    assert ctx.drivers == ["PARLIO", "RMT"]
+    assert [c["method"] for c in ctx.json_rpc_commands] == [
+        "setLaneSizes",
+        "runSingleTest",
+        "runSingleTest",
+    ]
+    assert [c["params"]["driver"] for c in ctx.json_rpc_commands[1:]] == [
+        "PARLIO",
+        "RMT",
+    ]
+
+
+def test_prune_unavailable_drivers_filters_parallel_entries():
+    ctx = _make_ctx(
+        drivers=["PARLIO", "RMT", "LCD_RGB"],
+        json_rpc_commands=[
+            {
+                "method": "runParallelTest",
+                "params": {
+                    "drivers": [
+                        {"driver": "PARLIO", "laneSizes": [100]},
+                        {"driver": "RMT", "laneSizes": [100]},
+                        {"driver": "LCD_RGB", "laneSizes": [100]},
+                    ]
+                },
+            }
+        ],
+    )
+
+    assert _prune_unavailable_drivers(ctx, {"PARLIO", "RMT"}) == ["LCD_RGB"]
+    assert ctx.json_rpc_commands[0]["params"]["drivers"] == [
+        {"driver": "PARLIO", "laneSizes": [100]},
+        {"driver": "RMT", "laneSizes": [100]},
+    ]
+
+
+def test_prune_unavailable_drivers_drops_parallel_tests_left_with_one_driver():
+    """The firmware rejects runParallelTest with fewer than two drivers."""
+    ctx = _make_ctx(
+        drivers=["OBJECT_FLED", "FLEX_IO"],
+        json_rpc_commands=[
+            {
+                "method": "runParallelTest",
+                "params": {
+                    "drivers": [
+                        {"driver": "OBJECT_FLED", "laneSizes": [100]},
+                        {"driver": "FLEX_IO", "laneSizes": [100]},
+                    ]
+                },
+            }
+        ],
+    )
+
+    assert _prune_unavailable_drivers(ctx, {"OBJECT_FLED"}) == ["FLEX_IO"]
+    assert ctx.json_rpc_commands == []
+
+
+def _drivers_client(result: Any = None, error: Exception | None = None) -> MagicMock:
+    client = MagicMock()
+    if error is not None:
+        client.send = AsyncMock(side_effect=error)
+    else:
+        client.send = AsyncMock(return_value=MagicMock(data=result))
+    return client
+
+
+def test_prune_to_device_drivers_reports_timeout_as_test_failure(capsys):
+    """A `drivers` preflight timeout is classified like a test-loop timeout."""
+    ctx = _make_ctx(args=_make_args(all=True))
+    qctx = QuietContext(quiet=False)
+
+    ok = asyncio.run(
+        _prune_to_device_drivers(ctx, _drivers_client(error=RpcTimeoutError("x")), qctx)
+    )
+
+    assert ok is False
+    assert "FAILURE class=timeout method=drivers" in capsys.readouterr().out
+
+
+def test_prune_to_device_drivers_fails_when_nothing_is_runnable(capsys):
+    ctx = _make_ctx(args=_make_args(all=True))  # one PARLIO runSingleTest
+
+    ok = asyncio.run(
+        _prune_to_device_drivers(
+            ctx, _drivers_client(result=[{"name": "RMT"}]), QuietContext(quiet=False)
+        )
+    )
+
+    assert ok is False
+    assert ctx.json_rpc_commands == []
+    assert "FAILURE class=no_runnable_driver" in capsys.readouterr().out
+
+
+def test_prune_to_device_drivers_keeps_registered_drivers():
+    ctx = _make_ctx(args=_make_args(all=True))
+
+    ok = asyncio.run(
+        _prune_to_device_drivers(
+            ctx, _drivers_client(result=[{"name": "PARLIO"}]), QuietContext(quiet=False)
+        )
+    )
+
+    assert ok is True
+    assert ctx.drivers == ["PARLIO"]
+
+
+def test_prune_to_device_drivers_reports_malformed_response(capsys):
+    ctx = _make_ctx(args=_make_args(all=True))
+    ok = asyncio.run(
+        _prune_to_device_drivers(
+            ctx, _drivers_client(result={"not": "a list"}), QuietContext(quiet=False)
+        )
+    )
+    assert ok is False
+    assert "FAILURE class=malformed_response method=drivers" in capsys.readouterr().out

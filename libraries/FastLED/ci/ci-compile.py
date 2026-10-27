@@ -5,24 +5,16 @@ from __future__ import annotations
 """
 FastLED Example Compiler
 
-Streamlined compiler that uses the PioCompiler to build FastLED examples for various boards.
-This replaces the previous complex compilation system with a simpler approach using the Pio compiler.
+Builds FastLED examples for boards through ``BoardCompiler`` (fbuild).
 
-ESP32 QEMU Support:
--------------------
-When using -o/--out with ESP32 boards and a directory path or filename containing "qemu",
-the compiler automatically generates properly merged flash images for QEMU testing.
-The merged flash image includes:
-  - Bootloader at 0x1000 (ESP32) or 0x0 (ESP32-C3/S3)
-  - Partition table at 0x8000
-  - boot_app0 at 0xe000
-  - Application firmware at 0x10000
-
-Uses esptool.py when available, falls back to manual binary merge if not installed.
+ESP32 QEMU builds use ``ci/stage_fbuild_project.py`` followed by fbuild's
+native ``test-emu`` command. This compiler does not assemble emulator images.
 """
 
 import os
+import shutil
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 
@@ -30,10 +22,24 @@ if TYPE_CHECKING:
     from ci.compiler.argument_parser import CompilationConfig
 
 
+def _copy_requested_build_info(source: Path, destination: Path) -> bool:
+    """Copy requested build metadata, failing without creating an error-shaped file."""
+    if not source.exists():
+        print(f"ERROR: Build info not found at {source}")
+        return False
+    try:
+        shutil.copy(source, destination)
+    except OSError as e:
+        print(f"ERROR: Failed to write build info: {e}")
+        return False
+    print(f"Build info written to: {destination}")
+    return True
+
+
 # handle_docker_compilation() removed in #2812 — compilation Docker has been
 # decommissioned. The niteris/fastled-compiler-* image family that wrapped
-# `bash compile --docker` was a stop-gap against PlatformIO self-poisoning;
-# fbuild does not self-poison and has been the default backend for some time.
+# `bash compile --docker` was a stop-gap against the previous backend
+# self-poisoning its package cache; fbuild does not.
 
 
 def _wasm_fast_path() -> int | None:
@@ -42,8 +48,11 @@ def _wasm_fast_path() -> int | None:
     Returns exit code if handled, None to fall through to full argument parser.
     Saves ~130ms by skipping CompilationArgumentParser and its 62 transitive imports.
     """
-    # argv: ci-compile.py wasm ExampleName [--run] [--just-compile] [-v]
+    # argv: ci-compile.py wasm ExampleName [--clean] [--run] [--defines ...]
     args = sys.argv[1:]
+    has_clean = "--clean" in args
+    if has_clean:
+        args = [arg for arg in args if arg != "--clean"]
     if not args or args[0].lower() != "wasm":
         return None
     rest = args[1:]
@@ -51,22 +60,33 @@ def _wasm_fast_path() -> int | None:
     # Extract example name (first positional, skipping flags)
     example = None
     has_run = False
+    has_check = False
     has_verbose = False
-    for a in rest:
+    defines: list[str] = []
+    index = 0
+    while index < len(rest):
+        a = rest[index]
         if a == "--run":
             has_run = True
+        elif a == "--check":
+            has_check = True
         elif a in ("-v", "--verbose"):
             has_verbose = True
         elif a == "--just-compile":
             pass  # ignored, kept for compat
-        elif a.startswith("--examples"):
-            # --examples Blink or --examples=Blink
-            if "=" in a:
-                example = a.split("=", 1)[1]
-            elif rest.index(a) + 1 < len(rest):
-                example = rest[rest.index(a) + 1]
+        elif a == "--examples" and index + 1 < len(rest):
+            index += 1
+            example = rest[index]
+        elif a.startswith("--examples="):
+            example = a.split("=", 1)[1]
+        elif a == "--defines" and index + 1 < len(rest):
+            index += 1
+            defines.extend(item for item in rest[index].split(",") if item)
+        elif a.startswith("--defines="):
+            defines.extend(item for item in a.split("=", 1)[1].split(",") if item)
         elif not a.startswith("-") and example is None:
             example = a
+        index += 1
 
     if example is None:
         example = "wasm"
@@ -74,29 +94,47 @@ def _wasm_fast_path() -> int | None:
     if has_verbose:
         os.environ["VERBOSE"] = "1"
 
-    if has_run:
-        # --run needs wasm_compile for Playwright test orchestration
+    if has_run or has_check:
+        # --run/--check need wasm_compile for Playwright orchestration.
         saved_argv = sys.argv
         sys.argv = ["ci.wasm_compile", f"examples/{example}"]
-        sys.argv.append("--run")
+        if has_clean:
+            sys.argv.append("--force")
+        if defines:
+            sys.argv.extend(["--defines", ",".join(defines)])
+        sys.argv.append("--check" if has_check else "--run")
         try:
             from ci.wasm_compile import main as wasm_compile_main
 
-            return wasm_compile_main()
+            return wasm_compile_main(None)
         finally:
             sys.argv = saved_argv
 
     # Compile-only fast path: call wasm_build.build() directly,
     # skipping both wasm_compile and argparse (~47ms saved)
-    from pathlib import Path
+    from ci.wasm_build import resolve_example_dir
 
-    output_dir = Path("examples") / example / "fastled_js"
+    output_dir = resolve_example_dir(example) / "fastled_js"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_js = output_dir / "fastled.js"
 
     from ci.wasm_build import build as wasm_build
 
-    rc = wasm_build(example=example, output=str(output_js), verbose=has_verbose)
+    if defines:
+        rc = wasm_build(
+            example=example,
+            output=output_js.as_posix(),
+            verbose=has_verbose,
+            force=has_clean,
+            defines=defines,
+        )
+    else:
+        rc = wasm_build(
+            example=example,
+            output=output_js.as_posix(),
+            verbose=has_verbose,
+            force=has_clean,
+        )
     if rc == 0:
         print("WASM compilation successful")
     else:
@@ -171,14 +209,11 @@ def main() -> int:
             extra_packages=config.extra_packages,
             verbose=config.verbose,
             output_path=config.output_path,
-            merged_bin=config.merged_bin,
             log_failures=config.log_failures,
             max_failures=config.max_failures,
             wasm_run=config.wasm_run,
-            global_cache_dir=config.global_cache_dir,
             skip_filters=config.skip_filters,
             no_parallel=config.no_parallel,
-            backend=config.backend,
         )
 
     # The "auto-detect Docker availability + force --local on GitHub Actions"
@@ -206,16 +241,18 @@ def main() -> int:
         example = examples[0]
         saved_argv = sys.argv
         sys.argv = ["ci.wasm_compile", f"examples/{example}"]
+        if config.defines:
+            sys.argv.extend(["--defines", ",".join(config.defines)])
         if config.wasm_run:
             sys.argv.append("--run")
         try:
             from ci.wasm_compile import main as wasm_compile_main
 
-            return wasm_compile_main()
+            return wasm_compile_main(None)
         finally:
             sys.argv = saved_argv
 
-    # --- PlatformIO path: lazy-import heavy deps (~350ms) ---
+    # --- board path: lazy-import heavy deps (~350ms) ---
     from ci.compiler.board_example_utils import resolve_example_path
     from ci.compiler.compilation_orchestrator import (
         compile_board_examples,
@@ -275,25 +312,14 @@ def main() -> int:
 
     # Compile for each board
     for board in boards:
-        # Determine merged-bin output path if requested
-        merged_bin_output = None
-        if config.merged_bin and config.output_path:
-            merged_bin_output = config.output_path
-
-        from ci.compiler.argument_parser import BuildBackend
-
         result = compile_board_examples(
             board=board,
             examples=examples,
             defines=defines,
             verbose=config.verbose,
-            global_cache_dir=config.global_cache_dir,
-            merged_bin=config.merged_bin,
-            merged_bin_output=merged_bin_output,
             extra_packages=config.extra_packages if config.extra_packages else None,
             max_failures=config.max_failures,
             skip_filters=config.skip_filters,
-            use_fbuild=(config.backend == BuildBackend.FBUILD),
         )
 
         if not result.ok:
@@ -346,9 +372,9 @@ def main() -> int:
                     str(config.output_path), sketch_name, board
                 )
                 if copy_validate_result.is_valid:
-                    # Find the build directory for this board
-                    project_root = Path(__file__).parent.parent.resolve()
-                    build_dir = project_root / ".build" / "pio" / board.board_name
+                    from ci.compiler.path_manager import board_build_dir
+
+                    build_dir = board_build_dir(board.board_name)
 
                     if not copy_build_artifact(
                         build_dir,
@@ -398,34 +424,17 @@ def main() -> int:
 
         # Write build info to file if requested
         if config.build_info and boards and examples:
-            import json
-            import shutil
+            from ci.compiler.path_manager import board_build_dir
 
             board_name = boards[0].board_name
             example_name = examples[0]
-            # Build info is generated per-example at .build/pio/<board>/build_info_<example>.json
+            # Build info is generated per-example at
+            # .build/fbuild/<board>/build_info_<example>.json
             build_info_path = (
-                Path(".build") / "pio" / board_name / f"build_info_{example_name}.json"
+                board_build_dir(board_name) / f"build_info_{example_name}.json"
             )
 
-            try:
-                if build_info_path.exists():
-                    shutil.copy(build_info_path, config.build_info)
-                    print(f"Build info written to: {config.build_info}")
-                else:
-                    with open(config.build_info, "w") as f:
-                        json.dump(
-                            {"error": f"Build info not found at {build_info_path}"},
-                            f,
-                            indent=2,
-                        )
-                    print(
-                        yellow_text(
-                            f"Warning: Build info not found at {build_info_path}"
-                        )
-                    )
-            except OSError as e:
-                print(red_text(f"ERROR: Failed to write build info: {e}"))
+            if not _copy_requested_build_info(build_info_path, config.build_info):
                 return 1
 
         return 0

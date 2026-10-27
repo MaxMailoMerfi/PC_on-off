@@ -4,7 +4,7 @@
 /// Tests the wave transpose functionality used for multi-lane LED protocols.
 
 #include "fl/channels/wave8.h"
-#include "fl/channels/detail/wave8.hpp"
+#include "fl/channels/detail/wave8.h"
 #include "fl/stl/cstring.h"
 #include "test.h"
 #include "fl/chipsets/led_timing.h"
@@ -1263,6 +1263,7 @@ FL_TEST_CASE("Wave8 byte LUT == nibble LUT for all 256 bytes across real chipset
         {"WS2812_800KHZ",   makeRealTiming<TIMING_WS2812_800KHZ>()},
         {"WS2812B_V5",      makeRealTiming<TIMING_WS2812B_V5>()},
         {"WS2813",          makeRealTiming<TIMING_WS2813>()},
+        {"WS2818",          makeRealTiming<TIMING_WS2818>()},
         {"SK6812",          makeRealTiming<TIMING_SK6812>()},
         {"UCS1903B_800KHZ", makeRealTiming<TIMING_UCS1903B_800KHZ>()},
         {"TM1809_800KHZ",   makeRealTiming<TIMING_TM1809_800KHZ>()},
@@ -1293,13 +1294,14 @@ FL_TEST_CASE("Wave8 byte LUT == nibble LUT for all 256 bytes across real chipset
 FL_TEST_CASE("Wave8 bit cell starts HIGH and ends LOW for every real chipset") {
     // The wave8 wire shape — every bit cell starts HIGH (T1 phase) and ends
     // LOW (T3 phase) — is the framing constraint that lets an inverted UART
-    // (#3023 workstream A: `Bus::LPUART`) carry wave8 traffic byte-by-byte.
+    // (#3023 workstream A: `Bus::UART`) carry wave8 traffic byte-by-byte.
     // Pinning the invariant here means a future timing-table edit can't
     // quietly invalidate the assumption the LPUART canHandle() rests on.
     const RealTimingEntry entries[] = {
         {"WS2812_800KHZ",   makeRealTiming<TIMING_WS2812_800KHZ>()},
         {"WS2812B_V5",      makeRealTiming<TIMING_WS2812B_V5>()},
         {"WS2813",          makeRealTiming<TIMING_WS2813>()},
+        {"WS2818",          makeRealTiming<TIMING_WS2818>()},
         {"SK6812",          makeRealTiming<TIMING_SK6812>()},
         {"UCS1903B_800KHZ", makeRealTiming<TIMING_UCS1903B_800KHZ>()},
         {"TM1809_800KHZ",   makeRealTiming<TIMING_TM1809_800KHZ>()},

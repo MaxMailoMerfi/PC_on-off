@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Add FL_NOEXCEPT to functions using clang-query AST + multi-line-aware insertion.
+"""Add FL_NO_EXCEPT to functions using clang-query AST + multi-line-aware insertion.
 
 Uses clang-query to find the exact file:line of every function missing noexcept,
 then reads the file context to find the balanced closing paren across multiple
-lines, skips past cv-qualifiers, and inserts FL_NOEXCEPT at the correct position.
+lines, skips past cv-qualifiers, and inserts FL_NO_EXCEPT at the correct position.
 
 Handles cases the single-line inserter cannot:
   - Multi-line function signatures
@@ -20,141 +20,62 @@ Usage:
 
 import argparse
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from ci.tools.check_noexcept import _SCOPES as CHECK_SCOPES
+from ci.tools.check_noexcept import NoexceptCheckError, find_missing_noexcept
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-
 _NOEXCEPT_INCLUDE = '#include "fl/stl/noexcept.h"'
+_SCOPES = tuple(CHECK_SCOPES)
 
-# Scope → (translation_unit, file_matching_regex)
-_SCOPES: dict[str, list[tuple[str, str]]] = {
-    "fl": [
-        ("src/fl/build/fl.system+.cpp", ".*src.fl.*"),
-    ],
-    "platforms": [
-        ("ci/tools/_noexcept_check_platforms_tu.cpp", ".*src.platforms.*"),
-    ],
-    "all": [
-        ("ci/tools/_noexcept_check_platforms_tu.cpp", ".*src.platforms.*"),
-        ("src/fl/build/fl.system+.cpp", ".*src.fl.*"),
-    ],
-}
 
-_COMPILER_ARGS = [
-    "-std=c++17",
-    "-Isrc",
-    "-Isrc/platforms/stub",
-    "-DSTUB_PLATFORM",
-    "-DARDUINO=10808",
-    "-DFASTLED_USE_STUB_ARDUINO",
-    "-DFASTLED_STUB_IMPL",
-    "-DFASTLED_TESTING",
-    "-DFASTLED_NO_AUTO_NAMESPACE",
-    "-fno-exceptions",
-    "-DFL_NOEXCEPT=noexcept",
-]
+def _discover_hits(scope: str) -> list[tuple[str, int]]:
+    """Use active lint discovery and exclusions without applying its debt baseline."""
+    return sorted({(hit.path, hit.line) for hit in find_missing_noexcept(scope)})
 
 
 # ============================================================================
-# Step 1: Find clang-query
-# ============================================================================
-
-
-def _find_clang_query() -> str:
-    """Find clang-query binary."""
-    import shutil
-
-    system_path = Path("C:/Program Files/LLVM/bin/clang-query.exe")
-    if system_path.exists():
-        return str(system_path)
-
-    cache_path = (
-        PROJECT_ROOT / ".cache" / "clang-tools" / "clang" / "bin" / "clang-query.exe"
-    )
-    if cache_path.exists():
-        return str(cache_path)
-
-    found = shutil.which("clang-query")
-    if found:
-        return found
-
-    return ""
-
-
-# ============================================================================
-# Step 2: AST query for functions missing noexcept
-# ============================================================================
-
-
-def _run_clang_query(
-    clang_query: str, tu: str, file_regex: str
-) -> list[tuple[str, int]]:
-    """Run clang-query and return (filepath, line_number) tuples."""
-    query = (
-        f"set output diag\n"
-        f"match functionDecl("
-        f"unless(isNoThrow()), "
-        f"unless(isDeleted()), "
-        f"unless(isDefaulted()), "
-        f"unless(isImplicit()), "
-        f'isExpansionInFileMatching("{file_regex}"))'
-    )
-
-    result = subprocess.run(
-        [clang_query, tu, "--"] + _COMPILER_ARGS,
-        input=query,
-        capture_output=True,
-        text=True,
-        cwd=str(PROJECT_ROOT),
-        timeout=300,
-    )
-
-    output = result.stdout + result.stderr
-
-    pattern = re.compile(r"(src[\\/]\S+):(\d+):\d+: note: .root. binds here")
-    hits: list[tuple[str, int]] = []
-    seen: set[tuple[str, int]] = set()
-
-    for m in pattern.finditer(output):
-        filepath = m.group(1).replace("\\", "/")
-        line_num = int(m.group(2))
-        key = (filepath, line_num)
-        if key not in seen:
-            seen.add(key)
-            hits.append(key)
-
-    return hits
-
-
-# ============================================================================
-# Step 3: Multi-line-aware FL_NOEXCEPT insertion
+# Step 3: Multi-line-aware FL_NO_EXCEPT insertion
 # ============================================================================
 
 
 def _find_balanced_close_paren(lines: list[str], start_line: int) -> tuple[int, int]:
-    """Find the balanced closing ')' starting from start_line.
-
-    Scans from the first '(' on start_line forward across lines.
-    Returns (line_index, col_index) of the matching ')' or (-1, -1).
-    """
-    depth = 0
-    found_open = False
-
-    for li in range(start_line, min(start_line + 30, len(lines))):
-        line = lines[li]
-        for ci, ch in enumerate(line):
-            if ch == "(":
-                depth += 1
-                found_open = True
-            elif ch == ")":
-                depth -= 1
-                if found_open and depth == 0:
-                    return (li, ci)
-
+    """Find function parameters, skipping balanced prefix attribute/type expressions."""
+    prefix_expressions = {
+        "__attribute__",
+        "__declspec",
+        "decltype",
+        "sizeof",
+        "alignof",
+        "alignas",
+        "__alignof__",
+        "typeof",
+        "__typeof__",
+        "_Pragma",
+    }
+    line_index = start_line
+    column = 0
+    while line_index < min(start_line + 30, len(lines)):
+        opening = lines[line_index].find("(", column)
+        if opening < 0:
+            line_index += 1
+            column = 0
+            continue
+        preceding = (
+            "\n".join(lines[start_line:line_index]) + "\n" + lines[line_index][:opening]
+        )
+        word = re.search(r"([A-Za-z_]\w*)\s*$", preceding)
+        closing = _find_balanced_close_paren_from(lines, line_index, opening)
+        if closing == (-1, -1):
+            return closing
+        if word is None or word.group(1) not in prefix_expressions:
+            return closing
+        line_index, column = closing
+        column += 1
     return (-1, -1)
 
 
@@ -182,10 +103,10 @@ def _find_balanced_close_paren_from(
 def _skip_cv_and_trailing_return(
     lines: list[str], line_idx: int, col: int
 ) -> tuple[int, int]:
-    """Skip past const/volatile and trailing return types after ')'.
+    """Find the specification position after cv/ref qualifiers and before ->.
 
-    Handles: ) const volatile -> decltype(...) {
-    Returns (line_idx, col) pointing to the insertion position for FL_NOEXCEPT.
+    Handles: ) const volatile && -> decltype(...) {
+    Returns (line_idx, col) pointing to the insertion position for FL_NO_EXCEPT.
     """
     pos_line = line_idx
     pos_col = col + 1  # start after ')'
@@ -206,34 +127,27 @@ def _skip_cv_and_trailing_return(
     rest = text.lstrip()
     consumed = len(text) - len(rest)
 
+    specification_end = 0
+
     # Skip const/volatile
     for qualifier in ("const", "volatile"):
         if rest.startswith(qualifier) and (
             len(rest) == len(qualifier) or not rest[len(qualifier)].isalnum()
         ):
             consumed += len(qualifier)
+            specification_end = consumed
             rest = text[consumed:].lstrip()
             consumed = len(text) - len(rest)
 
-    # Skip trailing return type: -> expr { or -> expr ;
-    # Track only parens (decltype/sizeof have them); angle brackets are
-    # ambiguous with comparison operators inside decltype expressions.
-    if rest.startswith("->"):
-        consumed += 2
-        rest = text[consumed:].lstrip()
-        consumed = len(text) - len(rest)
-        paren_depth = 0
-        i = consumed
-        while i < len(text):
-            ch = text[i]
-            if ch == "(":
-                paren_depth += 1
-            elif ch == ")":
-                paren_depth -= 1
-            elif ch in ("{", ";") and paren_depth == 0:
-                consumed = i
-                break
-            i += 1
+    # Exception specifications precede trailing return types and follow
+    # ref-qualifiers. Never scan through -> into a return-type expression.
+    for qualifier in ("&&", "&"):
+        if rest.startswith(qualifier):
+            consumed += len(qualifier)
+            specification_end = consumed
+            rest = text[consumed:].lstrip()
+            consumed = len(text) - len(rest)
+            break
 
     def _offset_to_line_col(consumed_offset: int) -> tuple[int, int]:
         running = 0
@@ -245,20 +159,24 @@ def _skip_cv_and_trailing_return(
             running += len(part) + 1
         return (pos_line, pos_col)
 
+    # A directive between parameters and initializer belongs on its own line.
+    # Put the specification on the preceding signature, never before #if.
+    if rest.startswith("#"):
+        return _offset_to_line_col(specification_end)
     return _offset_to_line_col(consumed)
 
 
 def _insert_fl_noexcept_multiline(
     lines: list[str], start_line: int
 ) -> list[tuple[int, str]] | None:
-    """Insert FL_NOEXCEPT into a function signature starting at start_line.
+    """Insert FL_NO_EXCEPT into a function signature starting at start_line.
 
     Returns list of (line_index, new_line_content) replacements, or None if
     insertion is not possible or not needed.
     """
     # Build the signature text from start_line through the end of the
     # function signature (up to the first ; or { after balanced parens).
-    # Stop precisely at the terminator to avoid picking up FL_NOEXCEPT
+    # Stop precisely at the terminator to avoid picking up FL_NO_EXCEPT
     # from a subsequent function on a nearby line.
     sig_text = ""
     depth = 0
@@ -279,7 +197,7 @@ def _insert_fl_noexcept_multiline(
             break
         sig_text += " "
 
-    if re.search(r"\b(?:FL_NOEXCEPT|noexcept)\b", sig_text):
+    if re.search(r"\b(?:FL_NO_EXCEPT|noexcept)\b", sig_text):
         return None
 
     # Skip destructors
@@ -329,25 +247,27 @@ def _insert_fl_noexcept_multiline(
 
     # Get the line we're inserting into
     target_line = lines[insert_line]
-    before = target_line[:insert_col].rstrip()
+    prefix = target_line[:insert_col]
+    before = prefix.rstrip() if prefix.strip() else prefix
+    separator = " " if before.strip() else ""
     after = target_line[insert_col:].lstrip()
 
     # Determine what follows and build insertion
     if not after:
-        new_line = before + " FL_NOEXCEPT"
+        new_line = before + separator + "FL_NO_EXCEPT"
     elif after[0] == ";":
-        new_line = before + " FL_NOEXCEPT;" + after[1:]
+        new_line = before + separator + "FL_NO_EXCEPT;" + after[1:]
     elif after[0] == "{":
-        new_line = before + " FL_NOEXCEPT {" + after[1:]
+        new_line = before + separator + "FL_NO_EXCEPT {" + after[1:]
     elif after.startswith("override") or after.startswith("final"):
-        new_line = before + " FL_NOEXCEPT " + after
+        new_line = before + separator + "FL_NO_EXCEPT " + after
     elif after.startswith("__attribute__"):
-        new_line = before + " FL_NOEXCEPT " + after
+        new_line = before + separator + "FL_NO_EXCEPT " + after
     elif after.startswith(":"):
         # Constructor initializer list
-        new_line = before + " FL_NOEXCEPT " + after
+        new_line = before + separator + "FL_NO_EXCEPT " + after
     else:
-        new_line = before + " FL_NOEXCEPT " + after
+        new_line = before + separator + "FL_NO_EXCEPT " + after
 
     return [(insert_line, new_line)]
 
@@ -387,7 +307,7 @@ def _ensure_include(lines: list[str]) -> bool:
 
 @dataclass(slots=True)
 class FixResult:
-    """Result of applying FL_NOEXCEPT fixes."""
+    """Result of applying FL_NO_EXCEPT fixes."""
 
     changes: int = 0
     files: int = 0
@@ -395,7 +315,7 @@ class FixResult:
 
 
 def _apply_fixes(hits: list[tuple[str, int]], apply: bool) -> FixResult:
-    """Apply FL_NOEXCEPT insertions."""
+    """Apply FL_NO_EXCEPT insertions."""
     by_file: dict[str, list[int]] = {}
     for filepath, line_num in hits:
         by_file.setdefault(filepath, []).append(line_num)
@@ -446,6 +366,8 @@ def _apply_fixes(hits: list[tuple[str, int]], apply: bool) -> FixResult:
                     lines[line_idx] = new_content
 
                 include_added = _ensure_include(lines)
+                # split("\n") retains the final empty item, so joining already
+                # preserves the original newline without adding a blank line.
                 full_path.write_text("\n".join(lines), encoding="utf-8")
                 print(
                     f"  {filepath}: {file_changes} changes"
@@ -468,13 +390,13 @@ def _apply_fixes(hits: list[tuple[str, int]], apply: bool) -> FixResult:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Add FL_NOEXCEPT to functions using clang-query AST analysis "
+            "Add FL_NO_EXCEPT to functions using clang-query AST analysis "
             "with multi-line-aware insertion."
         )
     )
     parser.add_argument(
         "--scope",
-        choices=list(_SCOPES.keys()),
+        choices=_SCOPES,
         default="all",
         help="Which code scope to process (default: all)",
     )
@@ -485,33 +407,21 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    clang_query = _find_clang_query()
-    if not clang_query:
-        print("ERROR: clang-query not found.")
-        print("Install LLVM: https://github.com/llvm/llvm-project/releases")
-        return 1
-
-    print(f"Using: {clang_query}")
     print(f"Scope: {args.scope}")
     print(f"Mode:  {'apply' if args.apply else 'dry-run'}")
     print()
 
-    all_hits: list[tuple[str, int]] = []
-    for tu, file_regex in _SCOPES[args.scope]:
-        tu_path = PROJECT_ROOT / tu
-        if not tu_path.exists():
-            print(f"WARNING: Translation unit not found: {tu}")
-            continue
-
-        print(f"Running clang-query on {tu} ...")
-        hits = _run_clang_query(clang_query, tu, file_regex)
-        all_hits.extend(hits)
+    try:
+        all_hits = _discover_hits(args.scope)
+    except NoexceptCheckError as exc:
+        print(f"ERROR: {exc}")
+        return 1
 
     if not all_hits:
-        print("\nAll functions have FL_NOEXCEPT. Nothing to do.")
+        print("\nAll functions have FL_NO_EXCEPT. Nothing to do.")
         return 0
 
-    print(f"Found {len(all_hits)} functions missing FL_NOEXCEPT")
+    print(f"Found {len(all_hits)} functions missing FL_NO_EXCEPT")
     print()
 
     result = _apply_fixes(all_hits, args.apply)

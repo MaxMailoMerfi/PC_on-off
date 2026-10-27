@@ -28,7 +28,8 @@
     defined(__AVR_ATmega2560__) || defined(__AVR_ATmega1280__) || \
     defined(__AVR_ATmega32U4__) || \
     defined(__AVR_ATmega1284__) || defined(__AVR_ATmega1284P__) || \
-    defined(__AVR_ATmega644P__) || defined(__AVR_ATmega644__) || \
+    defined(__AVR_ATmega644__) || defined(__AVR_ATmega644A__) || \
+    defined(__AVR_ATmega644P__) || defined(__AVR_ATmega644PA__) || \
     defined(__AVR_ATmega32__) || defined(__AVR_ATmega16__) || \
     defined(__AVR_ATmega128__) || defined(__AVR_ATmega64__) || \
     defined(__AVR_ATmega32U2__) || defined(__AVR_ATmega16U2__) || \
@@ -133,7 +134,7 @@
 //            ATtinyxy4 0/1-series: 204=128B, 404/414=256/512B, 804=512B, 1604=1KB
 //            (intentionally excludes 2-series xy4: 424=512B, 824=1KB, 1624=2KB, 3224=3KB
 //            because 2KB+ variants fit sketches; if 424/824 were common we'd list them,
-//            but megaTinyCore/PlatformIO rarely targets them)
+//            but megaTinyCore rarely targets them)
 // ============================================================================
 #if defined(__AVR_ATtiny13__) || defined(__AVR_ATtiny13A__) || \
     defined(__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__) || \
@@ -150,6 +151,17 @@
     defined(__AVR_ATtiny1604__) || \
     defined(__AVR_ATtinyxy2__)
 #define FL_IS_AVR_ATTINY_TINY_MEMORY
+#endif
+
+// ============================================================================
+// FL_IS_AVR_ATMEGA_TINY_MEMORY - classic ATmega parts with <=1KB SRAM and
+// 8KB flash. Same budget as the ATtiny85, so they belong in the same tier:
+// without it an ATmega8 compiles the colour-profile runtime and its event
+// lists, and ColorPalette / Fire2012 link at ~14KB against 8KB of flash.
+//   ATmega8/8A = 1KB SRAM, 8KB flash
+// ============================================================================
+#if defined(__AVR_ATmega8__) || defined(__AVR_ATmega8A__)
+#define FL_IS_AVR_ATMEGA_TINY_MEMORY
 #endif
 
 // ============================================================================

@@ -27,11 +27,11 @@
 // Platform dispatch
 #ifdef FL_IS_STUB
     #include "platforms/stub/semaphore_stub.h"
-#elif defined(ESP32)
+#elif defined(FL_IS_ESP32)
     #include "platforms/esp/32/semaphore_esp32.h"
 #elif defined(FL_IS_STM32) && FL_HAS_INCLUDE("FreeRTOS.h")
     #include "platforms/arm/stm32/semaphore_stm32.h"
-#elif defined(FL_IS_RP2040)
+#elif defined(FL_IS_RP)
     #include "platforms/arm/rp/semaphore_rp.h"
 #elif defined(FL_IS_TEENSY)
     #include "platforms/arm/teensy/semaphore_teensy.h"

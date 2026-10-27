@@ -29,10 +29,8 @@ from ci.meson.compiler import check_meson_version_compatibility
 from ci.meson.meson_cleanup import (
     CleanupResult,
     cleanup_build_artifacts,
-    detect_system_llvm_tools,
 )
 from ci.meson.meson_markers import (
-    cleanup_stale_meson_lockfile,
     inject_ar_optimization_patches,
 )
 from ci.meson.meson_setup_execute import (
@@ -40,6 +38,7 @@ from ci.meson.meson_setup_execute import (
     build_setup_env,
     detect_compiler_and_cache,
     handle_skip_meson_setup,
+    resolve_native_linker,
     run_meson_setup_command,
     write_meson_native_file,
 )
@@ -81,8 +80,6 @@ __all__ = [
     "_ensure_emcc_native_launcher",
     "_find_zccache_binary",
     "cleanup_build_artifacts",
-    "cleanup_stale_meson_lockfile",
-    "detect_system_llvm_tools",
     "find_strict_path_violations",
     "get_zccache_version",
     "inject_ar_optimization_patches",
@@ -104,6 +101,7 @@ def setup_meson_build(
     verbose: bool = False,
     enable_examples: bool = True,
     enable_unit_tests: bool = True,
+    enable_full_examples: bool = True,
 ) -> bool:
     """
     Set up Meson build directory.
@@ -114,10 +112,11 @@ def setup_meson_build(
         reconfigure: Force reconfiguration of existing build
         debug: Enable debug mode with full symbols and sanitizers (default: False)
         check: Enable IWYU static analysis (default: False)
-        build_mode: Build mode ("quick", "debug", or "release"). If None, derived from debug flag.
+        build_mode: Build mode (quick, debug, debug-thin, release, profile).
         verbose: Show detailed output including toolchain info (default: False)
         enable_examples: Enable example compilation targets (default: True)
         enable_unit_tests: Enable unit test compilation targets (default: True)
+        enable_full_examples: Configure individual example targets (default: True)
 
     Returns:
         True if setup successful, False otherwise
@@ -125,10 +124,12 @@ def setup_meson_build(
     # Derive build_mode from debug flag if not explicitly provided
     if build_mode is None:
         build_mode = "debug" if debug else "quick"
-    if build_mode == "debug":
+    if build_mode in ("debug", "debug-thin"):
         debug = True
     elif build_mode in ("quick", "release", "profile"):
         debug = False
+
+    native_linker, native_linker_identity = resolve_native_linker(build_mode)
 
     build_dir.mkdir(parents=True, exist_ok=True)
     meson_info = build_dir / "meson-info"
@@ -173,6 +174,11 @@ def setup_meson_build(
         )
 
     markers = MarkerPaths.for_build_dir(build_dir)
+    native_linker_changed = (
+        already_configured
+        and markers.native_linker.exists()
+        and markers.native_linker.read_text().strip() != native_linker_identity
+    )
     hashes = compute_source_hashes(source_dir, markers)
 
     # Marker-based reconfigure detection (consolidated message + cleanup).
@@ -184,7 +190,9 @@ def setup_meson_build(
             debug=debug,
             check=check,
             build_mode=build_mode,
+            native_linker_identity=native_linker_identity,
             enable_examples=enable_examples,
+            enable_full_examples=enable_full_examples,
             enable_unit_tests=enable_unit_tests,
             use_thin_archives=use_thin_archives,
         )
@@ -204,10 +212,12 @@ def setup_meson_build(
         force_reconfigure = True
         force_reconfigure_reason = "test files changed"
 
-    # Example files added/removed/modified → reconfigure.
-    if already_configured and detect_example_file_changes(source_dir, build_dir):
-        force_reconfigure = True
-        force_reconfigure_reason = "example files changed"
+    # Example files added/removed/modified (or unprovable) → reconfigure.
+    if already_configured:
+        example_reason = detect_example_file_changes(source_dir, build_dir)
+        if example_reason:
+            force_reconfigure = True
+            force_reconfigure_reason = example_reason
 
     skip_meson_setup = already_configured and not reconfigure and not force_reconfigure
     native_file_path = build_dir / "meson_native.txt"
@@ -229,8 +239,11 @@ def setup_meson_build(
             native_file_path=native_file_path,
             build_dir=build_dir,
             build_mode=build_mode,
+            native_linker=native_linker,
+            native_linker_identity=native_linker_identity,
             enable_examples=enable_examples,
             enable_unit_tests=enable_unit_tests,
+            enable_full_examples=enable_full_examples,
             reconfigure=True,
             source_hashes=hashes,
         )
@@ -240,15 +253,18 @@ def setup_meson_build(
             native_file_path=native_file_path,
             build_dir=build_dir,
             build_mode=build_mode,
+            native_linker=native_linker,
+            native_linker_identity=native_linker_identity,
             enable_examples=enable_examples,
             enable_unit_tests=enable_unit_tests,
+            enable_full_examples=enable_full_examples,
             reconfigure=False,
             source_hashes=hashes,
         )
 
     check_obsolete_zig_wrappers(source_dir)
 
-    compiler = detect_compiler_and_cache(markers, verbose)
+    compiler = detect_compiler_and_cache(markers, verbose, build_mode)
 
     # Late-stage compiler-version check: requires the detected compiler.
     if already_configured:
@@ -297,7 +313,11 @@ def setup_meson_build(
                 force_reconfigure = True
                 force_reconfigure_reason = zccache_version_reason
                 skip_meson_setup = False
-                cleanup_build_artifacts(build_dir, "zccache version changed")
+                # NOTE (#3129 A3): no longer wipes build artifacts on zccache
+                # version delta. zccache is a cache layer, not a codegen layer
+                # — a version bump that doesn't change the cache key just
+                # forces a miss-and-recompile, which is what the reconfigure
+                # is for. Compiler-version deltas (line 275) still wipe.
 
         # If compiler/zccache version forced reconfigure but we hadn't built a cmd yet
         if force_reconfigure and cmd is None:
@@ -306,14 +326,21 @@ def setup_meson_build(
                 native_file_path=native_file_path,
                 build_dir=build_dir,
                 build_mode=build_mode,
+                native_linker=native_linker,
+                native_linker_identity=native_linker_identity,
                 enable_examples=enable_examples,
                 enable_unit_tests=enable_unit_tests,
+                enable_full_examples=enable_full_examples,
                 reconfigure=True,
             )
 
-    write_meson_native_file(native_file_path=native_file_path, compiler=compiler)
+    write_meson_native_file(
+        native_file_path=native_file_path,
+        compiler=compiler,
+        build_mode=build_mode,
+    )
 
-    env = build_setup_env(compiler)
+    env = build_setup_env(compiler, build_mode)
 
     if skip_meson_setup:
         handle_skip_meson_setup(
@@ -325,14 +352,16 @@ def setup_meson_build(
             debug=debug,
             check=check,
             build_mode=build_mode,
+            native_linker_identity=native_linker_identity,
             enable_examples=enable_examples,
+            enable_full_examples=enable_full_examples,
             enable_unit_tests=enable_unit_tests,
             compiler=compiler,
         )
         return True
 
     assert cmd is not None, "cmd should be set when not skipping meson setup"
-    return run_meson_setup_command(
+    configured = run_meson_setup_command(
         cmd=cmd,
         source_dir=source_dir,
         build_dir=build_dir,
@@ -342,11 +371,16 @@ def setup_meson_build(
         debug=debug,
         check=check,
         build_mode=build_mode,
+        native_linker=native_linker,
+        native_linker_identity=native_linker_identity,
+        native_linker_changed=native_linker_changed,
         enable_examples=enable_examples,
+        enable_full_examples=enable_full_examples,
         enable_unit_tests=enable_unit_tests,
         use_thin_archives=use_thin_archives,
         compiler=compiler,
     )
+    return configured
 
 
 def perform_ninja_maintenance(build_dir: Path) -> bool:

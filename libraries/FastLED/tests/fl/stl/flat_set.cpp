@@ -285,7 +285,7 @@ FL_TEST_CASE("flat_set: reserve") {
     fl::flat_set<int> s;
     s.reserve(100);
 
-    FL_CHECK_GE(s.capacity(), 100);
+    FL_CHECK_GE(s.capacity(), 100u);
 }
 
 FL_TEST_CASE("flat_set: with string elements") {
@@ -321,6 +321,40 @@ FL_TEST_CASE("flat_set: large number of insertions") {
         auto it = s.find(i);
         FL_CHECK_NE(it, s.end());
         FL_CHECK_EQ(*it, i);
+    }
+}
+
+FL_TEST_CASE("flat_set: erase returns immediate successor") {
+    FL_SUBCASE("iterator overload") {
+        fl::flat_set<int> s;
+        s.insert(1);
+        s.insert(2);
+        s.insert(3);
+        auto first = s.erase(s.begin());
+        FL_CHECK_EQ(*first, 2);
+
+        s.insert(1);
+        auto middle = s.erase(s.begin() + 1);
+        FL_CHECK_EQ(*middle, 3);
+
+        auto last = s.erase(s.end() - 1);
+        FL_CHECK_EQ(last, s.end());
+    }
+
+    FL_SUBCASE("const_iterator overload") {
+        fl::flat_set<int> s;
+        s.insert(1);
+        s.insert(2);
+        s.insert(3);
+        auto first = s.erase(s.cbegin());
+        FL_CHECK_EQ(*first, 2);
+
+        s.insert(1);
+        auto middle = s.erase(s.cbegin() + 1);
+        FL_CHECK_EQ(*middle, 3);
+
+        auto last = s.erase(s.cend() - 1);
+        FL_CHECK_EQ(last, s.end());
     }
 }
 

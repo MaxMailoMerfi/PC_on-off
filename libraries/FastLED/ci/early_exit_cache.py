@@ -30,7 +30,6 @@ SKIP_DIR_NAMES = frozenset(
         ".venv_new",
         "node_modules",
         "__pycache__",
-        ".pio",
         "emscripten",
         "bin",
     ]
@@ -40,6 +39,134 @@ SKIP_DIR_PREFIXES = (".build", "build", "builddir", ".")
 # Source file extensions used in fast-path file scans.
 CPP_EXTS = frozenset([".cpp", ".h", ".hpp", ".c", ".ino"])
 PY_EXTS = frozenset([".py"])
+WASM_EXTS = CPP_EXTS | frozenset([".js", ".html"])
+FINGERPRINT_VALIDATION_VERSION = 4
+
+NATIVE_SOURCE_EXTS = frozenset(
+    [
+        ".h",
+        ".hpp",
+        ".hh",
+        ".hxx",
+        ".c",
+        ".cpp",
+        ".cc",
+        ".cxx",
+        ".inc",
+        ".ino",
+        ".inl",
+        ".tpp",
+        ".s",
+        ".asm",
+        ".m",
+        ".mm",
+    ]
+)
+
+NATIVE_BUILD_DRIVERS = (
+    "ci/compile_pch.py",
+    "ci/meson/compile.py",
+    "ci/meson/native_input_guard.py",
+    "ci/meson/streaming.py",
+    "ci/meson/cache_utils.py",
+    "ci/early_exit_cache.py",
+    "ci/util/test_runner.py",
+    "ci/util/fingerprint.py",
+)
+
+
+def native_source_content_hash(root: Path = Path(".")) -> str:
+    """Verify native source bytes even when an edit preserves its timestamp.
+
+    Shared by early and ordinary skip gates. Never memoize by metadata: source
+    content can change independently of timestamps. An unreadable input raises so the
+    caller misses its cache rather than certifying an incomplete tree.
+    """
+    import hashlib  # noqa: PLC0415 - keep non-cache startup lightweight
+
+    digest = hashlib.sha256()
+    files: list[tuple[str, str]] = []
+    for source in ("src", "tests", "examples"):
+        start = root / source
+        if not start.exists():
+            continue
+        stack = [start]
+        while stack:
+            directory = stack.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    if entry.is_dir(follow_symlinks=False):
+                        relative = path.relative_to(root).as_posix()
+                        if relative == "src/fl/build" or not (
+                            entry.name in SKIP_DIR_NAMES
+                            or entry.name.startswith(SKIP_DIR_PREFIXES)
+                        ):
+                            stack.append(path)
+                    elif entry.is_file() and path.suffix.lower() in NATIVE_SOURCE_EXTS:
+                        files.append((path.relative_to(root).as_posix(), entry.path))
+    for relative, filename in sorted(files):
+        digest.update(relative.encode("utf-8") + b"\0")
+        with open(filename, "rb") as source_file:
+            digest.update(hashlib.sha256(source_file.read()).digest())
+    # A cached pass also certifies the build logic that produced its binaries.
+    # Track only this fixed inventory so unrelated tooling does not evict it.
+    for relative in NATIVE_BUILD_DRIVERS:
+        digest.update(relative.encode("utf-8") + b"\0")
+        path = root / relative
+        try:
+            digest.update(b"1" + hashlib.sha256(path.read_bytes()).digest())
+        except FileNotFoundError:
+            digest.update(b"0")
+    return digest.hexdigest()
+
+
+# Inputs hashed by the corresponding calculate_* function outside its source
+# directories. Keep this stdlib-only so the ultra-early paths can verify them.
+FINGERPRINT_AUX_INPUTS: dict[str, tuple[str, ...]] = {
+    "cpp_test": (
+        "meson.build",
+        "tests/meson.build",
+        "ci/meson/native/meson.build",
+    ),
+    "examples": (
+        "meson.build",
+        "examples/meson.build",
+        "ci/meson/native/meson.build",
+        "ci/compiler/test_example_compilation.py",
+        "ci/compiler/clang_compiler.py",
+        "ci/compiler/native_fingerprint.py",
+    ),
+    "python_test": ("pyproject.toml", "uv.lock", ".python-version"),
+    "wasm": (
+        "ci/wasm_compile.py",
+        "ci/wasm_build.py",
+        "ci/wasm_build_library.py",
+        "ci/boards.py",
+        "ci/meson/wasm/meson.build",
+        "meson.build",
+    ),
+}
+
+
+def fingerprint_aux_hash(name: str, root: Path = Path(".")) -> str | None:
+    """Hash the small non-source inputs, including their presence or absence."""
+    import hashlib  # noqa: PLC0415 - avoid startup cost for non-cache paths
+
+    digest = hashlib.sha256()
+    try:
+        if name in ("cpp_test", "examples", "wasm", "all"):
+            digest.update(native_source_content_hash(root).encode("ascii"))
+        for relative in FINGERPRINT_AUX_INPUTS.get(name, ()):
+            path = root / relative
+            digest.update(relative.encode("utf-8") + b"\0")
+            if path.is_file():
+                digest.update(b"1" + path.read_bytes())
+            else:
+                digest.update(b"0")
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 
 def max_file_mtime(root: Path, exts: frozenset = CPP_EXTS) -> float:
@@ -178,6 +305,8 @@ def ninja_skip(
     try:
         with open(state_file, "r", encoding="utf-8") as f:
             saved = json.load(f)
+        if saved.get("native_source_hash") != native_source_content_hash():
+            return False
         build_ninja = build_dir / "build.ninja"
         if not build_ninja.exists():
             return False
@@ -279,9 +408,63 @@ def test_cached(build_dir: Path, test_name: str, artifact_path: Path) -> bool:
         return False
 
 
+def _cpp_run_breakdown(fp: dict, num_passed: int, num_run: int) -> "tuple[str, str]":
+    """Render a cached cpp_test count with its unit/example split.
+
+    Stdlib-only mirror of ci.util.test_types.format_run_breakdown -- importing
+    that module costs ~62ms, which is more than this whole early-exit path is
+    allowed to spend (see the module docstring on intentional duplication).
+    Keep the wording in step with the canonical implementation.
+
+    A total alone cannot say whether examples were part of the run, so
+    "274 unit, examples cached" and "274 of the 357 expected" render
+    identically (#3779).
+
+    Returns ``(counts, notes)``; ``notes`` is empty when every requested
+    population ran.
+    """
+    ex_run = fp.get("num_examples_run")
+    ex_passed = fp.get("num_examples_passed")
+    included = fp.get("examples_included")
+    if ex_run is None or ex_passed is None or included is None:
+        if included is not None:
+            # Populations known, sizes not -- name the coverage, claim no split.
+            if included:
+                return f"{num_passed}/{num_run} unit + examples", ""
+            return f"{num_passed}/{num_run} unit", "examples not requested"
+        # Written before the split was recorded -- replay the total, but do
+        # not let it imply coverage it cannot vouch for.
+        return f"{num_passed}/{num_run}", "unit/example split unrecorded"
+
+    # #3778 records a narrowed run as scope="partial"; a population that ran
+    # nothing under a filter was skipped, not verified as up to date.
+    missing = (
+        "not matched by filter"
+        if fp.get("scope") == "partial"
+        else "cached, not re-run"
+    )
+    parts = []
+    if num_run - ex_run:
+        parts.append(f"{num_passed - ex_passed}/{num_run - ex_run} unit")
+    if ex_run:
+        parts.append(f"{ex_passed}/{ex_run} examples")
+    notes = []
+    if not (num_run - ex_run):
+        notes.append(f"unit tests {missing}")
+    if not included:
+        notes.append("examples not requested")
+    elif not ex_run:
+        notes.append(f"examples {missing}")
+
+    # Keep the totals visible when nothing ran, so an empty run stays
+    # distinguishable from a corrupt entry.
+    counts = ", ".join(parts) if parts else f"{num_passed}/{num_run}"
+    return counts, "; ".join(notes)
+
+
 def full_run_cache(
     build_dir: Path, include_examples: bool = False
-) -> tuple[int, int, float] | None:
+) -> tuple[int, int, float, dict] | None:
     """Check if full test suite result is cached (stdlib only, no ci.* imports).
 
     Verifies that:
@@ -298,7 +481,8 @@ def full_run_cache(
         include_examples: If True, also check examples/ for changes.
 
     Returns:
-        Tuple of (num_passed, num_tests, duration) on cache hit, else None.
+        Tuple of (num_passed, num_tests, duration, raw_entry) on cache hit,
+        else None. ``raw_entry`` carries any recorded unit/example split.
     """
     cache_file = build_dir / ".full_run_cache.json"
     if not cache_file.exists():
@@ -306,6 +490,8 @@ def full_run_cache(
     try:
         with open(cache_file, "r", encoding="utf-8") as f:
             saved = json.load(f)
+        if saved.get("native_source_hash") != native_source_content_hash():
+            return None
         if saved.get("result") != "pass":
             return None
         build_ninja = build_dir / "build.ninja"
@@ -345,10 +531,18 @@ def full_run_cache(
             ex_max = max_file_mtime(Path("examples"))
             if ex_max > saved.get("examples_max_file_mtime", -1.0) + 0.001:
                 return None
+            # Fail closed: never serve an entry that recorded no example
+            # coverage to a caller that asked for examples. Comparing mtimes
+            # alone would replay a unit-only pass as though examples had run.
+            if saved.get("examples_included") is False:
+                return None
+        # Hand back the raw entry too: it carries the unit/example attribution
+        # when the writing run recorded one (#3779).
         return (
             int(saved.get("num_passed", 0)),
             int(saved.get("num_tests", 0)),
             float(saved.get("duration", 0.0)),
+            saved,
         )
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
@@ -374,6 +568,8 @@ def check_single_test_cached(test_name_raw: str, build_dir: Path) -> bool:
     Returns:
         True if the test is fully cached and can be skipped, False otherwise.
     """
+    if "FASTLED_NATIVE_LINKER" in os.environ:
+        return False
     cached_names = load_test_names(build_dir)
     if not cached_names:
         return False
@@ -429,6 +625,11 @@ def check_single_test_cached(test_name_raw: str, build_dir: Path) -> bool:
     )
 
 
+def pytest_addopts_active() -> bool:
+    """Return whether external pytest options can change suite coverage."""
+    return bool(os.environ.get("PYTEST_ADDOPTS", "").strip())
+
+
 def argv_ultra_early_exit(start_time: float) -> None:
     """Check if test result is cached without running parse_args().
 
@@ -457,17 +658,22 @@ def argv_ultra_early_exit(start_time: float) -> None:
       Saves ~0.5s per cached run.
 
     Correctness: Bails out if any of these flags are present (they change semantics):
-      --clean, --force, --no-fingerprint, --debug, --build-mode, --docker, --run,
-      --qemu, --examples, --py, --full, --check, -h/--help, --list-tests
+      --clean, --force, --no-fingerprint, --debug, --build-mode, --run,
+      --examples, --py, --full, --check, -h/--help, --list-tests
 
     Args:
         start_time: Time when test.py started (used for elapsed time reporting).
     """
+    if pytest_addopts_active():
+        return
+    if "FASTLED_NATIVE_LINKER" in os.environ:
+        return
+
     argv = sys.argv[1:]
 
     # --- CASE 0: No flags (bash test with no arguments) ---
     # Default mode runs unit tests, examples, Python tests, and WASM.
-    # If all 4 primary fingerprints are fresh and status="success", exit immediately.
+    # If each executed category has a fresh, scoped success, exit immediately.
     # Saves ~0.46s by bypassing parse_args() and heavy module imports.
     if not argv:
         try:
@@ -477,27 +683,31 @@ def argv_ultra_early_exit(start_time: float) -> None:
             # produce false "nothing changed" cache hits (correctness bug).
             # File-level scanning adds ~70-120ms but is necessary for correctness.
             _fps_c0 = [
-                Path(".cache/fingerprint/all.json"),
                 Path(".cache/fingerprint/cpp_test_quick.json"),
                 Path(".cache/fingerprint/examples_quick.json"),
                 Path(".cache/fingerprint/python_test.json"),
+                Path(".cache/fingerprint/wasm.json"),
             ]
-            _mtimes_c0: list[float] = []
+            _scope_names_c0 = ("cpp_test", "examples", "python_test", "wasm")
             _fp_data_c0: list[dict] = []
-            for _fp_c0 in _fps_c0:
+            for _scope_c0, _fp_c0 in zip(_scope_names_c0, _fps_c0):
                 try:
-                    _st_c0 = _fp_c0.stat()
+                    _fp_c0.stat()
                 except FileNotFoundError:
                     return
                 with open(_fp_c0) as _f_c0:
                     _data_c0 = json.load(_f_c0)
-                    if _data_c0.get("status") != "success":
+                    if (
+                        _data_c0.get("status") != "success"
+                        or _data_c0.get("validation_version")
+                        != FINGERPRINT_VALIDATION_VERSION
+                        or _data_c0.get("source_max_mtime") is None
+                        or _data_c0.get("aux_hash") is None
+                        or _data_c0.get("aux_hash") != fingerprint_aux_hash(_scope_c0)
+                    ):
                         return
                     _fp_data_c0.append(_data_c0)
-                _mtimes_c0.append(_st_c0.st_mtime)
-            _mt_all_c0, _mt_cpp_c0, _mt_ex_c0, _mt_py_c0 = _mtimes_c0
-            # src/ is used by all, cpp_test, and examples fingerprints
-            _min_src_c0 = min(_mt_all_c0, _mt_cpp_c0, _mt_ex_c0)
+            _cpp_c0, _ex_c0, _py_c0, _wasm_c0 = _fp_data_c0
 
             # Parallel directory scans: os.scandir()+stat() release the GIL so
             # multiple OS threads can do true concurrent I/O. On cold OS cache
@@ -507,7 +717,7 @@ def argv_ultra_early_exit(start_time: float) -> None:
             # at module level) so CASE 1-4 paths avoid paying the ~2.5ms cost.
             import threading  # noqa: PLC0415 - lazy import for startup performance
 
-            _scan_res_c0: list = [None, None, None, None]  # [src, tests, ex, ci]
+            _scan_res_c0: list = [None, None, None, None, None]
 
             def _scan_c0(idx: int, root: Path, exts: frozenset = CPP_EXTS) -> None:
                 try:
@@ -526,33 +736,50 @@ def argv_ultra_early_exit(start_time: float) -> None:
                 threading.Thread(
                     target=_scan_c0, args=(3, Path("ci"), PY_EXTS), daemon=True
                 ),
+                threading.Thread(
+                    target=_scan_c0,
+                    args=(4, Path("examples/wasm"), WASM_EXTS),
+                    daemon=True,
+                ),
             ]
             for _t_c0 in _threads_c0:
                 _t_c0.start()
             for _t_c0 in _threads_c0:
                 _t_c0.join()
-            _max_src_c0, _max_tests_c0, _max_ex_c0, _max_ci_c0 = _scan_res_c0
+            _max_src_c0, _max_tests_c0, _max_ex_c0, _max_ci_c0, _max_wasm_c0 = (
+                _scan_res_c0
+            )
 
-            if _max_src_c0 > _min_src_c0:
+            if _max_src_c0 > min(
+                _cpp_c0["source_max_mtime"],
+                _ex_c0["source_max_mtime"],
+                _wasm_c0["source_max_mtime"],
+            ):
                 return  # src/ source file modified after fingerprint write
-            if _max_tests_c0 > _mt_cpp_c0:
+            if _max_tests_c0 > _cpp_c0["source_max_mtime"]:
                 return  # tests/ source file modified after cpp fingerprint write
-            if _max_ex_c0 > _mt_ex_c0:
+            if _max_ex_c0 > _ex_c0["source_max_mtime"]:
                 return  # examples/ source file modified after examples fingerprint write
-            if _max_ci_c0 > _mt_py_c0:
+            if _max_ci_c0 > _py_c0["source_max_mtime"]:
                 return  # ci/ Python file modified after python fingerprint write
+            if _max_wasm_c0 > _wasm_c0["source_max_mtime"]:
+                return  # WASM example changed after its validated run
 
             import time  # noqa: PLC0415 - lazy import
 
             # Build summary table matching normal cached output.
-            # _fp_data_c0 order: [all, cpp_test_quick, examples_quick, python_test]
-            _cpp_fp = _fp_data_c0[1]
+            # _fp_data_c0 order: [cpp_test_quick, examples_quick, python_test, wasm]
+            _cpp_fp = _fp_data_c0[0]
             _cpp_label = "cpp_unit_tests"
             _np = _cpp_fp.get("num_tests_passed")
             _nt = _cpp_fp.get("num_tests_run")
             _dur = _cpp_fp.get("duration_seconds")
             if _np is not None and _nt is not None and _dur is not None:
-                _cpp_label = f"cpp_unit_tests ({_np}/{_nt} passed in {_dur:.2f}s)"
+                _counts, _notes = _cpp_run_breakdown(_cpp_fp, _np, _nt)
+                _cpp_label = (
+                    f"cpp_unit_tests ({_counts} passed in {_dur:.2f}s"
+                    f"{'; ' + _notes if _notes else ''})"
+                )
 
             _rows = [
                 (_cpp_label, "skipped"),
@@ -600,10 +827,17 @@ def argv_ultra_early_exit(start_time: float) -> None:
             if _cached_fr:
                 import time  # noqa: PLC0415 - lazy import
 
-                _np_fr, _nt_fr, _dur_fr = _cached_fr
+                _np_fr, _nt_fr, _dur_fr, _entry_fr = _cached_fr
+                # Describe the run from what the ENTRY recorded, never from
+                # this invocation's flags -- those describe the reader, and a
+                # --unit run's cache can be served here to --cpp. An entry
+                # written before the split existed still reports honestly as
+                # unrecorded (#3779).
+                _counts_fr, _notes_fr = _cpp_run_breakdown(_entry_fr, _np_fr, _nt_fr)
                 print(
                     f"✓ Fingerprint cache valid - skipping C++ unit tests "
-                    f"[{_np_fr}/{_nt_fr} passed in {_dur_fr:.2f}s]"
+                    f"[{_counts_fr} passed in {_dur_fr:.2f}s"
+                    f"{'; ' + _notes_fr if _notes_fr else ''}]"
                 )
                 print(f"Total: {time.time() - start_time:.2f}s")
                 sys.exit(0)
@@ -621,7 +855,16 @@ def argv_ultra_early_exit(start_time: float) -> None:
         try:
             _fp_file = Path(".cache/fingerprint/examples_quick.json")
             if _fp_file.exists():
-                _fp_mtime = _fp_file.stat().st_mtime
+                with open(_fp_file) as _f:
+                    _fp_data = json.load(_f)
+                if (
+                    _fp_data.get("validation_version") != FINGERPRINT_VALIDATION_VERSION
+                    or _fp_data.get("status") != "success"
+                    or _fp_data.get("source_max_mtime") is None
+                    or _fp_data.get("aux_hash") is None
+                    or _fp_data.get("aux_hash") != fingerprint_aux_hash("examples")
+                ):
+                    return
                 # Use FILE-level mtime scan (not directory mtime) to correctly detect
                 # content-only modifications. Directory mtimes do not update when file
                 # content changes on NTFS/ext4 (correctness fix from iteration 16).
@@ -629,17 +872,14 @@ def argv_ultra_early_exit(start_time: float) -> None:
                     max_file_mtime(Path("src")),
                     max_file_mtime(Path("examples")),
                 )
-                if _max_mtime <= _fp_mtime:
-                    with open(_fp_file) as _f:
-                        _fp_data = json.load(_f)
-                    if _fp_data.get("status") == "success":
-                        import time  # noqa: PLC0415 - lazy import
+                if _max_mtime <= _fp_data["source_max_mtime"]:
+                    import time  # noqa: PLC0415 - lazy import
 
-                        print(
-                            "✓ Fingerprint cache valid - skipping examples (no changes detected)"
-                        )
-                        print(f"Total: {time.time() - start_time:.2f}s")
-                        sys.exit(0)
+                    print(
+                        "✓ Fingerprint cache valid - skipping examples (no changes detected)"
+                    )
+                    print(f"Total: {time.time() - start_time:.2f}s")
+                    sys.exit(0)
         except KeyboardInterrupt:
             _thread.interrupt_main()
         except Exception:
@@ -653,22 +893,30 @@ def argv_ultra_early_exit(start_time: float) -> None:
         try:
             _fp_file_py = Path(".cache/fingerprint/python_test.json")
             if _fp_file_py.exists():
-                _fp_mtime_py = _fp_file_py.stat().st_mtime
+                with open(_fp_file_py) as _f_py:
+                    _fp_data_py = json.load(_f_py)
+                if (
+                    _fp_data_py.get("validation_version")
+                    != FINGERPRINT_VALIDATION_VERSION
+                    or _fp_data_py.get("status") != "success"
+                    or _fp_data_py.get("source_max_mtime") is None
+                    or _fp_data_py.get("aux_hash") is None
+                    or _fp_data_py.get("aux_hash")
+                    != fingerprint_aux_hash("python_test")
+                ):
+                    return
                 # Use FILE-level .py scan (not directory mtime) for correctness.
                 # Directory mtimes do not update when file content changes on NTFS/ext4,
                 # so directory-based checks can miss content-only Python file modifications.
                 _max_mtime_py = max_file_mtime(Path("ci"), PY_EXTS)
-                if _max_mtime_py <= _fp_mtime_py:
-                    with open(_fp_file_py) as _f_py:
-                        _fp_data_py = json.load(_f_py)
-                    if _fp_data_py.get("status") == "success":
-                        import time  # noqa: PLC0415 - lazy import
+                if _max_mtime_py <= _fp_data_py["source_max_mtime"]:
+                    import time  # noqa: PLC0415 - lazy import
 
-                        print(
-                            "✓ Fingerprint cache valid - skipping Python tests (no changes detected)"
-                        )
-                        print(f"Total: {time.time() - start_time:.2f}s")
-                        sys.exit(0)
+                    print(
+                        "✓ Fingerprint cache valid - skipping Python tests (no changes detected)"
+                    )
+                    print(f"Total: {time.time() - start_time:.2f}s")
+                    sys.exit(0)
         except KeyboardInterrupt:
             _thread.interrupt_main()
         except Exception:
@@ -683,9 +931,7 @@ def argv_ultra_early_exit(start_time: float) -> None:
             "--no-fingerprint",
             "--debug",
             "--build-mode",
-            "--docker",
             "--run",
-            "--qemu",
             "--examples",
             "--py",
             "--full",

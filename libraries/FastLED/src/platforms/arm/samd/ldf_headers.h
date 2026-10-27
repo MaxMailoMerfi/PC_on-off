@@ -10,5 +10,6 @@
 /// This file contains #if 0 blocks with library includes to hint dependencies
 /// to PlatformIO's LDF scanner without actually compiling the code.
 
-// SAMD platform - no additional LDF hints needed currently
-// Add library includes here if LDF issues are discovered
+// No hints needed: SAMD hardware SPI programs the core SERCOM abstraction
+// directly and does not depend on Arduino's SPI library. Non-variant pins use
+// FastLED's software SPI fallback.

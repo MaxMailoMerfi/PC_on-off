@@ -8,7 +8,7 @@
 /// to ChannelManager::instance().
 ///
 /// Priority Order:
-/// - SPI_UNIFIED (6-8): True SPI hardware (octal/quad/dual-lane via PIO)
+/// - SPI_UNIFIED: True single-lane SPI channel hardware
 ///
 /// Architecture Pattern:
 /// This follows the ESP32 pattern:
@@ -26,10 +26,13 @@
 #include "fl/log/log.h"
 #include "fl/log/log.h"
 #include "fl/stl/shared_ptr.h"
-#include "platforms/shared/spi_hw_2.h"
-#include "platforms/shared/spi_hw_4.h"
-#include "platforms/shared/spi_hw_8.h"
 #include "platforms/arm/rp/rpcommon/init_channel_driver.h"
+#include "platforms/arm/rp/rpcommon/rp_uart_bus_traits.h"
+#include "platforms/arm/rp/rpcommon/rp_spi_bus_traits.h"
+#include "platforms/arm/rp/rpcommon/rp_pio_tx_bus_traits.h"
+#if !FASTLED_RP2040_CLOCKLESS_PIO
+#include "platforms/arm/rp/rpcommon/rp_bitbang_bus_traits.h"
+#endif
 
 namespace fl {
 
@@ -43,47 +46,11 @@ static void addSpiHardwareIfPossible(ChannelManager& manager) {
     fl::vector<int> priorities;
     fl::vector<const char*> names;
 
-    // ========================================================================
-    // Collect SpiHw8 controllers (highest priority: 8)
-    // ========================================================================
-    const auto& hw8Controllers = SpiHw8::getAll();
-    FL_DBG("RP2040/RP2350: Found " << hw8Controllers.size() << " SpiHw8 controllers");
-
-    for (const auto& ctrl : hw8Controllers) {
-        if (ctrl) {
-            controllers.push_back(ctrl);
-            priorities.push_back(8);
-            names.push_back(ctrl->getName());  // "SPI0" or "SPI1"
-        }
-    }
-
-    // ========================================================================
-    // Collect SpiHw4 controllers (medium priority: 7)
-    // ========================================================================
-    const auto& hw4Controllers = SpiHw4::getAll();
-    FL_DBG("RP2040/RP2350: Found " << hw4Controllers.size() << " SpiHw4 controllers");
-
-    for (const auto& ctrl : hw4Controllers) {
-        if (ctrl) {
-            controllers.push_back(ctrl);
-            priorities.push_back(7);
-            names.push_back(ctrl->getName());  // "SPI0" or "SPI1"
-        }
-    }
-
-    // ========================================================================
-    // Collect SpiHw2 controllers (lower priority: 6)
-    // ========================================================================
-    const auto& hw2Controllers = SpiHw2::getAll();
-    FL_DBG("RP2040/RP2350: Found " << hw2Controllers.size() << " SpiHw2 controllers");
-
-    for (const auto& ctrl : hw2Controllers) {
-        if (ctrl) {
-            controllers.push_back(ctrl);
-            priorities.push_back(6);
-            names.push_back(ctrl->getName());  // "SPI0" or "SPI1"
-        }
-    }
+    // RP2040's PIO-based SpiHw2/4/8 controllers are intentionally not added
+    // here. They are multi-lane backends for MultiLaneDevice, which owns the
+    // lane buffers and performs the required bit transposition before DMA.
+    // SpiChannelEngineAdapter receives independent ChannelData buffers and
+    // cannot safely reinterpret them as a parallel transfer.
 
     // ========================================================================
     // Create unified adapter with all controllers
@@ -107,9 +74,7 @@ static void addSpiHardwareIfPossible(ChannelManager& manager) {
 
             manager.addDriver(maxPriority, adapter);
 
-            FL_DBG("RP2040/RP2350: Registered unified SPI driver with "
-                   << controllers.size() << " controllers (priority "
-                   << maxPriority << ")");
+            FL_DBG("RP2040/RP2350: Registered unified SPI driver with " << controllers.size() << " controllers (priority " << maxPriority << ")");
         } else {
             FL_WARN("RP2040/RP2350: Failed to create unified SPI adapter");
         }
@@ -133,6 +98,25 @@ void initChannelDrivers() {
 
     // Register true SPI hardware (priority 6-8)
     detail::addSpiHardwareIfPossible(manager);
+
+    // RP2040 has two PL011 UART blocks. They are explicit Bus::UART lanes;
+    // USB CDC remains the sketch/RPC transport and is never registered here.
+    BusTraits<Bus::UART, 0>::registerWithManager();
+    BusTraits<Bus::UART, 1>::registerWithManager();
+    // Keep fixed PL022 SPI separate from the PIO multi-lane adapter above.
+    // Explicit Bus::SPI instance selection names SPI0 or SPI1 and therefore
+    // cannot be silently routed to a PIO parallel-SPI implementation.
+    BusTraits<Bus::SPI, 0>::registerWithManager();
+    BusTraits<Bus::SPI, 1>::registerWithManager();
+    BusTraits<Bus::FLEX_IO, 0>::registerWithManager();
+    BusTraits<Bus::FLEX_IO, 1>::registerWithManager();
+#if defined(FL_IS_RP2350)
+    BusTraits<Bus::FLEX_IO, 2>::registerWithManager();
+#endif
+#if !FASTLED_RP2040_CLOCKLESS_PIO
+    // M0 CPU bit-bang fallback for legacy clockless strips (#4635).
+    BusTraits<Bus::BIT_BANG, 0>::registerWithManager();
+#endif
 
     FL_DBG("RP2040/RP2350: Channel drivers initialized");
 }

@@ -13,6 +13,7 @@
 #include "fastled_delay.h"
 #include "fl/stl/compiler_control.h"
 #include "fl/stl/noexcept.h"
+#include "fl/system/delay.h"
 
 FL_DISABLE_WARNING_PUSH
 FL_DISABLE_WARNING_DEPRECATED_REGISTER
@@ -45,9 +46,9 @@ class InlineBlockClocklessController : public CPixelLEDController<RGB_ORDER, LAN
 	CMinWait<WAIT_TIME> mWait;
 
 public:
-	virtual int size() { return CLEDController::size() * LANES; }
+	int size() const FL_NO_EXCEPT override { return CLEDController::size() * LANES; }
 
-	virtual void showPixels(PixelController<RGB_ORDER, LANES, PORT_MASK> & pixels) FL_NOEXCEPT {
+	virtual void showPixels(PixelController<RGB_ORDER, LANES, PORT_MASK> & pixels) FL_NO_EXCEPT {
 		mWait.wait();
 		/*u32 clocks = */
 		int cnt=FASTLED_INTERRUPT_RETRY_COUNT;
@@ -56,7 +57,7 @@ public:
 			#ifdef FASTLED_DEBUG_COUNT_FRAME_RETRIES
 			++_retry_cnt;
 			#endif
-			delayMicroseconds(WAIT_TIME * 10);
+			fl::delayMicroseconds(WAIT_TIME * 10);
 			os_intr_lock();
 		}
 		// #if FASTLED_ALLOW_INTTERUPTS == 0
@@ -68,11 +69,11 @@ public:
 		mWait.mark();
 	}
 
-	template<int PIN> static void initPin() FL_NOEXCEPT {
+	template<int PIN> static void initPin() FL_NO_EXCEPT {
 		_ESPPIN<PIN, 1<<(PIN & 0xFF)>::setOutput();
 	}
 
-	virtual void init() FL_NOEXCEPT {
+	virtual void init() FL_NO_EXCEPT {
 		void (* funcs[])() ={initPin<12>, initPin<13>, initPin<14>, initPin<15>, initPin<4>, initPin<5>};
 
 		for (u8 i = 0; i < USED_LANES; ++i) {
@@ -90,7 +91,7 @@ public:
 
 #define ESP_ADJUST 0 // (2*(F_CPU/24000000))
 #define ESP_ADJUST2 0
-  	template<int BITS,int PX> __attribute__ ((always_inline)) inline static void writeBits(FASTLED_REGISTER u32 & last_mark, FASTLED_REGISTER Lines & b, PixelController<RGB_ORDER, LANES, PORT_MASK> &pixels) FL_NOEXCEPT { // , FASTLED_REGISTER uint32_t & b2)  {
+  	template<int BITS,int PX> __attribute__ ((always_inline)) inline static void writeBits(FASTLED_REGISTER u32 & last_mark, FASTLED_REGISTER Lines & b, PixelController<RGB_ORDER, LANES, PORT_MASK> &pixels) FL_NO_EXCEPT { // , FASTLED_REGISTER uint32_t & b2)  {
 	  	Lines b2 = b;
 		transpose8x1_noinline(b.bytes,b2.bytes);
 
@@ -128,7 +129,7 @@ public:
 
   	// This method is made static to force making register Y available to use for data on AVR - if the method is non-static, then
 	// gcc will use register Y for the this pointer.
-	static u32 FL_IRAM showRGBInternal(PixelController<RGB_ORDER, LANES, PORT_MASK> &allpixels) FL_NOEXCEPT {
+	static u32 FL_IRAM showRGBInternal(PixelController<RGB_ORDER, LANES, PORT_MASK> &allpixels) FL_NO_EXCEPT {
 
 		// Setup the pixel controller and load/scale the first byte
 		Lines b0;

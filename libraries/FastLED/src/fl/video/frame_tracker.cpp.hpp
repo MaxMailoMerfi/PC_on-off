@@ -1,18 +1,19 @@
 #include "fl/video/frame_tracker.h"
 #include "fl/stl/int.h"
 #include "fl/math/math.h"
+#include "fl/stl/noexcept.h"
 
 namespace fl {
 namespace video {
 
-FrameTracker::FrameTracker(float fps) {
+FrameTracker::FrameTracker(float fps) FL_NO_EXCEPT {
     // Convert fps to microseconds per frame interval
     mMicrosSecondsPerInterval = static_cast<fl::u32>(1000000.0f / fps + .5f);
 }
 
 void FrameTracker::get_interval_frames(fl::u32 now, fl::u32 *frameNumber,
                                        fl::u32 *nextFrameNumber,
-                                       u8 *amountOfNextFrame) const {
+                                       u8 *amountOfNextFrame) const FL_NO_EXCEPT {
     // Account for any pause time
     fl::u32 effectiveTime = now;
 
@@ -25,8 +26,10 @@ void FrameTracker::get_interval_frames(fl::u32 now, fl::u32 *frameNumber,
 
     // Calculate interpolation amount if requested
     if (amountOfNextFrame != nullptr) {
-        fl::u64 frame1_start = (*frameNumber * mMicrosSecondsPerInterval);
-        fl::u64 frame2_start = (*nextFrameNumber * mMicrosSecondsPerInterval);
+        fl::u64 frame1_start =
+            static_cast<fl::u64>(*frameNumber) * mMicrosSecondsPerInterval;
+        fl::u64 frame2_start =
+            static_cast<fl::u64>(*nextFrameNumber) * mMicrosSecondsPerInterval;
         fl::u32 rel_time = microseconds - frame1_start;
         fl::u32 frame_duration = frame2_start - frame1_start;
         u8 progress = map_range<fl::u32, u8>(rel_time, 0, frame_duration, 0, 255);
@@ -34,8 +37,9 @@ void FrameTracker::get_interval_frames(fl::u32 now, fl::u32 *frameNumber,
     }
 }
 
-fl::u32 FrameTracker::get_exact_timestamp_ms(fl::u32 frameNumber) const {
-    fl::u64 microseconds = frameNumber * mMicrosSecondsPerInterval;
+fl::u32 FrameTracker::get_exact_timestamp_ms(fl::u32 frameNumber) const FL_NO_EXCEPT {
+    fl::u64 microseconds =
+        static_cast<fl::u64>(frameNumber) * mMicrosSecondsPerInterval;
     return static_cast<fl::u32>(microseconds / 1000) + mStartTime;
 }
 

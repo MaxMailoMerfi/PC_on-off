@@ -1,12 +1,12 @@
-// IWYU pragma: private
+﻿// IWYU pragma: private
 
 
 #include "platforms/wasm/is_wasm.h"
 #ifdef FL_IS_WASM
 
-// ⚠️⚠️⚠️ CRITICAL WARNING: C++ ↔ JavaScript FILE SYSTEM BRIDGE - HANDLE WITH EXTREME CARE! ⚠️⚠️⚠️
+// âš ï¸âš ï¸âš ï¸ CRITICAL WARNING: C++ â†” JavaScript FILE SYSTEM BRIDGE - HANDLE WITH EXTREME CARE! âš ï¸âš ï¸âš ï¸
 //
-// 🚨 THIS FILE CONTAINS C++ TO JAVASCRIPT FILE SYSTEM BINDINGS 🚨
+// ðŸš¨ THIS FILE CONTAINS C++ TO JAVASCRIPT FILE SYSTEM BINDINGS ðŸš¨
 //
 // DO NOT MODIFY FUNCTION SIGNATURES WITHOUT UPDATING CORRESPONDING JAVASCRIPT CODE!
 //
@@ -32,7 +32,7 @@
 // 3. Verify JSON parsing for file declarations works correctly
 // 4. Check that file operations remain accessible from JavaScript
 //
-// ⚠️⚠️⚠️ REMEMBER: File system errors prevent resource loading! ⚠️⚠️⚠️
+// âš ï¸âš ï¸âš ï¸ REMEMBER: File system errors prevent resource loading! âš ï¸âš ï¸âš ï¸
 
 // IWYU pragma: begin_keep
 #include <emscripten.h>
@@ -49,7 +49,8 @@
 // IWYU pragma: end_keep
 
 #include "fl/log/log.h"
-#include "fl/system/file_system.h"
+#include "fl/fled/detail/parser.h"
+#include "fl/fs/fs.h"
 #include "fl/stl/json.h"
 #include "fl/math/math.h"
 #include "fl/stl/memory.h"
@@ -57,63 +58,14 @@
 #include "fl/stl/stdio.h"
 #include "fl/log/log.h"
 #include "fl/stl/mutex.h"
+#include "platforms/wasm/fs_wasm_file_handle.h"
+#include "platforms/wasm/fs_wasm_manifest.hpp"
 #include "platforms/wasm/js.h"
 
 
 namespace fl {
 
 FASTLED_SHARED_PTR(FsImplWasm);
-FASTLED_SHARED_PTR(WasmFileHandle);
-
-// Map is great because it doesn't invalidate it's data members unless erase is
-// called.
-FASTLED_SHARED_PTR(FileData);
-
-class FileData {
-  public:
-    FileData(size_t capacity) : mCapacity(capacity) { mData.reserve(capacity); }
-    FileData(const fl::vector<u8> &data, size_t len)
-        : mData(data), mCapacity(len) {}
-    FileData() = default;
-
-    void append(const u8 *data, size_t len) {
-        fl::unique_lock<fl::mutex> lock(mMutex);
-        mData.insert(mData.end(), data, data + len);
-        mCapacity = fl::max(mCapacity, mData.size());
-    }
-
-    size_t read(size_t pos, u8 *dst, size_t len) {
-        fl::unique_lock<fl::mutex> lock(mMutex);
-        if (pos >= mData.size()) {
-            return 0;
-        }
-        size_t bytesAvailable = mData.size() - pos;
-        size_t bytesToActuallyRead = fl::min(len, bytesAvailable);
-        fl::memcpy(dst, mData.data() + pos, bytesToActuallyRead);
-        return bytesToActuallyRead;
-    }
-
-    bool ready(size_t pos) {
-        fl::unique_lock<fl::mutex> lock(mMutex);
-        return mData.size() == mCapacity || pos < mData.size();
-    }
-
-    size_t bytesRead() const {
-        fl::unique_lock<fl::mutex> lock(mMutex);
-        return mData.size();
-    }
-
-    size_t capacity() const {
-        fl::unique_lock<fl::mutex> lock(mMutex);
-        return mCapacity;
-    }
-
-  private:
-    fl::vector<u8> mData;
-    size_t mCapacity = 0;
-    mutable fl::mutex mMutex;
-};
-
 typedef fl::flat_map<fl::string, FileDataPtr, fl::StringFastLess> FileMap;  // okay fl namespace
 
 struct FileRegistry {
@@ -125,95 +77,6 @@ struct FileRegistry {
     }
 private:
     FileRegistry() = default;
-};
-
-class WasmFileHandle : public fl::filebuf {
-  private:
-    FileDataPtr mData;
-    size_t mPos;
-    string mPath;
-
-  public:
-    WasmFileHandle(const string &path, const FileDataPtr data)
-        : mData(data), mPos(0), mPath(path) {}
-
-    virtual ~WasmFileHandle() override {}
-
-    bool is_open() const override { return true; } // always open if we have data
-
-    bool available() const override {
-        if (mPos >= mData->capacity()) {
-            return false;
-        }
-        if (!mData->ready(mPos)) {
-            FL_WARN("File is not ready yet. This is a major error because "
-                         "FastLED-wasm does not support async yet, the file "
-                         "will fail to read.");
-            return false;
-        }
-        return true;
-    }
-
-    fl::size_t bytes_left() const override {
-        if (!available()) {
-            return 0;
-        }
-        return mData->capacity() - mPos;
-    }
-
-    size_t size() const override { return mData->capacity(); }
-
-    size_t read(char *dst, size_t bytesToRead) override {
-        if (mPos >= mData->capacity()) {
-            return 0;
-        }
-        if (mPos + bytesToRead > mData->capacity()) {
-            bytesToRead = mData->capacity() - mPos;
-        }
-        if (!mData->ready(mPos)) {
-            FL_WARN("File is not ready yet. This is a major error because "
-                         "FastLED-wasm does not support async yet, the file "
-                         "will fail to read.");
-            return 0;
-        }
-        size_t bytesRead = mData->read(mPos, reinterpret_cast<u8*>(dst), bytesToRead); // ok reinterpret cast
-        mPos += bytesRead;
-        return bytesRead;
-    }
-    using filebuf::read; // Pull in u8 overload
-
-    size_t write(const char *data, size_t count) override {
-        (void)data; (void)count;
-        return 0; // Read-only
-    }
-
-    size_t tell() override { return mPos; }
-    const char *path() const override { return mPath.c_str(); }
-
-    bool seek(size_t pos, fl::seek_dir dir) override {
-        size_t target = pos;
-        if (dir == fl::seek_dir::cur) {
-            target = mPos + pos;
-        } else if (dir == fl::seek_dir::end) {
-            target = mData->capacity() + pos;
-        }
-        if (target > mData->capacity()) {
-            return false;
-        }
-        mPos = target;
-        return true;
-    }
-    using filebuf::seek; // Pull in single-arg overload
-
-    void close() override {
-        // No need to do anything for in-memory files
-    }
-
-    bool is_eof() const override { return mPos >= mData->capacity(); }
-    bool has_error() const override { return false; }
-    void clear_error() override {}
-    int error_code() const override { return 0; }
-    const char *error_message() const override { return "No error"; }
 };
 
 class FsImplWasm : public fl::FsImpl {
@@ -279,6 +142,87 @@ FileDataPtr _createIfNotExists(const fl::string &path, size_t len) {
     return entry;
 }
 
+// Dump a .fled file's JSON metadata envelope to the browser console.
+//
+// Files arrive here either whole (jsInjectFile) or in chunks (jsDeclareFile +
+// jsAppendFile), so this runs after every append and reports as soon as the
+// header plus the declared json_length have landed - not when the whole
+// payload has, which for a video is orders of magnitude later.
+//
+// printf is routed to console.log on this platform (see platforms/wasm/readme),
+// so println() is the console. Anything that is not a .fled stays silent: this
+// is a diagnostic for FLED bundles, not a log line for every asset.
+void _logFledEnvelopeOnce(const fl::string &path, const FileDataPtr &entry) {
+    if (!entry) {
+        return;
+    }
+
+    static fl::vector<fl::string> sReported;
+    static fl::mutex sReportedMutex;
+
+    const size_t have = entry->bytesRead();
+    if (have < 12) {
+        return;  // header not complete yet
+    }
+
+    // json_length lives at offset 8 as u32 little-endian.
+    fl::u8 header[12] = {0};
+    if (entry->read(0, header, 12) != 12) {
+        return;
+    }
+    if (header[0] != 'F' || header[1] != 'L' || header[2] != 'E' ||
+        header[3] != 'D') {
+        return;  // not a FLED container
+    }
+    const fl::u32 jsonLen =
+        static_cast<fl::u32>(header[8]) |
+        (static_cast<fl::u32>(header[9]) << 8) |
+        (static_cast<fl::u32>(header[10]) << 16) |
+        (static_cast<fl::u32>(header[11]) << 24);
+
+    const size_t envelopeEnd = 12u + static_cast<size_t>(jsonLen);
+    if (have < envelopeEnd) {
+        return;  // envelope still streaming
+    }
+
+    {
+        fl::unique_lock<fl::mutex> lock(sReportedMutex);
+        for (size_t i = 0; i < sReported.size(); ++i) {
+            if (sReported[i] == path) {
+                return;  // already reported this file
+            }
+        }
+        sReported.push_back(path);
+    }
+
+    fl::vector<fl::u8> buf;
+    buf.resize(envelopeEnd);
+    if (entry->read(0, buf.data(), envelopeEnd) != envelopeEnd) {
+        return;
+    }
+
+    fl::fled::ParsedHeader hdr{};
+    fl::json envelope;
+    if (!fl::fled::parseHeaderAndEnvelope(buf.data(), buf.size(), &hdr,
+                                          &envelope)) {
+        fl::println("[FLED] malformed container, cannot read metadata");
+        return;
+    }
+
+    fl::string out = "[FLED] ";
+    out += path;
+    out += " (v";
+    out += fl::to_string(static_cast<int>(hdr.version));
+    out += ", pixel_format 0x";
+    const char kHex[] = "0123456789abcdef";
+    char pf[3] = {kHex[(hdr.pixelFormat >> 4) & 0x0f],
+                  kHex[hdr.pixelFormat & 0x0f], '\0'};
+    out += pf;
+    out += ") metadata: ";
+    out += envelope.to_string();
+    fl::println(out.c_str());
+}
+
 } // namespace fl
 
 extern "C" {
@@ -292,6 +236,7 @@ EMSCRIPTEN_KEEPALIVE bool jsInjectFile(const char *path, const fl::u8 *data,
         return false;
     }
     inserted->append(data, len);
+    fl::_logFledEnvelopeOnce(fl::string(path), inserted);
     return true;
 }
 
@@ -303,6 +248,7 @@ EMSCRIPTEN_KEEPALIVE bool jsAppendFile(const char *path, const fl::u8 *data,
         return false;
     }
     entry->append(data, len);
+    fl::_logFledEnvelopeOnce(fl::string(path), entry);
     return true;
 }
 
@@ -317,37 +263,12 @@ EMSCRIPTEN_KEEPALIVE bool jsDeclareFile(const char *path, size_t len) {
 }
 
 EMSCRIPTEN_KEEPALIVE void fastled_declare_files(const char* jsonStr) {
-    fl::json doc = fl::json::parse(fl::string(jsonStr));
-    if (!doc.is_object() || !doc.contains("files")) {
-        return;
-    }
-    
-    auto files = doc["files"];
-    if (!files.is_array()) {
-        return;
-    }
-    
-    size_t fileCount = files.size();
-    for (size_t i = 0; i < fileCount; i++) {
-        auto file = files[i];
-        if (!file.is_object()) {
-            continue;
+    fl::wasm::declareManifestFiles(jsonStr, [](const fl::string &path, size_t size) {
+        FL_DBG("Declaring file " << path.c_str() << " with size " << size << ". These will become available as File system paths within the app.");
+        if (!jsDeclareFile(path.c_str(), size)) {
+            FL_WARN("Failed to declare manifest file: " << path.c_str());
         }
-        
-        if (!file.contains("size") || !file.contains("path")) {
-            continue;
-        }
-        
-        int size = file["size"] | 0;
-        fl::string path = file["path"] | fl::string("");
-        
-        if (size > 0 && !path.empty()) {
-            fl::printf("Declaring file %s with size %d. These will become available as "
-                   "File system paths within the app.\n",
-                   path.c_str(), size);
-            jsDeclareFile(path.c_str(), size);
-        }
-    }
+    });
 }
 
 } // extern "C"
@@ -356,7 +277,7 @@ EMSCRIPTEN_KEEPALIVE void fastled_declare_files(const char* jsonStr) {
 
 namespace fl {
 // Platforms eed to implement this to create an instance of the filesystem.
-FsImplPtr make_sdcard_filesystem(int cs_pin) { return fl::make_shared<FsImplWasm>(); }
+FsImplPtr make_sdcard_filesystem(int cs_pin) FL_NO_EXCEPT { return fl::make_shared<FsImplWasm>(); }
 } // namespace fl
 
 #endif // FL_IS_WASM

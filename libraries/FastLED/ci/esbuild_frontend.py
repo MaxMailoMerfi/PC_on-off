@@ -4,12 +4,12 @@ import hashlib
 import os
 import shutil
 import stat
-import subprocess
 import sys
 import tarfile
 from pathlib import Path
 
 import httpx
+from running_process import RunningProcess
 
 
 ESBUILD_VERSION = "0.28.0"
@@ -17,6 +17,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 FRONTEND_DIR = PROJECT_ROOT / "src" / "platforms" / "wasm" / "compiler"
 INSTALL_ROOT = Path.home() / ".fastled" / "toolchains" / "esbuild"
 ARCHIVE_CACHE_DIR = Path.home() / ".fastled" / "toolchains" / "archives"
+FRONTEND_DEPENDENCY_MARKER = "fastled-dependencies.sha256"
 
 
 def _platform_arch() -> tuple[str, str]:
@@ -101,11 +102,42 @@ def _copy_file(src: Path, dst: Path) -> None:
 def _get_source_mtime(source_dir: Path) -> float:
     max_mtime = 0.0
     for path in source_dir.rglob("*"):
-        if "dist" in path.parts:
+        if "dist" in path.parts or "node_modules" in path.parts:
             continue
         if path.is_file():
             max_mtime = max(max_mtime, path.stat().st_mtime)
     return max_mtime
+
+
+def _frontend_dependency_hash() -> str:
+    """Hash the manifests which determine a reproducible frontend install."""
+    digest = hashlib.sha256()
+    for name in ("package.json", "package-lock.json"):
+        manifest = FRONTEND_DIR / name
+        if not manifest.is_file():
+            raise RuntimeError(f"Missing frontend dependency manifest: {manifest}")
+        digest.update(name.encode("utf-8"))
+        digest.update(manifest.read_bytes())
+    return digest.hexdigest()
+
+
+def ensure_frontend_dependencies() -> None:
+    """Materialize the lockfile before esbuild resolves bare package imports."""
+    dependency_hash = _frontend_dependency_hash()
+    node_modules = FRONTEND_DIR / "node_modules"
+    marker = node_modules / FRONTEND_DEPENDENCY_MARKER
+    if (
+        marker.is_file()
+        and marker.read_text(encoding="utf-8").strip() == dependency_hash
+    ):
+        return
+
+    result = RunningProcess.run(
+        ["npm", "ci", "--ignore-scripts"], cwd=str(FRONTEND_DIR)
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"npm ci failed with exit code {result.returncode}")
+    marker.write_text(f"{dependency_hash}\n", encoding="utf-8")
 
 
 def _compute_dir_hash(directory: Path) -> str:
@@ -128,10 +160,9 @@ def _has_required_static_dist_assets(dist_dir: Path) -> bool:
 
 def _run_esbuild(args: list[str]) -> None:
     esbuild = install_esbuild()
-    result = subprocess.run(
+    result = RunningProcess.run(
         [
             str(esbuild),
-            "--alias:three=./vendor/three/build/three.module.js",
             *args,
         ],
         cwd=str(FRONTEND_DIR),
@@ -141,6 +172,7 @@ def _run_esbuild(args: list[str]) -> None:
 
 
 def build_dist() -> Path:
+    ensure_frontend_dependencies()
     dist_dir = FRONTEND_DIR / "dist"
     marker = dist_dir / ".esbuild_marker"
     source_mtime = _get_source_mtime(FRONTEND_DIR)

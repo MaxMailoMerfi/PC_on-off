@@ -8,15 +8,16 @@ construction, the skip-setup branch, and the actual ``meson setup`` call.
 """
 # pyright: reportMissingImports=false, reportUnknownVariableType=false
 
+import hashlib
 import os
 import platform
+import re
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple, Optional, cast
 
-from running_process import RunningProcess
+from running_process import CalledProcessError, RunningProcess, TimeoutExpired
 
 from ci.meson.compiler import (
     get_compiler_version,
@@ -25,7 +26,6 @@ from ci.meson.compiler import (
 from ci.meson.io_utils import write_if_different
 from ci.meson.meson_markers import (
     _write_configuration_markers,
-    cleanup_stale_meson_lockfile,
     inject_ar_optimization_patches,
     inject_zccache_wrapping,
 )
@@ -45,32 +45,145 @@ from ci.meson.path_normalization import (
     _enforce_strict_path_violations,
     normalize_meson_private_include_paths,
 )
+from ci.tools.reld import bridge_linker, ensure_reld
 from ci.util.global_interrupt_handler import handle_keyboard_interrupt
 from ci.util.output_formatter import TimestampFormatter
 from ci.util.timestamp_print import ts_print as _ts_print
 
 
-def detect_compiler_and_cache(markers: MarkerPaths, verbose: bool) -> CompilerDetection:
+_RELD_NAMES = frozenset({"reld", "reld.exe"})
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_native_linker(build_mode: str) -> tuple[str, str]:
+    """Select reld, FastLED's only native linker, and identify its contents.
+
+    reld links every host build on Linux, macOS and Windows; it routes ThinLTO
+    and non-ELF links to the clang-tool-chain bridge linker exported as
+    ``RELD_BRIDGE_LINKER``. ``FASTLED_NATIVE_LINKER`` may point at a different
+    reld build (e.g. a local checkout) but never at another linker.
+    """
+    del build_mode  # every mode, including ThinLTO release, links through reld
+    requested = os.environ.get("FASTLED_NATIVE_LINKER")
+    if requested is None:
+        path = ensure_reld()
+    else:
+        path = Path(requested)
+        if not path.is_absolute():
+            raise ValueError("FASTLED_NATIVE_LINKER must be an absolute path")
+        if path.name.lower() not in _RELD_NAMES:
+            raise ValueError(
+                f"FASTLED_NATIVE_LINKER must be a reld executable, got {path.name}"
+            )
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ValueError(f"native linker {path} is not an executable file")
+    # Always overwrite: a stale RELD_BRIDGE_LINKER inherited from an older
+    # shell must never win over the pinned toolchain. Every supported build
+    # entry point (bash test / compile / profile) resolves this before Ninja
+    # runs, and Ninja inherits it; bare `ninja` is banned by repo policy.
+    bridge = bridge_linker()
+    os.environ["RELD_BRIDGE_LINKER"] = str(bridge)
+    # The identity covers reld *and* its bridge, so a changed bridge relinks.
+    return str(
+        path
+    ), f"{path}:{_sha256_file(path)}|bridge={bridge}:{_sha256_file(bridge)}"
+
+
+def invalidate_native_link_outputs(build_dir: Path) -> int:
+    """Relink when linker contents changed without discarding compiled objects."""
+    graph = (build_dir / "build.ninja").read_text(encoding="utf-8")
+    outputs = re.findall(r"^build ([^ :]+): cpp_LINKER\b", graph, re.MULTILINE)
+    count = 0
+    for output in outputs:
+        relative = Path(output)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"Unsafe native link output in Ninja graph: {output}")
+        target = build_dir / relative
+        if target.is_file():
+            target.unlink()
+            count += 1
+    return count
+
+
+def _resolve_xcode_tool(tool: str) -> str:
+    """Return the selected Xcode tool path without relying on PATH shims."""
+    try:
+        result = RunningProcess.run(
+            ["xcrun", "--find", tool],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except KeyboardInterrupt as ki:
+        handle_keyboard_interrupt(ki)
+        raise
+    except (CalledProcessError, TimeoutExpired, OSError, RuntimeError) as error:
+        raise RuntimeError(f"Unable to resolve Xcode tool {tool!r}: {error}") from error
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() if result.stderr else "unknown xcrun error"
+        raise RuntimeError(f"Unable to resolve Xcode tool {tool!r}: {detail}")
+
+    path = result.stdout.strip()
+    if not path:
+        raise RuntimeError(f"xcrun returned no path for Xcode tool {tool!r}")
+    return path
+
+
+def _resolve_xcode_sdk_root() -> str:
+    """Return the active macOS SDK root for direct Xcode compiler calls."""
+    try:
+        result = RunningProcess.run(
+            ["xcrun", "--sdk", "macosx", "--show-sdk-path"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except KeyboardInterrupt as ki:
+        handle_keyboard_interrupt(ki)
+        raise
+    except (CalledProcessError, TimeoutExpired, OSError, RuntimeError) as error:
+        raise RuntimeError(f"Unable to resolve the macOS SDK root: {error}") from error
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() if result.stderr else "unknown xcrun error"
+        raise RuntimeError(f"Unable to resolve the macOS SDK root: {detail}")
+
+    path = result.stdout.strip()
+    if not path:
+        raise RuntimeError("xcrun returned no macOS SDK root")
+    return path
+
+
+def detect_compiler_and_cache(
+    markers: MarkerPaths, verbose: bool, build_mode: str
+) -> CompilerDetection:
     """Detect clang-tool-chain wrappers + zccache + version strings.
 
-    Caches the compiler and zccache version strings via marker mtimes so we
-    skip the ~3.6s subprocess unless the binary itself has changed.
+    Cache the compiler version via marker mtimes. Probe the selected zccache
+    directly: a fallback binary can predate a marker written for another path.
     """
-    in_docker = os.environ.get("FASTLED_DOCKER", "0") == "1"
-
-    cache_binary: Optional[str] = None
-    cache_name: Optional[str] = None
-    if not in_docker:
-        zccache_binary = _find_zccache_binary()
-        if zccache_binary:
-            cache_binary = zccache_binary
-            cache_name = "zccache"
-        else:
-            _ts_print(
-                "[MESON] zccache not found, compilation will proceed without caching. To install, run: bash ./install"
-            )
-    else:
-        _ts_print("[MESON] Skipping compiler cache in Docker (startup delay too long)")
+    # Private PCH inputs require the same wrapper for producers and consumers,
+    # including Docker. Reject an incomplete installation during setup.
+    cache_binary = _find_zccache_binary()
+    if cache_binary is None:
+        raise RuntimeError(
+            "zccache is required for safe PCH compilation; run: bash ./install"
+        )
+    cache_name = "zccache"
 
     clang_wrapper = shutil.which("clang-tool-chain-c")
     clangxx_wrapper = shutil.which("clang-tool-chain-cpp")
@@ -90,10 +203,17 @@ def detect_compiler_and_cache(markers: MarkerPaths, verbose: bool) -> CompilerDe
             _ts_print("[MESON]   - clang-tool-chain-ar")
         raise RuntimeError("clang-tool-chain wrapper commands not available")
 
+    apple_debug = sys.platform == "darwin" and build_mode == "debug"
     current_compiler_version = ""
     version_from_cache = False
-    clangxx_path = Path(clangxx_wrapper)
-    if markers.compiler_version.exists() and clangxx_path.exists():
+    selected_clangxx = (
+        _resolve_xcode_tool("clang++") if apple_debug else clangxx_wrapper
+    )
+    clangxx_path = Path(selected_clangxx)
+    # Always query Apple debug clang. A marker written by the former Clang 19
+    # toolchain can be newer than the selected Xcode binary, and reusing that
+    # marker would retain ASan objects with an incompatible runtime ABI.
+    if not apple_debug and markers.compiler_version.exists() and clangxx_path.exists():
         try:
             compiler_mtime = clangxx_path.stat().st_mtime
             marker_mtime = markers.compiler_version.stat().st_mtime
@@ -107,36 +227,24 @@ def detect_compiler_and_cache(markers: MarkerPaths, verbose: bool) -> CompilerDe
         except OSError:
             pass
     if not version_from_cache:
-        fast_compiler = _resolve_fast_compiler_binary()
+        fast_compiler = None if apple_debug else _resolve_fast_compiler_binary()
         current_compiler_version = get_compiler_version(
-            fast_compiler if fast_compiler else clangxx_wrapper
+            fast_compiler if fast_compiler else selected_clangxx
         )
 
-    current_zccache_version = ""
-    if cache_binary:
-        zccache_version_from_cache = False
-        zccache_path = Path(cache_binary)
-        if markers.zccache_version.exists() and zccache_path.exists():
-            try:
-                zccache_mtime = zccache_path.stat().st_mtime
-                zc_marker_mtime = markers.zccache_version.stat().st_mtime
-                if zccache_mtime < zc_marker_mtime:
-                    cached_zc_ver = markers.zccache_version.read_text(
-                        encoding="utf-8"
-                    ).strip()
-                    if cached_zc_ver:
-                        current_zccache_version = cached_zc_ver
-                        zccache_version_from_cache = True
-            except OSError:
-                pass
-        if not zccache_version_from_cache:
-            current_zccache_version = get_zccache_version(cache_binary)
+    current_zccache_version = get_zccache_version(cache_binary)
+
+    version_match = re.fullmatch(
+        r"(?:zccache\s+)?(\d+)\.(\d+)\.(\d+)", current_zccache_version.strip()
+    )
+    if version_match is None or tuple(map(int, version_match.groups())) < (1, 15, 6):
+        raise RuntimeError(
+            "zccache >= 1.15.6 is required for safe PCH compilation; "
+            f"selected {cache_binary} reports {current_zccache_version!r}"
+        )
 
     if verbose:
-        if cache_name:
-            print(f"Toolchain: {current_compiler_version} + {cache_name}")
-        else:
-            print(f"Toolchain: {current_compiler_version}")
+        print(f"Toolchain: {current_compiler_version} + {cache_name}")
 
     return CompilerDetection(
         clang_wrapper=clang_wrapper,
@@ -153,6 +261,7 @@ def write_meson_native_file(
     *,
     native_file_path: Path,
     compiler: CompilerDetection,
+    build_mode: str,
 ) -> None:
     """Generate/update the Meson native file with tool paths + platform info.
 
@@ -163,18 +272,39 @@ def write_meson_native_file(
     instead of timing out under zccache. See issue #2714.
     """
     try:
-        fast = _resolve_fast_native_entries()
-        if fast.cc is not None:
-            c_compiler = fast.cc
-            cpp_compiler = fast.cxx
-            ar_tool = fast.ar
-        else:
-            c_compiler = f"['{compiler.clang_wrapper}']"
-            cpp_compiler = f"['{compiler.clangxx_wrapper}']"
-            ar_tool = f"['{compiler.llvm_ar_wrapper}']"
-
         is_windows = sys.platform.startswith("win") or os.name == "nt"
         is_darwin = sys.platform == "darwin"
+        apple_builtin_options = ""
+
+        if is_darwin and build_mode == "debug":
+            # macOS 26.4 deadlocks before main() with older ASan runtimes
+            # (LLVM #200447). Xcode 26.4+ contains Apple's fixed compiler-rt,
+            # so compile and link sanitized Apple targets with the selected
+            # Xcode toolchain as one ABI-compatible unit.
+            c_compiler = f"['{_resolve_xcode_tool('clang')}']"
+            cpp_compiler = f"['{_resolve_xcode_tool('clang++')}']"
+            ar_tool = f"['{_resolve_xcode_tool('ar')}']"
+            sdk_root = _resolve_xcode_sdk_root()
+            # Directly invoking the Xcode toolchain binary does not select an
+            # SDK. Apply the active macOS SDK to compiler probes, compilation,
+            # and links so libc++, system libraries, and frameworks resolve.
+            apple_builtin_options = f"""
+[built-in options]
+c_args = ['-isysroot', '{sdk_root}']
+cpp_args = ['-isysroot', '{sdk_root}']
+c_link_args = ['-isysroot', '{sdk_root}']
+cpp_link_args = ['-isysroot', '{sdk_root}']
+"""
+        else:
+            fast = _resolve_fast_native_entries()
+            if fast.cc is not None:
+                c_compiler = fast.cc
+                cpp_compiler = fast.cxx
+                ar_tool = fast.ar
+            else:
+                c_compiler = f"['{compiler.clang_wrapper}']"
+                cpp_compiler = f"['{compiler.clangxx_wrapper}']"
+                ar_tool = f"['{compiler.llvm_ar_wrapper}']"
 
         machine = platform.machine().lower()
         if machine in ("x86_64", "amd64"):
@@ -200,13 +330,14 @@ def write_meson_native_file(
 # This file is auto-generated by meson_runner.py to configure tool paths.
 # It persists across build regenerations when ninja detects meson.build changes.
 #
-# IMPORTANT: LLD linker is forced via -fuse-ld=lld in meson.build link_args.
-# This ensures consistent linker behavior across Windows, Linux, and macOS.
+# clang-tool-chain builds use LLD. Apple debug builds use Xcode clang + ld64
+# so the compiler instrumentation and fixed platform sanitizer runtime match.
 
 [binaries]
 c = {c_compiler}
 cpp = {cpp_compiler}
 ar = {ar_tool}
+{apple_builtin_options}
 
 [host_machine]
 system = '{host_system}'
@@ -224,7 +355,7 @@ endian = 'little'
         _ts_print(f"[MESON] Warning: Could not write native file: {e}", file=sys.stderr)
 
 
-def build_setup_env(compiler: CompilerDetection) -> dict[str, str]:
+def build_setup_env(compiler: CompilerDetection, build_mode: str) -> dict[str, str]:
     """Build the environment dict for ``meson setup``.
 
     Uses raw compiler binaries when resolvable (avoids ~3.6s Python wrapper
@@ -234,6 +365,13 @@ def build_setup_env(compiler: CompilerDetection) -> dict[str, str]:
     env = os.environ.copy()
     if compiler.cache_binary:
         env.setdefault("ZCCACHE_STRICT_PATHS", "absolute")
+
+    if sys.platform == "darwin" and build_mode == "debug":
+        env["CC"] = _resolve_xcode_tool("clang")
+        env["CXX"] = _resolve_xcode_tool("clang++")
+        env["AR"] = _resolve_xcode_tool("ar")
+        env["SDKROOT"] = _resolve_xcode_sdk_root()
+        return env
 
     fast_compiler = _resolve_fast_compiler_binary()
     if fast_compiler:
@@ -269,7 +407,9 @@ def handle_skip_meson_setup(
     debug: bool,
     check: bool,
     build_mode: str,
+    native_linker_identity: str,
     enable_examples: bool,
+    enable_full_examples: bool,
     enable_unit_tests: bool,
     compiler: CompilerDetection,
 ) -> None:
@@ -299,6 +439,8 @@ def handle_skip_meson_setup(
     _write_configuration_markers(
         build_mode_marker=markers.build_mode,
         build_mode=build_mode,
+        native_linker_marker=markers.native_linker,
+        native_linker_identity=native_linker_identity,
         thin_archive_marker=markers.thin_archive,
         use_thin_archives=use_thin_archives,
         debug_marker=markers.debug,
@@ -318,6 +460,8 @@ def handle_skip_meson_setup(
         current_zccache_version=compiler.zccache_version or None,
         enable_examples_marker=markers.enable_examples,
         enable_examples=enable_examples,
+        enable_full_examples_marker=markers.enable_full_examples,
+        enable_full_examples=enable_full_examples,
         enable_unit_tests_marker=markers.enable_unit_tests,
         enable_unit_tests=enable_unit_tests,
         only_missing=True,
@@ -338,17 +482,21 @@ def handle_skip_meson_setup(
     _enforce_strict_path_violations(build_dir)
 
 
-# FastLED's full set of meson.build files, relative to the source dir
+# FastLED's Meson configuration inputs, relative to the source dir
 # (the project root). Listed explicitly so the wrapper can be invoked
 # with `--no-walk` and avoid the recursive `--source-dir` traversal
 # whose dominant cost was walking `.venv/` (~100k Python files, ~5s
-# cold-with-cache). Keep this list in sync with `find . -name meson.build`
-# (excluding scratch/worktree copies). See zackees/zccache#659.
+# cold-with-cache). Keep the Meson files in sync with
+# `find . -name meson.build` (excluding scratch/worktree copies), and
+# include non-Meson inputs that affect target generation. See zackees/zccache#659.
 FASTLED_MESON_BUILD_FILES: tuple[str, ...] = (
     "meson.build",
+    "meson.options",
     "tests/meson.build",
     "tests/profile/meson.build",
     "examples/meson.build",
+    "ci/examples/example_groups.py",
+    "ci/meson/compile_tests/meson.build",
     "ci/meson/native/meson.build",
     "ci/meson/shared/meson.build",
     "ci/meson/wasm/meson.build",
@@ -400,17 +548,18 @@ def _get_zccache_meson_configure_path() -> Optional[ZccacheCapability]:
         # The wrapper-equipped binary prints "Cache-aware `meson setup`..." at
         # the top; a passthrough binary forwards to real meson which prints
         # "usage: meson [-h]..." instead.
-        result = subprocess.run(
+        result = RunningProcess.run(
             [str(venv_zccache), "meson", "configure", "--help"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=False,
         )
     except KeyboardInterrupt as ki:
         handle_keyboard_interrupt(ki)
         raise ki
-    except (subprocess.SubprocessError, OSError):
+    except (CalledProcessError, TimeoutExpired, OSError, RuntimeError):
         return None
     if "Cache-aware" not in result.stdout:
         return None
@@ -425,6 +574,7 @@ def _write_zccache_input_sidecar(
     build_dir: Path,
     build_mode: str,
     source_hashes: "SourceHashes",
+    native_linker_identity: str,
 ) -> Optional[Path]:
     """Persist FastLED's source/test/example hashes to a sidecar file the
     zccache configure-cache wrapper can hash via ``--input-file``.
@@ -447,6 +597,7 @@ def _write_zccache_input_sidecar(
             f"src={source_hashes.src_hash}",
             f"test={source_hashes.test_hash}",
             f"source={source_hashes.source_hash}",
+            f"native_linker={native_linker_identity}",
         ]
     )
     try:
@@ -461,9 +612,12 @@ def build_meson_setup_cmd(
     native_file_path: Path,
     build_dir: Path,
     build_mode: str,
+    native_linker: str,
+    native_linker_identity: str,
     enable_examples: bool,
     enable_unit_tests: bool,
     reconfigure: bool,
+    enable_full_examples: bool = True,
     source_hashes: Optional["SourceHashes"] = None,
 ) -> list[str]:
     """Build the ``meson setup [--reconfigure] ...`` command list.
@@ -497,8 +651,10 @@ def build_meson_setup_cmd(
         "--native-file",
         str(native_file_path),
         f"-Dbuild_mode={build_mode}",
+        f"-Dnative_linker={native_linker}",
         f"-Denable_examples={str(enable_examples).lower()}",
         f"-Denable_unit_tests={str(enable_unit_tests).lower()}",
+        f"-Denable_full_examples={str(enable_full_examples).lower()}",
     ]
 
     capability = _get_zccache_meson_configure_path()
@@ -508,6 +664,7 @@ def build_meson_setup_cmd(
             build_dir=build_dir,
             build_mode=build_mode,
             source_hashes=source_hashes,
+            native_linker_identity=native_linker_identity,
         )
 
     # Wrapper path: requires zccache+wrapper. The sidecar is OPTIONAL —
@@ -535,6 +692,14 @@ def build_meson_setup_cmd(
             wrapped.extend(["--input-file", str(sidecar)])
         # `--` separates wrapper flags from the trailing meson args.
         wrapped.append("--")
+        # `--reconfigure` must survive the wrapper. Without it the wrapper runs
+        # a plain `meson setup` against an already-configured dir, meson prints
+        # "Directory already configured" and regenerates nothing -- so a
+        # source-triggered reconfigure (e.g. a newly added test file) is
+        # detected, reported, and then silently dropped. Only `--clean` picked
+        # the file up.
+        if reconfigure:
+            wrapped.append("--reconfigure")
         wrapped.extend(meson_args)
         return wrapped
 
@@ -546,7 +711,58 @@ def build_meson_setup_cmd(
 
 
 _ZCCACHE_MESON_HIT_MARKER = "[zccache-meson] hit"
-_PCH_ARTIFACT_SUFFIXES = (".pch", ".pch.input_hash", ".d.cache")
+_PCH_ARTIFACT_SUFFIXES = (
+    ".pch",
+    ".pch.input_hash",
+    ".pch.flags_hash",
+    ".pch.inputs.json",
+    ".pch.zccache-imports.json",
+    ".d.cache",
+)
+
+
+def _migrate_native_linker_option(
+    *,
+    build_dir: Path,
+    marker: Path,
+    native_linker: str,
+    source_dir: Path,
+    env: dict[str, str],
+) -> bool:
+    """Register the new project option in build dirs created before it existed."""
+    if marker.exists() or not (build_dir / "build.ninja").exists():
+        return True
+    _ts_print("[MESON] Registering native_linker option in existing build directory")
+    bootstrap = RunningProcess(
+        [get_meson_executable(), "setup", "--reconfigure", str(build_dir)],
+        cwd=source_dir,
+        timeout=600,
+        auto_run=True,
+        check=False,
+        env=env,
+        output_formatter=TimestampFormatter(),
+    )
+    if bootstrap.wait(echo=True) != 0:
+        _ts_print("[MESON] Native linker option migration failed", file=sys.stderr)
+        return False
+    proc = RunningProcess(
+        [
+            get_meson_executable(),
+            "configure",
+            str(build_dir),
+            f"-Dnative_linker={native_linker}",
+        ],
+        cwd=source_dir,
+        timeout=600,
+        auto_run=True,
+        check=False,
+        env=env,
+        output_formatter=TimestampFormatter(),
+    )
+    if proc.wait(echo=True) != 0:
+        _ts_print("[MESON] Native linker option migration failed", file=sys.stderr)
+        return False
+    return True
 
 
 def _purge_restored_pch_artifacts(build_dir: Path) -> None:
@@ -589,13 +805,26 @@ def run_meson_setup_command(
     debug: bool,
     check: bool,
     build_mode: str,
+    native_linker: str,
+    native_linker_identity: str,
+    native_linker_changed: bool,
     enable_examples: bool,
+    enable_full_examples: bool,
     enable_unit_tests: bool,
     use_thin_archives: bool,
     compiler: CompilerDetection,
 ) -> bool:
     """Run ``meson setup``, with one self-healing retry, then persist markers."""
     print_banner("MESON CONFIGURATION", "⚙️")
+
+    if not _migrate_native_linker_option(
+        build_dir=build_dir,
+        marker=markers.native_linker,
+        native_linker=native_linker,
+        source_dir=source_dir,
+        env=env,
+    ):
+        return False
 
     def _run_meson_setup() -> tuple[int, str]:
         proc = RunningProcess(
@@ -628,7 +857,6 @@ def run_meson_setup_command(
                     )
 
     try:
-        cleanup_stale_meson_lockfile(build_dir)
         returncode, stdout = _run_meson_setup()
 
         if returncode != 0 and "does not exist" in stdout:
@@ -637,7 +865,6 @@ def run_meson_setup_command(
             )
             _clear_stale_caches()
             _ts_print("[MESON] 🔄 Retrying meson setup...")
-            cleanup_stale_meson_lockfile(build_dir)
             returncode, stdout = _run_meson_setup()
 
         if returncode != 0:
@@ -651,9 +878,19 @@ def run_meson_setup_command(
         if _ZCCACHE_MESON_HIT_MARKER in stdout:
             _purge_restored_pch_artifacts(build_dir)
 
+        # Keep the previous identity marker until stale outputs are gone. If
+        # setup is interrupted here, the next invocation must retry the relink.
+        if native_linker_changed:
+            removed = invalidate_native_link_outputs(build_dir)
+            _ts_print(
+                f"[MESON] Native linker changed; invalidated {removed} link outputs"
+            )
+
         _write_configuration_markers(
             build_mode_marker=markers.build_mode,
             build_mode=build_mode,
+            native_linker_marker=markers.native_linker,
+            native_linker_identity=native_linker_identity,
             thin_archive_marker=markers.thin_archive,
             use_thin_archives=use_thin_archives,
             debug_marker=markers.debug,
@@ -673,6 +910,8 @@ def run_meson_setup_command(
             current_zccache_version=compiler.zccache_version or None,
             enable_examples_marker=markers.enable_examples,
             enable_examples=enable_examples,
+            enable_full_examples_marker=markers.enable_full_examples,
+            enable_full_examples=enable_full_examples,
             enable_unit_tests_marker=markers.enable_unit_tests,
             enable_unit_tests=enable_unit_tests,
             only_missing=False,

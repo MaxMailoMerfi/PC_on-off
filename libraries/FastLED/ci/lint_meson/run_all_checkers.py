@@ -10,10 +10,12 @@ Architecture mirrors ci/lint_cpp/run_all_checkers.py:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 from ci.lint_meson.backslash_path_checker import BackslashPathChecker
+from ci.lint_meson.path_norm_join_checker import PathNormJoinChecker
 from ci.util.check_files import FileContentChecker, MultiCheckerFileProcessor
 
 
@@ -21,8 +23,20 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def _collect_meson_files(root: Path) -> list[str]:
-    """Find all meson.build files under root."""
-    return sorted(str(p) for p in root.rglob("meson.build") if ".build" not in p.parts)
+    """Find repository Meson files, excluding generated and nested worktrees.
+
+    Uses os.walk with pruning instead of Path.rglob: other lint stages run
+    concurrently and mutate build trees (e.g. the Rust linter's cargo
+    ``target/``), and rglob raises FileNotFoundError when a directory
+    vanishes mid-walk. os.walk ignores such errors by default.
+    """
+    excluded_directories = {".build", ".claude", ".git", ".venv", "target"}
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in excluded_directories]
+        if "meson.build" in filenames:
+            found.append(str(Path(dirpath) / "meson.build"))
+    return sorted(found)
 
 
 def _collect_violations(
@@ -68,6 +82,7 @@ def run_meson_lint() -> bool:
     # All checkers — add new checkers here
     checkers: list[FileContentChecker] = [
         BackslashPathChecker(),
+        PathNormJoinChecker(),
     ]
 
     processor = MultiCheckerFileProcessor()

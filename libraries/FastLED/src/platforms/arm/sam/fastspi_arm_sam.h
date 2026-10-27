@@ -14,7 +14,7 @@
 #if defined(FL_IS_SAMD21) || defined(FL_IS_SAMD51)
 // IWYU pragma: begin_keep
 #include "fl/system/arduino.h"
-#include <SPI.h>
+#include <variant.h>
 #include <wiring_private.h>
 // IWYU pragma: end_keep
 #include "fl/system/pin.h"  // For PinMode, PinValue enums
@@ -42,14 +42,14 @@ class SAMHardwareSPIOutput {
 	void disableSPI() { m_SPI->SPI_CR = SPI_CR_SPIDIS; }
 	void resetSPI() { m_SPI->SPI_CR = SPI_CR_SWRST; }
 
-	static inline void readyTransferBits(FASTLED_REGISTER u32 bits) FL_NOEXCEPT {
+	static inline void readyTransferBits(FASTLED_REGISTER u32 bits) FL_NO_EXCEPT {
 		bits -= 8;
 		// don't change the number of transfer bits while data is still being transferred from TDR to the shift register
 		waitForEmpty();
 		m_SPI->SPI_CSR[0] = SPI_CSR_NCPHA | SPI_CSR_CSAAT | (bits << SPI_CSR_BITS_Pos) | SPI_CSR_DLYBCT(1) | SPI_CSR_SCBR(_SPI_CLOCK_DIVIDER);
 	}
 
-	template<int BITS> static inline void writeBits(u16 w) FL_NOEXCEPT {
+	template<int BITS> static inline void writeBits(u16 w) FL_NO_EXCEPT {
 		waitForEmpty();
 		m_SPI->SPI_TDR = (u32)w | SPI_PCS(0);
 	}
@@ -62,14 +62,14 @@ public:
 	void setSelect(Selectable *pSelect) { /* TODO */ }
 
 	// initialize the SPI subssytem
-	void init() FL_NOEXCEPT {
+	void init() FL_NO_EXCEPT {
 		// m_SPI = SPI0;
 
 		// set the output pins master out, master in, clock.  Note doing this here because I still don't
 		// know how I want to expose this type of functionality in FastPin.
-		PIO_Configure(PIOA, PIO_PERIPH_A, FastPin<_DATA_PIN>::mask(), PIO_DEFAULT) FL_NOEXCEPT;
-		PIO_Configure(PIOA, PIO_PERIPH_A, FastPin<_DATA_PIN-1>::mask(), PIO_DEFAULT) FL_NOEXCEPT;
-		PIO_Configure(PIOA, PIO_PERIPH_A, FastPin<_CLOCK_PIN>::mask(), PIO_DEFAULT) FL_NOEXCEPT;
+		PIO_Configure(PIOA, PIO_PERIPH_A, FastPin<_DATA_PIN>::mask(), PIO_DEFAULT) FL_NO_EXCEPT;
+		PIO_Configure(PIOA, PIO_PERIPH_A, FastPin<_DATA_PIN-1>::mask(), PIO_DEFAULT) FL_NO_EXCEPT;
+		PIO_Configure(PIOA, PIO_PERIPH_A, FastPin<_CLOCK_PIN>::mask(), PIO_DEFAULT) FL_NO_EXCEPT;
 
 		release();
 
@@ -98,7 +98,7 @@ public:
 	// release the CS select
 	void inline release() __attribute__((always_inline)) { if(mPSelect != nullptr) { mPSelect->release(); } }
 
-	void endTransaction() FL_NOEXCEPT {
+	void endTransaction() FL_NO_EXCEPT {
 		waitFully();
 		release();
 	}
@@ -107,26 +107,26 @@ public:
 	void waitFully() { while((m_SPI->SPI_SR & SPI_SR_TXEMPTY) == 0); }
 
 	// write a byte out via SPI (returns immediately on writing register)
-	static void writeByte(u8 b) FL_NOEXCEPT {
+	static void writeByte(u8 b) FL_NO_EXCEPT {
 		writeBits<8>(b);
 	}
 
 	// write a word out via SPI (returns immediately on writing register)
-	static void writeWord(u16 w) FL_NOEXCEPT {
+	static void writeWord(u16 w) FL_NO_EXCEPT {
 		writeBits<16>(w);
 	}
 
 	// A raw set of writing byte values, assumes setup/init/waiting done elsewhere
-	static void writeBytesValueRaw(u8 value, int len) FL_NOEXCEPT {
+	static void writeBytesValueRaw(u8 value, int len) FL_NO_EXCEPT {
 		while(len--) { writeByte(value); }
 	}
 
 	// A full cycle of writing a value for len bytes, including select, release, and waiting
-	void writeBytesValue(u8 value, int len) FL_NOEXCEPT {
+	void writeBytesValue(u8 value, int len) FL_NO_EXCEPT {
 		select(); writeBytesValueRaw(value, len); release();
 	}
 
-	template <class D> void writeBytes(FASTLED_REGISTER u8 *data, int len) FL_NOEXCEPT {
+	template <class D> void writeBytes(FASTLED_REGISTER u8 *data, int len) FL_NO_EXCEPT {
 		u8 *end = data + len;
 		select();
 		// could be optimized to write 16bit words out instead of 8bit bytes
@@ -142,7 +142,7 @@ public:
 
 	// write a single bit out, which bit from the passed in byte is determined by template parameter
 	// not the most efficient mechanism in the world - but should be enough for sm16716 and friends
-	template <u8 BIT> inline void writeBit(u8 b) FL_NOEXCEPT {
+	template <u8 BIT> inline void writeBit(u8 b) FL_NO_EXCEPT {
 		// need to wait for all exisiting data to go out the door, first
 		waitFully();
 		disableSPI();
@@ -159,7 +159,7 @@ public:
 
 	// write a block of uint8_ts out in groups of three.  len is the total number of uint8_ts to write out.  The template
 	// parameters indicate how many uint8_ts to skip at the beginning and/or end of each grouping
-	template <u8 FLAGS, class D, EOrder RGB_ORDER> void writePixels(PixelController<RGB_ORDER> pixels, void* context = nullptr) FL_NOEXCEPT {
+	template <u8 FLAGS, class D, EOrder RGB_ORDER> void writePixels(PixelController<RGB_ORDER> pixels, void* context = nullptr) FL_NO_EXCEPT {
 		select();
 		int len = pixels.mLen;
 
@@ -201,121 +201,66 @@ namespace fl {
 template <u8 _DATA_PIN, u8 _CLOCK_PIN, u32 _SPI_CLOCK_DIVIDER>
 class SAMDHardwareSPIOutput {
 private:
-	Sercom* mSPI;
 	Selectable *mPSelect;
-	u8 mSercomNum;
 	bool mInitialized;
 
-	static inline void waitForEmpty(Sercom* spi) FL_NOEXCEPT {
-		while (!spi->SPI.INTFLAG.bit.DRE);
-	}
-
-	static inline void waitForComplete(Sercom* spi) FL_NOEXCEPT {
-		while (!spi->SPI.INTFLAG.bit.TXC);
-	}
+	static SERCOM* peripheral() FL_NO_EXCEPT;
+	static u32 clockHz() FL_NO_EXCEPT;
+	static void configureClock() FL_NO_EXCEPT;
 
 public:
-	SAMDHardwareSPIOutput() : mSPI(nullptr), mPSelect(nullptr), mSercomNum(0), mInitialized(false) {}
-	SAMDHardwareSPIOutput(Selectable *pSelect) : mSPI(nullptr), mPSelect(pSelect), mSercomNum(0), mInitialized(false) {}
+	SAMDHardwareSPIOutput() : mPSelect(nullptr), mInitialized(false) {}
+	SAMDHardwareSPIOutput(Selectable *pSelect) : mPSelect(pSelect), mInitialized(false) {}
 
 	// set the object representing the selectable
 	void setSelect(Selectable *pSelect) { mPSelect = pSelect; }
 
-	// Helper to get SERCOM instance from Arduino's SPI object
-	// On SAMD, the default SPI object uses a specific SERCOM
-	// We'll use Arduino's built-in SPI functionality if available
-	void init() FL_NOEXCEPT {
-		if (mInitialized) {
-			return;
-		}
-
-		// Use Arduino's built-in SPI library for SAMD
-		// This leverages the proper SERCOM already configured by the Arduino core
-		::SPI.begin();
-
-		// Get the SERCOM instance used by Arduino's SPI
-		// Note: Different boards use different SERCOM units:
-		// - Arduino Zero: SERCOM4
-		// - Feather M0: SERCOM4
-		// - Feather M4: SERCOM1
-		// We rely on Arduino core's pin definitions
-
-		#if defined(FL_IS_SAMD51)
-		// SAMD51 - Arduino core typically uses SERCOM1 or specific board SERCOM
-		// Use the SPI peripheral that Arduino configured
-		mSPI = &(::SPI);
-		#elif defined(FL_IS_SAMD21)
-		// SAMD21 - Arduino core typically uses SERCOM4
-		mSPI = &(::SPI);
-		#endif
-
-		// Configure SPI settings
-		// Clock divider maps to SPI frequency
-		// Default Arduino SPI uses 4MHz, we can adjust based on _SPI_CLOCK_DIVIDER
-		u32 clock_hz = F_CPU / _SPI_CLOCK_DIVIDER;
-		if (clock_hz > 24000000) clock_hz = 24000000;  // Max 24MHz for safety
-
-		::SPI.beginTransaction(SPISettings(clock_hz, MSBFIRST, SPI_MODE0));
-		::SPI.endTransaction();
-
-		mInitialized = true;
-	}
+	void init() FL_NO_EXCEPT;
 
 	// latch the CS select
-	void inline select() FL_NOEXCEPT __attribute__((always_inline)) {
-		if(mPSelect != nullptr) {
-			mPSelect->select();
-		}
-		if (mInitialized) {
-			u32 clock_hz = F_CPU / _SPI_CLOCK_DIVIDER;
-			if (clock_hz > 24000000) clock_hz = 24000000;
-			::SPI.beginTransaction(SPISettings(clock_hz, MSBFIRST, SPI_MODE0));
-		}
-	}
+	void inline select() FL_NO_EXCEPT __attribute__((always_inline));
 
 	// release the CS select
-	void inline release() FL_NOEXCEPT __attribute__((always_inline)) {
-		if (mInitialized) {
-			::SPI.endTransaction();
-		}
+	void inline release() FL_NO_EXCEPT __attribute__((always_inline)) {
 		if(mPSelect != nullptr) {
 			mPSelect->release();
 		}
 	}
 
-	void endTransaction() FL_NOEXCEPT {
+	void endTransaction() FL_NO_EXCEPT {
 		waitFully();
 		release();
 	}
 
 	// wait until all queued up data has been written
-	void waitFully() FL_NOEXCEPT {
-		// Arduino SPI is blocking, so no need to wait
+	void waitFully() FL_NO_EXCEPT {
+		// transferDataSPI() blocks until the receive-complete flag is set.
 	}
 
 	// write a byte out via SPI (returns immediately on writing register)
-	static void writeByte(u8 b) FL_NOEXCEPT {
-		::SPI.transfer(b);
+	static void writeByte(u8 b) FL_NO_EXCEPT {
+		peripheral()->transferDataSPI(b);
 	}
 
 	// write a word out via SPI (returns immediately on writing register)
-	static void writeWord(u16 w) FL_NOEXCEPT {
-		::SPI.transfer16(w);
+	static void writeWord(u16 w) FL_NO_EXCEPT {
+		writeByte(static_cast<u8>(w >> 8));
+		writeByte(static_cast<u8>(w));
 	}
 
 	// A raw set of writing byte values, assumes setup/init/waiting done elsewhere
-	static void writeBytesValueRaw(u8 value, int len) FL_NOEXCEPT {
+	static void writeBytesValueRaw(u8 value, int len) FL_NO_EXCEPT {
 		while(len--) { writeByte(value); }
 	}
 
 	// A full cycle of writing a value for len bytes, including select, release, and waiting
-	void writeBytesValue(u8 value, int len) FL_NOEXCEPT {
+	void writeBytesValue(u8 value, int len) FL_NO_EXCEPT {
 		select();
 		writeBytesValueRaw(value, len);
 		release();
 	}
 
-	template <class D> void writeBytes(FASTLED_REGISTER u8 *data, int len) FL_NOEXCEPT {
+	template <class D> void writeBytes(FASTLED_REGISTER u8 *data, int len) FL_NO_EXCEPT {
 		u8 *end = data + len;
 		select();
 		while(data != end) {
@@ -326,14 +271,13 @@ public:
 		release();
 	}
 
-	void writeBytes(FASTLED_REGISTER u8 *data, int len) FL_NOEXCEPT {
+	void writeBytes(FASTLED_REGISTER u8 *data, int len) FL_NO_EXCEPT {
 		writeBytes<DATA_NOP>(data, len);
 	}
 
 	// write a single bit out, which bit from the passed in byte is determined by template parameter
-	template <u8 BIT> inline void writeBit(u8 b) FL_NOEXCEPT {
-		// For bit-banging, we need to temporarily disable SPI and use GPIO
-		::SPI.endTransaction();
+	template <u8 BIT> inline void writeBit(u8 b) FL_NO_EXCEPT {
+		peripheral()->disableSPI();
 
 		pinMode(_DATA_PIN, PinMode::Output);
 		pinMode(_CLOCK_PIN, PinMode::Output);
@@ -347,12 +291,13 @@ public:
 		digitalWrite(_CLOCK_PIN, PinValue::High);
 		digitalWrite(_CLOCK_PIN, PinValue::Low);
 
-		// Re-initialize pins for SPI
-		::SPI.begin();
+		pinPeripheral(PIN_SPI_SCK, g_APinDescription[PIN_SPI_SCK].ulPinType);
+		pinPeripheral(PIN_SPI_MOSI, g_APinDescription[PIN_SPI_MOSI].ulPinType);
+		peripheral()->enableSPI();
 	}
 
 	// write a block of uint8_ts out in groups of three.  len is the total number of uint8_ts to write out.
-	template <u8 FLAGS, class D, EOrder RGB_ORDER> void writePixels(PixelController<RGB_ORDER> pixels, void* context = nullptr) FL_NOEXCEPT {
+	template <u8 FLAGS, class D, EOrder RGB_ORDER> void writePixels(PixelController<RGB_ORDER> pixels, void* context = nullptr) FL_NO_EXCEPT {
 		select();
 		int len = pixels.mLen;
 
@@ -381,12 +326,13 @@ public:
 		release();
 	}
 
-	/// Finalize transmission (no-op for SAMD SPI using Arduino core)
+	/// Finalize transmission (no-op for blocking SAMD SERCOM SPI)
 	/// This method exists for compatibility with other SPI implementations
 	static void finalizeTransmission() { }
 };
 
 }  // namespace fl
+
 #endif  // FL_IS_SAMD21 || FL_IS_SAMD51
 
 

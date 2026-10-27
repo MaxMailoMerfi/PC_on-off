@@ -2,28 +2,31 @@
 #include "fl/fx/wled.h"
 #include "fl/log/log.h"
 #include "fl/log/log.h"
+#include "fl/stl/compiler_control.h"  // IWYU pragma: keep - FL_UNUSED
+#include "fl/stl/noexcept.h"
 namespace fl {
 
 // WLED Constructor and Stub Implementations
 
-WLED::WLED()
+WLED::WLED() FL_NO_EXCEPT
     : Remote(
         [this]() { return stubRequestSource(); },
         [this](const fl::json& response) { stubResponseSink(response); }
     ) {}
 
-fl::optional<fl::json> WLED::stubRequestSource() {
+fl::optional<fl::json> WLED::stubRequestSource() FL_NO_EXCEPT {
     FL_ERROR("WLED::stubRequestSource: Not implemented - provide a real RequestSource callback");
     return fl::nullopt;
 }
 
-void WLED::stubResponseSink(const fl::json& response) {
+void WLED::stubResponseSink(const fl::json& response) FL_NO_EXCEPT {
+    FL_UNUSED(response);  // only consumed by FL_ERROR, a no-op on small platforms
     FL_ERROR("WLED::stubResponseSink: Not implemented - provide a real ResponseSink callback");
 }
 
 // WLED State Management
 
-void WLED::setState(const fl::json& wledState) {
+void WLED::setState(const fl::json& wledState) FL_NO_EXCEPT {
     if (!wledState.has_value()) {
         FL_WARN("WLED: setState called with invalid JSON");
         return;
@@ -34,7 +37,7 @@ void WLED::setState(const fl::json& wledState) {
         bool newOn = wledState["on"] | mWledOn;
         if (newOn != mWledOn) {
             mWledOn = newOn;
-            FL_DBG("WLED: on=" << (mWledOn ? "true" : "false"));
+            FL_DBG("WLED: on=" << ((mWledOn ? "true" : "false")));
         }
     }
 
@@ -53,7 +56,7 @@ void WLED::setState(const fl::json& wledState) {
             u8 newBri = static_cast<u8>(briInt);
             if (newBri != mWledBri) {
                 mWledBri = newBri;
-                FL_DBG("WLED: bri=" << static_cast<int>(mWledBri));
+                FL_DBG("WLED: bri=" << (static_cast<int>(mWledBri)));
             }
         } else {
             FL_WARN("WLED: 'bri' field has invalid type (expected int)");
@@ -141,7 +144,7 @@ void WLED::setState(const fl::json& wledState) {
             u8 newLiveOverride = static_cast<u8>(lorInt);
             if (newLiveOverride != mLiveOverride) {
                 mLiveOverride = newLiveOverride;
-                FL_DBG("WLED: lor=" << static_cast<int>(mLiveOverride));
+                FL_DBG("WLED: lor=" << (static_cast<int>(mLiveOverride)));
             }
         } else {
             FL_WARN("WLED: 'lor' field has invalid type (expected int)");
@@ -163,7 +166,7 @@ void WLED::setState(const fl::json& wledState) {
             u8 newMainSegment = static_cast<u8>(mainsegInt);
             if (newMainSegment != mMainSegment) {
                 mMainSegment = newMainSegment;
-                FL_DBG("WLED: mainseg=" << static_cast<int>(mMainSegment));
+                FL_DBG("WLED: mainseg=" << (static_cast<int>(mMainSegment)));
             }
         } else {
             FL_WARN("WLED: 'mainseg' field has invalid type (expected int)");
@@ -180,7 +183,7 @@ void WLED::setState(const fl::json& wledState) {
                 bool newNlOn = nl["on"] | mNightlightOn;
                 if (newNlOn != mNightlightOn) {
                     mNightlightOn = newNlOn;
-                    FL_DBG("WLED: nl.on=" << (mNightlightOn ? "true" : "false"));
+                    FL_DBG("WLED: nl.on=" << ((mNightlightOn ? "true" : "false")));
                 }
             }
 
@@ -199,7 +202,7 @@ void WLED::setState(const fl::json& wledState) {
                     u8 newDur = static_cast<u8>(durInt);
                     if (newDur != mNightlightDuration) {
                         mNightlightDuration = newDur;
-                        FL_DBG("WLED: nl.dur=" << static_cast<int>(mNightlightDuration));
+                        FL_DBG("WLED: nl.dur=" << (static_cast<int>(mNightlightDuration)));
                     }
                 } else {
                     FL_WARN("WLED: 'nl.dur' field has invalid type (expected int)");
@@ -221,7 +224,7 @@ void WLED::setState(const fl::json& wledState) {
                     u8 newMode = static_cast<u8>(modeInt);
                     if (newMode != mNightlightMode) {
                         mNightlightMode = newMode;
-                        FL_DBG("WLED: nl.mode=" << static_cast<int>(mNightlightMode));
+                        FL_DBG("WLED: nl.mode=" << (static_cast<int>(mNightlightMode)));
                     }
                 } else {
                     FL_WARN("WLED: 'nl.mode' field has invalid type (expected int)");
@@ -243,7 +246,7 @@ void WLED::setState(const fl::json& wledState) {
                     u8 newTbri = static_cast<u8>(tbriInt);
                     if (newTbri != mNightlightTargetBrightness) {
                         mNightlightTargetBrightness = newTbri;
-                        FL_DBG("WLED: nl.tbri=" << static_cast<int>(mNightlightTargetBrightness));
+                        FL_DBG("WLED: nl.tbri=" << (static_cast<int>(mNightlightTargetBrightness)));
                     }
                 } else {
                     FL_WARN("WLED: 'nl.tbri' field has invalid type (expected int)");
@@ -264,7 +267,7 @@ void WLED::setState(const fl::json& wledState) {
                 bool newSend = udpn["send"] | mUdpSend;
                 if (newSend != mUdpSend) {
                     mUdpSend = newSend;
-                    FL_DBG("WLED: udpn.send=" << (mUdpSend ? "true" : "false"));
+                    FL_DBG("WLED: udpn.send=" << ((mUdpSend ? "true" : "false")));
                 }
             }
 
@@ -273,7 +276,7 @@ void WLED::setState(const fl::json& wledState) {
                 bool newRecv = udpn["recv"] | mUdpReceive;
                 if (newRecv != mUdpReceive) {
                     mUdpReceive = newRecv;
-                    FL_DBG("WLED: udpn.recv=" << (mUdpReceive ? "true" : "false"));
+                    FL_DBG("WLED: udpn.recv=" << ((mUdpReceive ? "true" : "false")));
                 }
             }
         } else {
@@ -348,7 +351,7 @@ void WLED::setState(const fl::json& wledState) {
             // Extract "r" field (randomize)
             if (pl.contains("r") && pl["r"].is_bool()) {
                 mPlaylistRandomize = pl["r"] | false;
-                FL_DBG("WLED: playlist.r=" << (mPlaylistRandomize ? "true" : "false"));
+                FL_DBG("WLED: playlist.r=" << ((mPlaylistRandomize ? "true" : "false")));
             }
         } else {
             FL_WARN("WLED: 'playlist' field has invalid type (expected object)");
@@ -402,7 +405,7 @@ void WLED::setState(const fl::json& wledState) {
     }
 }
 
-fl::json WLED::getState() const {
+fl::json WLED::getState() const FL_NO_EXCEPT {
     fl::json state = fl::json::object();
     state.set("on", mWledOn);
     state.set("bri", static_cast<i64>(mWledBri));
@@ -507,7 +510,7 @@ fl::json WLED::getState() const {
     return state;
 }
 
-fl::json WLED::getPlaylistConfig() const {
+fl::json WLED::getPlaylistConfig() const FL_NO_EXCEPT {
     fl::json playlist = fl::json::object();
 
     // Preset IDs
@@ -545,7 +548,7 @@ fl::json WLED::getPlaylistConfig() const {
     return playlist;
 }
 
-const WLEDSegment* WLED::findSegmentById(u8 id) const {
+const WLEDSegment* WLED::findSegmentById(u8 id) const FL_NO_EXCEPT {
     for (const auto& seg : mSegments) {
         if (seg.mId == id) {
             return &seg;

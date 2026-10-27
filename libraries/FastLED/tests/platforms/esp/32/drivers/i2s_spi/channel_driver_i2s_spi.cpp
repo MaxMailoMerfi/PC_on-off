@@ -63,45 +63,45 @@ ChannelDataPtr createClocklessTestChannelData(int pin, size_t numLeds) {
 fl::shared_ptr<II2sSpiPeripheral> createMockPeripheral() {
     class MockWrapper : public II2sSpiPeripheral {
       public:
-        bool initialize(const I2sSpiConfig &config) FL_NOEXCEPT override {
+        bool initialize(const I2sSpiConfig &config) FL_NO_EXCEPT override {
             return I2sSpiPeripheralMock::instance().initialize(config);
         }
-        void deinitialize() FL_NOEXCEPT override {
+        void deinitialize() FL_NO_EXCEPT override {
             I2sSpiPeripheralMock::instance().deinitialize();
         }
-        bool isInitialized() const FL_NOEXCEPT override {
+        bool isInitialized() const FL_NO_EXCEPT override {
             return I2sSpiPeripheralMock::instance().isInitialized();
         }
-        u8 *allocateBuffer(size_t size_bytes) FL_NOEXCEPT override {
+        u8 *allocateBuffer(size_t size_bytes) FL_NO_EXCEPT override {
             return I2sSpiPeripheralMock::instance().allocateBuffer(size_bytes);
         }
-        void freeBuffer(u8 *buffer) FL_NOEXCEPT override {
+        void freeBuffer(u8 *buffer) FL_NO_EXCEPT override {
             I2sSpiPeripheralMock::instance().freeBuffer(buffer);
         }
         bool transmit(const u8 *buffer,
-                      size_t size_bytes) FL_NOEXCEPT override {
+                      size_t size_bytes) FL_NO_EXCEPT override {
             return I2sSpiPeripheralMock::instance().transmit(buffer,
                                                             size_bytes);
         }
-        bool waitTransmitDone(u32 timeout_ms) FL_NOEXCEPT override {
+        bool waitTransmitDone(u32 timeout_ms) FL_NO_EXCEPT override {
             return I2sSpiPeripheralMock::instance().waitTransmitDone(
                 timeout_ms);
         }
-        bool isBusy() const FL_NOEXCEPT override {
+        bool isBusy() const FL_NO_EXCEPT override {
             return I2sSpiPeripheralMock::instance().isBusy();
         }
         bool registerTransmitCallback(void *callback,
-                                      void *user_ctx) FL_NOEXCEPT override {
+                                      void *user_ctx) FL_NO_EXCEPT override {
             return I2sSpiPeripheralMock::instance().registerTransmitCallback(
                 callback, user_ctx);
         }
-        const I2sSpiConfig &getConfig() const FL_NOEXCEPT override {
+        const I2sSpiConfig &getConfig() const FL_NO_EXCEPT override {
             return I2sSpiPeripheralMock::instance().getConfig();
         }
-        u64 getMicroseconds() FL_NOEXCEPT override {
+        u64 getMicroseconds() FL_NO_EXCEPT override {
             return I2sSpiPeripheralMock::instance().getMicroseconds();
         }
-        void delay(u32 ms) FL_NOEXCEPT override {
+        void delay(u32 ms) FL_NO_EXCEPT override {
             I2sSpiPeripheralMock::instance().delay(ms);
         }
     };
@@ -274,6 +274,47 @@ FL_TEST_CASE("ChannelDriverI2sSpi - multi-channel transmission") {
     FL_REQUIRE(history.size() == 1);
     // Each channel has 4 + 10*4 + 4 = 48 bytes, interleaved: 48 * 3 = 144
     FL_CHECK(history[0].size_bytes == 48 * 3);
+}
+
+FL_TEST_CASE("ChannelDriverI2sSpi - full 16-lane transmission") {
+    resetMockState();
+    auto peripheral = createMockPeripheral();
+    ChannelDriverI2sSpi driver(peripheral);
+    SpiEncoder encoder = SpiEncoder::apa102();
+
+    constexpr size_t kLaneCount = 16;
+    constexpr int kClockPin = 18;
+    for (size_t lane = 0; lane < kLaneCount; ++lane) {
+        SpiChipsetConfig config{static_cast<int>(lane), kClockPin, encoder};
+        fl::vector_psram<u8> data;
+        data.resize(2);
+        data[0] = static_cast<u8>(0xA0 + lane);
+        data[1] = static_cast<u8>(0x10 + lane);
+        driver.enqueue(ChannelData::create(config, fl::move(data)));
+    }
+
+    driver.show();
+
+    auto &mock = I2sSpiPeripheralMock::instance();
+    const I2sSpiConfig &config = mock.getConfig();
+    FL_CHECK_EQ(config.num_lanes, static_cast<int>(kLaneCount));
+    FL_CHECK_EQ(config.clock_gpio, kClockPin);
+    FL_CHECK_EQ(config.max_transfer_bytes, 2 * kLaneCount);
+    for (size_t lane = 0; lane < kLaneCount; ++lane) {
+        FL_CHECK_EQ(config.data_gpios[lane], static_cast<int>(lane));
+    }
+
+    fl::span<const u8> tx = mock.getLastTransmitData();
+    FL_REQUIRE_EQ(tx.size(), 2 * kLaneCount);
+    for (size_t lane = 0; lane < kLaneCount; ++lane) {
+        FL_CHECK_EQ(tx[lane], static_cast<u8>(0xA0 + lane));
+        FL_CHECK_EQ(tx[kLaneCount + lane], static_cast<u8>(0x10 + lane));
+    }
+
+    FL_CHECK(driver.poll() == IChannelDriver::DriverState::DRAINING);
+    FL_CHECK(mock.isBusy());
+    mock.simulateTransmitComplete();
+    FL_CHECK(driver.poll() == IChannelDriver::DriverState::READY);
 }
 
 //=============================================================================

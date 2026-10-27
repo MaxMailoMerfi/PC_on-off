@@ -9,7 +9,7 @@ namespace fl {
 
 // Out-of-line destructor: ensures unique_ptr<MultiLaneDevice> destruction
 // happens here (in fl.spi+), not in every TU that includes spi.h.
-Spi::~Spi() FL_NOEXCEPT = default;
+Spi::~Spi() FL_NO_EXCEPT = default;
 
 // ============================================================================
 // Spi Constructors
@@ -18,11 +18,11 @@ Spi::~Spi() FL_NOEXCEPT = default;
 Spi::Spi(int clock_pin, fl::span<const int> data_pins,
          spi_output_mode_t output_mode,
          u32 clock_speed_hz)
-    : Spi(SpiConfig(clock_pin, data_pins, clock_speed_hz, output_mode, 0)) {
+    FL_NO_EXCEPT : Spi(SpiConfig(clock_pin, data_pins, clock_speed_hz, output_mode, 0)) {
 }
 
 Spi::Spi(const SpiConfig& config)
-    : is_ok(false), error_code(SPIError::NOT_INITIALIZED) {
+    FL_NO_EXCEPT : is_ok(false), error_code(SPIError::NOT_INITIALIZED) {
 
     // Validate number of lanes
     size_t num_lanes = config.data_pins.size();
@@ -59,14 +59,14 @@ Spi::Spi(const SpiConfig& config)
     is_ok = true;
 }
 
-Spi::Spi(Spi&& other) FL_NOEXCEPT
+Spi::Spi(Spi&& other) FL_NO_EXCEPT
     : device(fl::move(other.device))
     , is_ok(other.is_ok)
     , error_code(other.error_code) {
     other.is_ok = false;
 }
 
-Spi& Spi::operator=(Spi&& other) FL_NOEXCEPT {
+Spi& Spi::operator=(Spi&& other) FL_NO_EXCEPT {
     if (this != &other) {
         device = fl::move(other.device);
         is_ok = other.is_ok;
@@ -76,7 +76,7 @@ Spi& Spi::operator=(Spi&& other) FL_NOEXCEPT {
     return *this;
 }
 
-bool Spi::wait(u32 timeout_ms) {
+bool Spi::wait(u32 timeout_ms) FL_NO_EXCEPT {
     if (!device) {
         return false;
     }

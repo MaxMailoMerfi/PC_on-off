@@ -36,10 +36,10 @@ struct EdgeTime {
     u32 high : 1;   ///< High/low level (1 bit: 1=high, 0=low)
 
     /// Default constructor (low, 0ns)
-    constexpr EdgeTime() FL_NOEXCEPT : ns(0), high(0) {}
+    constexpr EdgeTime() FL_NO_EXCEPT : ns(0), high(0) {}
 
     /// Construct from high/low state and duration
-    constexpr EdgeTime(bool high_level, u32 ns_duration) FL_NOEXCEPT
+    constexpr EdgeTime(bool high_level, u32 ns_duration) FL_NO_EXCEPT
         : ns(ns_duration), high(high_level ? 1 : 0) {}
 };
 
@@ -58,7 +58,7 @@ struct EdgeRange {
     size_t count;   ///< Number of edges to extract
 
     /// Constructor
-    constexpr EdgeRange(size_t offsetParam, size_t countParam) FL_NOEXCEPT
+    constexpr EdgeRange(size_t offsetParam, size_t countParam) FL_NO_EXCEPT
         : offset(offsetParam), count(countParam) {}
 };
 
@@ -69,7 +69,8 @@ enum class DecodeError : u8 {
     OK = 0,                  ///< No error (not typically used)
     HIGH_ERROR_RATE,         ///< Symbol decode error rate too high (>10%)
     BUFFER_OVERFLOW,         ///< Output buffer overflow
-    INVALID_ARGUMENT         ///< Invalid input arguments
+    INVALID_ARGUMENT,        ///< Invalid input arguments
+    CAPTURE_OVERRUN          ///< Streaming capture lost data (ring overwritten before decode)
 };
 
 /**
@@ -143,7 +144,7 @@ struct ChipsetTiming4Phase {
  * @endcode
  */
 ChipsetTiming4Phase make4PhaseTiming(const ChipsetTiming& timing_3phase,
-                                      u32 tolerance_ns = 150) FL_NOEXCEPT;
+                                      u32 tolerance_ns = 150) FL_NO_EXCEPT;
 
 /**
  * @brief Result codes for RX wait() operations
@@ -161,12 +162,15 @@ enum class RxWaitResult : u8 {
  * factory pattern for compile-time device selection.
  */
 enum class RxDeviceType : u8 {
+    PIO = 7,              ///< PIO receiver (RP2040/RP2350)
     PLATFORM_DEFAULT = 0,  ///< Platform default (RMT on ESP32, FLEXPWM on Teensy 4.x; FLEXIO available as opt-in on Teensy 4 — see FastLED#2764; LPC_SCT_CAPTURE on LPC845)
     ISR = 1,              ///< GPIO ISR-based receiver (ESP32)
     RMT = 2,              ///< RMT-based receiver (ESP32)
     FLEXPWM = 3,          ///< FlexPWM input-capture receiver (Teensy 4.x)
     FLEXIO = 4,           ///< FlexIO shifter-based receiver (Teensy 4.x, FLEXIO1; see FastLED#2764)
-    LPC_SCT_CAPTURE = 5   ///< SCT input-capture + DMA receiver (LPC8xx). Skeleton + decoder land in #3015; bench-verified register-level capture is a follow-up.
+    LPC_SCT_CAPTURE = 5,  ///< SCT input-capture + DMA receiver (LPC8xx). Skeleton + decoder land in #3015; bench-verified register-level capture is a follow-up.
+    PARLIO_RX = 8,        ///< PARLIO 1-bit oversampling receiver (ESP32-C6 et al — FastLED#3586)
+    I2S_RX = 6            ///< I2S 1-bit oversampling receiver (classic ESP32 — breaks the RMT one-shot 10-LED capture ceiling, FastLED#3576 Phase 3)
 };
 
 /**
@@ -174,7 +178,7 @@ enum class RxDeviceType : u8 {
  * @param type RX device type
  * @return String name ("ISR" or "RMT")
  */
-inline const char* toString(RxDeviceType type) FL_NOEXCEPT {
+inline const char* toString(RxDeviceType type) FL_NO_EXCEPT {
     switch (type) {
     case RxDeviceType::PLATFORM_DEFAULT: return "PLATFORM_DEFAULT";
     case RxDeviceType::ISR:     return "ISR";
@@ -182,6 +186,9 @@ inline const char* toString(RxDeviceType type) FL_NOEXCEPT {
     case RxDeviceType::FLEXPWM: return "FLEXPWM";
     case RxDeviceType::FLEXIO:  return "FLEXIO";
     case RxDeviceType::LPC_SCT_CAPTURE: return "LPC_SCT_CAPTURE";
+    case RxDeviceType::I2S_RX: return "I2S_RX";
+    case RxDeviceType::PARLIO_RX: return "PARLIO_RX";
+    case RxDeviceType::PIO: return "PIO";
     }
     return "UNKNOWN";
 }
@@ -242,8 +249,14 @@ struct RxConfig {
     // RmtMemoryManager::allocateDMA(). See issue #2254.
     bool use_dma = false;                   ///< Use DMA streaming for RX (RMT only, default: false)
 
+    // Streaming decode (Teensy 4.x FlexPWM). That backend decodes bits from a
+    // small DMA ring inside its ISR while the frame arrives, so it needs the
+    // decode thresholds before decode() is called. Pass the same timing you
+    // will give decode(). Unset: WS2812B defaults. Other backends ignore it.
+    fl::optional<ChipsetTiming4Phase> stream_timing;
+
     /// Default constructor with common WS2812B defaults
-    constexpr RxConfig() FL_NOEXCEPT = default;
+    RxConfig() FL_NO_EXCEPT = default;
 };
 
 /**
@@ -279,7 +292,7 @@ public:
      * @endcode
      */
     template <RxDeviceType TYPE>
-    static fl::shared_ptr<RxDevice> create(int pin) FL_NOEXCEPT;
+    static fl::shared_ptr<RxDevice> create(int pin) FL_NO_EXCEPT;
 
     /**
      * @brief Initialize (or re-arm) RX channel with configuration
@@ -305,20 +318,24 @@ public:
      * rx->begin(config);
      * @endcode
      */
-    virtual bool begin(const RxConfig& config) FL_NOEXCEPT = 0;
+    virtual bool begin(const RxConfig& config) FL_NO_EXCEPT = 0;
+
+    /// @brief Machine-readable reason from the most recent failed begin().
+    /// @return Empty string when the device has no additional diagnostic.
+    virtual const char* lastBeginError() const FL_NO_EXCEPT { return ""; }
 
     /**
      * @brief Check if receive operation is complete
      * @return true if receive finished, false if still in progress
      */
-    virtual bool finished() const FL_NOEXCEPT = 0;
+    virtual bool finished() const FL_NO_EXCEPT = 0;
 
     /**
      * @brief Wait for data with timeout
      * @param timeout_ms Timeout in milliseconds
      * @return RxWaitResult - SUCCESS, TIMEOUT, or BUFFER_OVERFLOW
      */
-    virtual RxWaitResult wait(u32 timeout_ms) FL_NOEXCEPT = 0;
+    virtual RxWaitResult wait(u32 timeout_ms) FL_NO_EXCEPT = 0;
 
     /**
      * @brief Decode captured data to bytes into a span
@@ -327,7 +344,7 @@ public:
      * @return Result with total bytes decoded, or error
      */
     virtual fl::result<u32, DecodeError> decode(const ChipsetTiming4Phase &timing,
-                                                       fl::span<u8> out) FL_NOEXCEPT = 0;
+                                                       fl::span<u8> out) FL_NO_EXCEPT = 0;
 
     /**
      * @brief Get raw edge timings in universal format (for debugging)
@@ -357,19 +374,19 @@ public:
      * size_t count = rx->getRawEdgeTimes(edges, 50);
      * @endcode
      */
-    virtual size_t getRawEdgeTimes(fl::span<EdgeTime> out, size_t offset = 0) FL_NOEXCEPT = 0;
+    virtual size_t getRawEdgeTimes(fl::span<EdgeTime> out, size_t offset = 0) FL_NO_EXCEPT = 0;
 
     /**
      * @brief Get device type name
      * @return Device name (e.g., "dummy", "RMT", "ISR")
      */
-    virtual const char* name() const FL_NOEXCEPT = 0;
+    virtual const char* name() const FL_NO_EXCEPT = 0;
 
     /**
      * @brief Get GPIO pin number
      * @return Pin number this device is listening on
      */
-    virtual int getPin() const FL_NOEXCEPT = 0;
+    virtual int getPin() const FL_NO_EXCEPT = 0;
 
     /**
      * @brief Manually inject edge timings for testing (Phase 1 - PARLIO gap simulation)
@@ -410,13 +427,13 @@ public:
      *
      * @note Not all RX devices support injection. DummyRxDevice returns false.
      */
-    virtual bool injectEdges(fl::span<const EdgeTime> edges) FL_NOEXCEPT = 0;
+    virtual bool injectEdges(fl::span<const EdgeTime> edges) FL_NO_EXCEPT = 0;
 
 protected:
     // Allow shared_ptr to access protected destructor
     friend class fl::shared_ptr<RxDevice>;
-    RxDevice() FL_NOEXCEPT = default;
-    virtual ~RxDevice() FL_NOEXCEPT = default;
+    RxDevice() FL_NO_EXCEPT = default;
+    virtual ~RxDevice() FL_NO_EXCEPT = default;
 
 private:
     /**
@@ -426,7 +443,7 @@ private:
      * Used by default template implementation when no platform-specific
      * specialization exists. Returns singleton DummyRxDevice instance.
      */
-    static fl::shared_ptr<RxDevice> createDummy() FL_NOEXCEPT;
+    static fl::shared_ptr<RxDevice> createDummy() FL_NO_EXCEPT;
 };
 
 // Explicit specialization declarations — definitions live in
@@ -434,10 +451,13 @@ private:
 // instantiation of the primary template at call sites (e.g.,
 // channel.cpp.hpp), which would otherwise collide with the explicit
 // specializations when both live in the same translation unit.
-template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NOEXCEPT;
-template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NOEXCEPT;
-template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NOEXCEPT;
-template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NOEXCEPT;
-template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NOEXCEPT;
+template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NO_EXCEPT;
+template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::I2S_RX>(int pin) FL_NO_EXCEPT;
+template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PARLIO_RX>(int pin) FL_NO_EXCEPT;
+template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NO_EXCEPT;
+template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NO_EXCEPT;
+template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NO_EXCEPT;
+template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NO_EXCEPT;
+template <> fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PIO>(int pin) FL_NO_EXCEPT;
 
 } // namespace fl

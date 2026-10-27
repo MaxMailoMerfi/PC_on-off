@@ -18,6 +18,7 @@
 /// convention - no "magic include" required at the call site.
 
 #include "fl/channels/all_drivers.h"
+#include "fl/channels/clockless_encoders.h"
 
 #include "platforms/is_platform.h"
 
@@ -25,6 +26,8 @@
 #include "platforms/esp/32/channel_drivers_esp32.impl.hpp"
 #elif defined(FL_IS_TEENSY_4X)
 #include "platforms/arm/teensy/channel_drivers_teensy.impl.hpp"
+#elif defined(FL_IS_ARM_LPC)
+#include "platforms/arm/lpc/channel_drivers_lpc.impl.hpp"
 #elif defined(FL_IS_STUB) || defined(FL_IS_WASM)
 #include "platforms/stub/channel_drivers_stub.impl.hpp"
 #else
@@ -33,7 +36,8 @@
 
 namespace fl {
 
-void enableAllDrivers() FL_NOEXCEPT {
+void enableAllDrivers() FL_NO_EXCEPT {
+    platforms::enableClocklessEncoders();  // #4793: every driver, every mode
     platforms::enableAllChannelDrivers();
 }
 

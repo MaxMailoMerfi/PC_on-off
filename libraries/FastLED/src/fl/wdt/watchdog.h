@@ -32,7 +32,7 @@
 
 #include "fl/stl/stdint.h"
 #include "fl/stl/noexcept.h"
-#include "fl/stl/compiler_control.h"   // FL_NORETURN
+#include "fl/stl/compiler_control.h"   // FL_NO_RETURN
 #include "fl/stl/span.h"
 #include "fl/stl/function.h"
 #include "fl/stl/string_view.h"        // for resetCauseName() return type
@@ -58,7 +58,7 @@ enum class ResetCause : fl::u8 {
 /// context (ISR, panic handler, before setup() finishes). Backed by
 /// `fl::string_view` so the result has no destructor and can be passed by
 /// value freely.
-inline fl::string_view resetCauseName(ResetCause c) FL_NOEXCEPT {
+inline fl::string_view resetCauseName(ResetCause c) FL_NO_EXCEPT {
     switch (c) {
         case ResetCause::POWER_ON:     return fl::string_view("POWER_ON");
         case ResetCause::BROWNOUT:     return fl::string_view("BROWNOUT");
@@ -85,12 +85,12 @@ struct ResetInfo {
     fl::u32    rawRegister;    ///< Raw value of the platform's reset-cause register
 
     /// Cause name (zero-cost, static string_view).
-    fl::string_view causeName() const FL_NOEXCEPT { return resetCauseName(cause); }
+    fl::string_view causeName() const FL_NO_EXCEPT { return resetCauseName(cause); }
 
     /// Platform-specific subcause name (zero-cost, static string_view).
     /// Returns an empty view if `subcauseId == 0` or the platform doesn't
     /// define names. Per-platform impls extend this via a strong override.
-    fl::string_view subcauseName() const FL_NOEXCEPT;
+    fl::string_view subcauseName() const FL_NO_EXCEPT;
 
     /// Write a single-line human-readable description into the caller's
     /// buffer. Returns the number of bytes written (NOT including any
@@ -100,7 +100,7 @@ struct ResetInfo {
     ///   "<cause>"                          if subcauseId == 0
     ///   "<cause> (<sub>)"                  if subcauseId != 0 && !verbose
     ///   "<cause> (<sub>) raw=0x<hex>"      if verbose
-    fl::size describe(fl::span<char> out, bool verbose = false) const FL_NOEXCEPT;
+    fl::size describe(fl::span<char> out, bool verbose = false) const FL_NO_EXCEPT;
 };
 
 /// @brief ISR-safe C function pointer callback for `onTimeout()`.
@@ -129,58 +129,122 @@ public:
     // FastLED.h. See `agents/docs/cpp-standards.md` → "Header rules:
     // function-local statics with non-trivial constructors are forbidden in
     // `src/**/*.h`."
-    static Watchdog& instance() FL_NOEXCEPT;
+    static Watchdog& instance() FL_NO_EXCEPT;
 
     // ========== Tier 0 — universal ==========
 
-    void       begin(fl::u32 timeout_ms) FL_NOEXCEPT;
-    void       feed() FL_NOEXCEPT;
-    void       disable() FL_NOEXCEPT;
+    void       begin(fl::u32 timeout_ms) FL_NO_EXCEPT;
+    void       feed() FL_NO_EXCEPT;
+    void       disable() FL_NO_EXCEPT;
 
-    ResetCause lastResetCause() const FL_NOEXCEPT;
-    bool       lastResetWasWatchdog() const FL_NOEXCEPT;
+    ResetCause lastResetCause() const FL_NO_EXCEPT;
+    bool       lastResetWasWatchdog() const FL_NO_EXCEPT;
 
     /// @brief Detailed reset information including platform raw register +
     /// subcause id. Default implementation returns {lastResetCause(), 0, 0};
     /// platforms that capture the raw register override with a strong
     /// definition in their `.impl.hpp`.
-    ResetInfo lastResetInfo() const FL_NOEXCEPT;
+    ResetInfo lastResetInfo() const FL_NO_EXCEPT;
 
-    fl::u8     persistRead(fl::size idx) const FL_NOEXCEPT;
-    void       persistWrite(fl::size idx, fl::u8 v) FL_NOEXCEPT;
+    fl::u8     persistRead(fl::size idx) const FL_NO_EXCEPT;
+    void       persistWrite(fl::size idx, fl::u8 v) FL_NO_EXCEPT;
 
-    fl::u16    consecutiveCrashCount() const FL_NOEXCEPT;
-    void       markCleanShutdown() FL_NOEXCEPT;
-    bool       isInSafeMode() const FL_NOEXCEPT;
-    fl::u16    safeModeThreshold() const FL_NOEXCEPT;
-    void       setSafeModeThreshold(fl::u16 threshold) FL_NOEXCEPT;
+    fl::u16    consecutiveCrashCount() const FL_NO_EXCEPT;
+    void       markCleanShutdown() FL_NO_EXCEPT;
+    bool       isInSafeMode() const FL_NO_EXCEPT;
+    fl::u16    safeModeThreshold() const FL_NO_EXCEPT;
+    void       setSafeModeThreshold(fl::u16 threshold) FL_NO_EXCEPT;
 
-    FL_NORETURN void reboot() FL_NOEXCEPT;
+    /// @brief Boot-loop escape hatch: drop to the bootloader instead of
+    /// looping forever, so an unattended host can re-flash the board.
+    ///
+    /// A board whose firmware wedges before its USB stack comes up is
+    /// invisible to the host -- no CDC endpoint, so no 1200-baud touch and no
+    /// `picotool reboot`. Nothing on the host can recover it, because a
+    /// root-hub port reset is a bus reset, not a VBUS power cycle. The only
+    /// remaining fix is physical. See FastLED#3713 / #3714.
+    ///
+    /// Setting a non-zero threshold makes the *device* break that loop: after
+    /// N consecutive watchdog resets, `escapeToBootloaderIfLooping()` reboots
+    /// into the bootloader, where the board re-enumerates as a flashable
+    /// target and the host can push working firmware without a human.
+    ///
+    /// Opt-in by design -- the default of 0 disables it. Call the check early
+    /// in `setup()`, before any code that might wedge:
+    /// @code
+    ///   FastLED.watchdog().setBootloaderEscapeThreshold(3);
+    ///   FastLED.watchdog().escapeToBootloaderIfLooping();
+    /// @endcode
+    /// Requires `FL_WATCHDOG_HAS_BOOTLOADER_REBOOT`; elsewhere the escape is
+    /// a no-op that returns false and leaves the crash counter intact.
+    fl::u16 bootloaderEscapeThreshold() const FL_NO_EXCEPT;
+
+    /// @brief Set the consecutive-watchdog-reset count that triggers the
+    /// escape. 0 (the default) disables it.
+    void setBootloaderEscapeThreshold(fl::u16 threshold) FL_NO_EXCEPT;
+
+    /// @brief True when the escape is enabled and the board has hit the
+    /// consecutive-watchdog-reset threshold.
+    bool shouldEscapeToBootloader() const FL_NO_EXCEPT;
+
+    /// @brief Reboot into the bootloader if this looks like a boot loop.
+    /// @return false when not looping, or when the platform has no bootloader
+    /// reboot. On success it does not return.
+    ///
+    /// The crash counter is deliberately left alone: if the reboot is
+    /// unsupported we must not destroy the evidence that a loop is happening.
+    bool escapeToBootloaderIfLooping() FL_NO_EXCEPT;
+
+    /// @brief Early-boot loop guard counter (see `fl/wdt/boot_guard.h`):
+    /// consecutive boots since the last `markBootHealthy()`, kept in
+    /// reset-persistent memory. 0 on platforms without boot-guard storage.
+    fl::u32 bootGuardCount() const FL_NO_EXCEPT;
+
+    /// @brief Tell the early-boot guard this boot is healthy, zeroing its
+    /// counter. Call once the firmware is known good (e.g. first `loop()`),
+    /// so later watchdog resets never accumulate toward a bootloader escape.
+    /// If the sketch never took over the watchdog with `begin()`, this also
+    /// disables the guard's early timer, so it cannot reset a healthy sketch.
+    /// No-op on platforms without boot-guard storage.
+    void markBootHealthy() FL_NO_EXCEPT;
+
+    FL_NO_RETURN void reboot() FL_NO_EXCEPT;
 
     // ========== Tier 1 — most platforms ==========
 
-    bool       onTimeout(WatchdogTimeoutCallback cb, void* user_data = nullptr) FL_NOEXCEPT;
-    bool       onTimeout(fl::function<void()> cb) FL_NOEXCEPT;
-    bool       setPauseOnDebug(bool pause) FL_NOEXCEPT;
-    bool       writeCrashLog(fl::span<const fl::u8> payload) FL_NOEXCEPT;
-    fl::size   readCrashLog(fl::span<fl::u8> out) const FL_NOEXCEPT;
-    bool       rebootIntoBootloader() FL_NOEXCEPT;
+    bool       onTimeout(WatchdogTimeoutCallback cb, void* user_data = nullptr) FL_NO_EXCEPT;
+    bool       onTimeout(fl::function<void()> cb) FL_NO_EXCEPT;
+    bool       setPauseOnDebug(bool pause) FL_NO_EXCEPT;
+    bool       writeCrashLog(fl::span<const fl::u8> payload) FL_NO_EXCEPT;
+    fl::size   readCrashLog(fl::span<fl::u8> out) const FL_NO_EXCEPT;
+    bool       rebootIntoBootloader() FL_NO_EXCEPT;
 
     // ========== Tier 2 — advanced platforms ==========
 
-    bool                setWindow(fl::u32 window_min_ms, fl::u32 window_max_ms) FL_NOEXCEPT;
-    bool                hasCrashReport() const FL_NOEXCEPT;
-    WatchdogCrashReport readCrashReport() const FL_NOEXCEPT;
-    void                clearCrashReport() FL_NOEXCEPT;
+    bool                setWindow(fl::u32 window_min_ms, fl::u32 window_max_ms) FL_NO_EXCEPT;
+    bool                hasCrashReport() const FL_NO_EXCEPT;
+    WatchdogCrashReport readCrashReport() const FL_NO_EXCEPT;
+    void                clearCrashReport() FL_NO_EXCEPT;
 
 private:
-    Watchdog() FL_NOEXCEPT = default;
-    ~Watchdog() FL_NOEXCEPT = default;
-    Watchdog(const Watchdog&) FL_NOEXCEPT = delete;
-    Watchdog& operator=(const Watchdog&) FL_NOEXCEPT = delete;
+    Watchdog() FL_NO_EXCEPT = default;
+    ~Watchdog() FL_NO_EXCEPT = default;
+    Watchdog(const Watchdog&) FL_NO_EXCEPT = delete;
+    Watchdog& operator=(const Watchdog&) FL_NO_EXCEPT = delete;
 
     fl::u16 mSafeModeThreshold = 2;
+    fl::u16 mBootloaderEscapeThreshold = 0;   // 0 = escape disabled
 };
+
+namespace platforms {
+/// Boot-guard counter storage, supplied by the platform watchdog impl (or
+/// the no-op). Backs Watchdog::bootGuardCount() / markBootHealthy().
+fl::u32 watchdogBootGuardRead() FL_NO_EXCEPT;
+void    watchdogBootGuardWrite(fl::u32 boots) FL_NO_EXCEPT;
+/// Disable the boot guard's early watchdog timer if it is still running and
+/// the sketch never armed the watchdog itself. Called by markBootHealthy().
+void    watchdogBootGuardReleaseEarlyTimer() FL_NO_EXCEPT;
+} // namespace platforms
 
 /// @brief RAII watchdog guard for the canonical `loop()`-top use case.
 ///
@@ -205,23 +269,23 @@ private:
 class ScopedWatchdog {
 public:
     /// Default construct with the library default timeout (15 000 ms).
-    ScopedWatchdog() FL_NOEXCEPT : ScopedWatchdog(15000u) {}
+    ScopedWatchdog() FL_NO_EXCEPT : ScopedWatchdog(15000u) {}
 
     /// Construct with an explicit timeout. Same semantics as the default
     /// constructor — first-call init, feed on construction.
-    explicit ScopedWatchdog(fl::u32 timeout_ms) FL_NOEXCEPT;
+    explicit ScopedWatchdog(fl::u32 timeout_ms) FL_NO_EXCEPT;
 
     /// Feed the watchdog at end-of-scope so the next `loop()` iteration has
     /// a clean deadline window.
-    ~ScopedWatchdog() FL_NOEXCEPT;
+    ~ScopedWatchdog() FL_NO_EXCEPT;
 
     /// Observability: number of simultaneously-alive ScopedWatchdog instances.
     /// Used by tests + diagnostics. A value > 1 means a nested-guard
     /// programmer error was hit; the WDT is still being fed.
-    static int activeScopeCount() FL_NOEXCEPT;
+    static int activeScopeCount() FL_NO_EXCEPT;
 
-    ScopedWatchdog(const ScopedWatchdog&)            FL_NOEXCEPT = delete;
-    ScopedWatchdog& operator=(const ScopedWatchdog&) FL_NOEXCEPT = delete;
+    ScopedWatchdog(const ScopedWatchdog&)            FL_NO_EXCEPT = delete;
+    ScopedWatchdog& operator=(const ScopedWatchdog&) FL_NO_EXCEPT = delete;
 };
 
 } // namespace fl
@@ -272,6 +336,8 @@ public:
 //   #define FL_WATCHDOG_HAS_WINDOW_MODE       // setWindow() honored
 //   #define FL_WATCHDOG_HAS_CRASH_REPORT      // hasCrashReport()/readCrashReport() honored
 //   #define FL_WATCHDOG_HAS_BOOTLOADER_REBOOT // rebootIntoBootloader() honored
+//   #define FL_WATCHDOG_HAS_BOOT_GUARD        // FL_WATCHDOG_BOOT_GUARD() early hook (fl/wdt/boot_guard.h)
+//   #define FL_WATCHDOG_HAS_BOOT_GUARD_STORAGE // bootGuardCount()/markBootHealthy() persist
 //   #define FL_WATCHDOG_MAX_TIMEOUT_MS N      // upper bound, in ms
 //
 // The Tier 0 surface is always callable; Tier 1/2 methods return false on

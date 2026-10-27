@@ -2,9 +2,10 @@
 """Build artifact cleanup and system LLVM tool detection."""
 
 import glob
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from running_process import CalledProcessError, RunningProcess, TimeoutExpired
 
 from ci.util.timestamp_print import ts_print as _ts_print
 
@@ -92,52 +93,3 @@ def cleanup_build_artifacts(build_dir: Path, reason: str) -> dict[str, CleanupRe
                 )
 
     return results
-
-
-def detect_system_llvm_tools() -> tuple[bool, bool]:
-    """
-    Detect if system has LLD and LLVM-AR that support thin archives.
-
-    Returns:
-        Tuple of (has_lld, has_llvm_ar)
-    """
-    has_lld = False
-    has_llvm_ar = False
-
-    # Check for system lld
-    # Try 'lld' first (created by workflow symlink or available by default)
-    # Then try 'ld.lld' (Linux naming) as fallback
-    for lld_cmd in ["lld", "ld.lld"]:
-        try:
-            result = subprocess.run(
-                [lld_cmd, "--version"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
-            )
-            if result.returncode == 0:
-                has_lld = True
-                break
-        except (subprocess.SubprocessError, FileNotFoundError):
-            continue
-
-    # Check for llvm-ar with thin archive support
-    # Try unversioned first, then common versioned variants (llvm-ar-20, llvm-ar-19, etc.)
-    for ar_cmd in ["llvm-ar", "llvm-ar-20", "llvm-ar-19", "llvm-ar-18"]:
-        try:
-            result = subprocess.run(
-                [ar_cmd, "--help"],
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
-            )
-            if result.returncode == 0 and "thin" in result.stdout.lower():
-                has_llvm_ar = True
-                break
-        except (subprocess.SubprocessError, FileNotFoundError):
-            continue
-
-    return has_lld, has_llvm_ar

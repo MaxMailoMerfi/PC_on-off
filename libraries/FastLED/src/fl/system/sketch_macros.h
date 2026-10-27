@@ -18,7 +18,8 @@
 //                                    select modern tinyAVR 0/1-series with
 //                                    <=1KB SRAM — see FL_IS_AVR_ATTINY_TINY_MEMORY
 //                                    in is_avr.h; 2-series parts with 2KB+ are
-//                                    excluded)
+//                                    excluded; ATmega8/8A via
+//                                    FL_IS_AVR_ATMEGA_TINY_MEMORY)
 //   FL_PLATFORM_HAS_LARGE_MEMORY  — 1 on the "high" tier (Apollo3, nRF52,
 //                                   SAMD21, generic ARM)
 //   FL_PLATFORM_HAS_HUGE_MEMORY   — 1 on the "huge" tier (ESP32, Teensy
@@ -69,7 +70,7 @@
   #endif
   #define FL_PLATFORM_HAS_TINY_MEMORY_OVERRIDDEN 1
 #else
-  #if defined(FL_IS_AVR_ATTINY_TINY_MEMORY)
+  #if defined(FL_IS_AVR_ATTINY_TINY_MEMORY) || defined(FL_IS_AVR_ATMEGA_TINY_MEMORY)
     #define FL_PLATFORM_HAS_TINY_MEMORY 1
   #else
     #define FL_PLATFORM_HAS_TINY_MEMORY 0
@@ -145,6 +146,39 @@
 #endif
 #if FL_PLATFORM_HAS_TINY_MEMORY && FL_PLATFORM_HAS_LARGE_MEMORY
   #error "FL_PLATFORM_HAS_TINY_MEMORY=1 is incompatible with FL_PLATFORM_HAS_LARGE_MEMORY=1"
+#endif
+
+// =============================================================================
+// AutoResearch tier — `FL_AUTORESEARCH_LITE_RPC`
+// =============================================================================
+//
+// Auto-derived from the memory tier: on the "Low" and "Tiny" tiers where
+// FL_PLATFORM_HAS_LARGE_MEMORY == 0 (LPC8xx, AVR Uno-class, STM32F1, ESP8266,
+// Teensy LC/3.0-3.2, Renesas UNO, ATtiny 2-3 KB) the AutoResearch sketch
+// enters lite mode: it drops JSON-shaped RPC handlers (which pull `fl::json`
+// output builder + tokenizer into flash — ~4 KB) and any float-dependent RPC
+// bodies (which pull soft-float libgcc helpers — ~4 KB). What remains is the
+// CSV-string RPC path that platform driver validation actually needs:
+// `echo`, `pinToggleRx`, `ws2812SctTest`, `pwmDmaCl*`, `dmaSpi*`.
+//
+// Override with `-DFL_AUTORESEARCH_LITE_RPC=0` (force full-fat mode on a
+// low-memory platform — will likely overflow flash) or `=1` (force lite mode
+// on a large-memory platform — useful for measuring what lite-mode ships).
+//
+// Rationale: LPC845 has 64 KB flash. Vanilla AutoResearch on LPC845 already
+// sits at ~53 KB / 83%. Once `FASTLED_LPC_PWM_DMA=1` or `FASTLED_LPC_SPI_DMA=1`
+// pull in the DMA harness code, the sketch needs the lite path to survive
+// the flash budget. The lite gate keeps the same CSV RPC contract so the
+// Python-side test runners (`ci/autoresearch/test_lpc_*.py`) do not have to
+// branch by build mode.
+#if defined(FL_AUTORESEARCH_LITE_RPC)
+  #define FL_AUTORESEARCH_LITE_RPC_OVERRIDDEN 1
+#else
+  #if !FL_PLATFORM_HAS_LARGE_MEMORY
+    #define FL_AUTORESEARCH_LITE_RPC 1
+  #else
+    #define FL_AUTORESEARCH_LITE_RPC 0
+  #endif
 #endif
 
 // =============================================================================

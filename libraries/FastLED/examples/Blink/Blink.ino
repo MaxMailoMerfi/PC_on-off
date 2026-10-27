@@ -13,7 +13,7 @@
 // ground, and power), like the LPD8806 define both PIN_DATA and CLOCK_PIN
 // Clock pin only needed for SPI based chipsets when not using hardware SPI
 #ifndef PIN_DATA
-#define PIN_DATA 3
+#define PIN_DATA FL_PIN_CLOCKLESS_1
 #endif  // PIN_DATA
 
 #define CLOCK_PIN 13
@@ -22,16 +22,10 @@
 CRGB leds[NUM_LEDS];
 
 void setup() {
-    Serial.begin(115200);
-    Serial.println("\n==============================================");
-    Serial.println("   BLINK.INO - Simple LED Blink Example");
-    Serial.println("==============================================\n");
-
     // Uncomment/edit one of the following lines for your leds arrangement.
     // ## Clockless types ##
     FastLED.addLeds<NEOPIXEL, PIN_DATA>(leds, NUM_LEDS);  // GRB ordering is assumed
 
-    Serial.println("✓ Blink setup complete - starting blink loop\n");
     // FastLED.addLeds<SM16824E, PIN_DATA, RGB>(leds, NUM_LEDS);  // RGB ordering (uses SM16824EController)
     // FastLED.addLeds<SM16703, PIN_DATA, RGB>(leds, NUM_LEDS);
     // FastLED.addLeds<TM1829, PIN_DATA, RGB>(leds, NUM_LEDS);
@@ -52,6 +46,7 @@ void setup() {
     // FastLED.addLeds<WS2812BMiniV3, PIN_DATA, RGB>(leds, NUM_LEDS);  // GRB ordering is typical (same timing as V5)
     // FastLED.addLeds<GS1903, PIN_DATA, RGB>(leds, NUM_LEDS);
     // FastLED.addLeds<SK6812, PIN_DATA, RGB>(leds, NUM_LEDS);  // GRB ordering is typical
+    // FastLED.addLeds<LC8816E, PIN_DATA, GRB>(leds, NUM_LEDS);  // 12V GRBW; RGBW enabled automatically
     // FastLED.addLeds<SK6822, PIN_DATA, RGB>(leds, NUM_LEDS);
     // FastLED.addLeds<APA106, PIN_DATA, RGB>(leds, NUM_LEDS);
     // FastLED.addLeds<PL9823, PIN_DATA, RGB>(leds, NUM_LEDS);
@@ -71,6 +66,7 @@ void setup() {
     // FastLED.addLeds<WS2801, PIN_DATA, CLOCK_PIN, RGB>(leds, NUM_LEDS);
     // FastLED.addLeds<WS2803, PIN_DATA, CLOCK_PIN, RGB>(leds, NUM_LEDS);
     // FastLED.addLeds<SM16716, PIN_DATA, CLOCK_PIN, RGB>(leds, NUM_LEDS);
+    // FastLED.addLeds<MY9221, PIN_DATA, CLOCK_PIN, RGB>(leds, NUM_LEDS);  // 4 RGB LEDs per chip
     // FastLED.addLeds<P9813, PIN_DATA, CLOCK_PIN, RGB>(leds, NUM_LEDS);  // BGR ordering is typical
     // FastLED.addLeds<DOTSTAR, PIN_DATA, CLOCK_PIN, RGB>(leds, NUM_LEDS);  // BGR ordering is typical
     // FastLED.addLeds<APA102, PIN_DATA, CLOCK_PIN, RGB>(leds, NUM_LEDS);  // BGR ordering is typical

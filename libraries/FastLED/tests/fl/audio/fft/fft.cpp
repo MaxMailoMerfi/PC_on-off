@@ -48,13 +48,16 @@ FL_TEST_CASE("fft tester 512") {
     // Test expectations for different precision modes
     // Each mode has slightly different numerical results due to internal precision
 #if FASTLED_FFT_PRECISION == FASTLED_FFT_FIXED16
+    // Re-pinned for the accurate fl::exp (#4288): the constant-Q band centres
+    // now sit where fmin*exp(m*i/(bands-1)) says, and the top band reaches the
+    // requested fmax, so counts move between neighbouring bands.
     // Fixed16 precision (default) - CQ_OCTAVE octave-wise path
     // With improved 7-tap halfband decimation filter (-45dB stopband)
     // fastMag produces integer magnitudes (u16 → float)
     // Golden values for 90-14080 Hz range
     const float expected_output[16] = {
-        5.00,      0.00,      3.00,      6.00,      1.00,     21.00,      3.00,     46.00,
-        9.00,     12.00,      4.00,      6.00,      5.00,      2.00,      1.00,      1.00};
+             5.00,      0.00,      3.00,      6.00,      1.00,     21.00,      9.00,     47.00,
+            10.00,     12.00,      4.00,      8.00,      4.00,      1.00,      0.00,      1.00};
     const float tolerance = 0.1; // Strict tolerance
 #elif FASTLED_FFT_PRECISION == FASTLED_FFT_FLOAT
     // Float/double precision - needs regeneration with new frequency range.
@@ -107,13 +110,16 @@ FL_TEST_CASE("fft tester 256") {
     // Test expectations for different precision modes
     // Each mode has slightly different numerical results due to internal precision
 #if FASTLED_FFT_PRECISION == FASTLED_FFT_FIXED16
+    // Re-pinned for the accurate fl::exp (#4288): the constant-Q band centres
+    // now sit where fmin*exp(m*i/(bands-1)) says, and the top band reaches the
+    // requested fmax, so counts move between neighbouring bands.
     // Fixed16 precision (default) - CQ_OCTAVE octave-wise path
     // With improved 7-tap halfband decimation filter (-45dB stopband)
     // fastMag produces integer magnitudes (u16 → float)
     // Golden values for 90-14080 Hz range
     const float expected_output[16] = {
-        0.00,      2.00,      1.00,     11.00,      1.00,     13.00,      4.00,     44.00,
-       20.00,    350.00,     37.00,     26.00,     18.00,     10.00,      2.00,      2.00};
+             0.00,      2.00,      1.00,     11.00,      1.00,     13.00,      4.00,     23.00,
+            16.00,    341.00,     37.00,     32.00,     16.00,      1.00,      1.00,      4.00};
     const float tolerance = 0.1; // Strict tolerance
 #elif FASTLED_FFT_PRECISION == FASTLED_FFT_FLOAT
     // Float/double precision - needs regeneration with new frequency range.
@@ -163,20 +169,23 @@ FL_TEST_CASE("fft tester 256 with 64 bands") {
     // Test expectations for different precision modes
     // Each mode has slightly different numerical results due to internal precision
 #if FASTLED_FFT_PRECISION == FASTLED_FFT_FIXED16
+    // Re-pinned for the accurate fl::exp (#4288): the constant-Q band centres
+    // now sit where fmin*exp(m*i/(bands-1)) says, and the top band reaches the
+    // requested fmax, so counts move between neighbouring bands.
     // Fixed16 precision (default) - CQ_NAIVE path (AUTO resolves to CQ_NAIVE for 64 bands)
     // fastMag produces integer magnitudes (u16 → float)
     // Golden values for 90-14080 Hz range
     const float expected_output[64] = {
-        0.00,      2.00,      2.00,      1.00,      2.00,      3.00,      4.00,
-        5.00,      1.00,      1.00,      3.00,      2.00,      2.00,      0.00,
-        0.00,      5.00,      6.00,      6.00,      2.00,      3.00,      1.00,
-        2.00,      3.00,      5.00,      4.00,      7.00,     13.00,     11.00,
-       12.00,     18.00,     17.00,     15.00,     19.00,     23.00,     23.00,
-      151.00,    430.00,    720.00,    241.00,    120.00,     75.00,     53.00,
-       37.00,     10.00,     59.00,     42.00,     37.00,     35.00,     27.00,
-       23.00,     21.00,     23.00,      1.00,      3.00,      3.00,      1.00,
-        1.00,      1.00,      0.00,      2.00,      1.00,      1.00,      3.00,
-        4.00};
+             0.00,      2.00,      2.00,      1.00,      2.00,      3.00,      4.00,
+             5.00,      1.00,      1.00,      3.00,      2.00,      2.00,      0.00,
+             0.00,      5.00,      6.00,      6.00,      2.00,      3.00,      1.00,
+             2.00,      3.00,      5.00,      4.00,      7.00,     13.00,     11.00,
+            12.00,     19.00,     17.00,     15.00,     18.00,     24.00,     23.00,
+           149.00,    445.00,    710.00,    226.00,    114.00,     71.00,     54.00,
+            32.00,     10.00,     53.00,     47.00,     32.00,     34.00,     28.00,
+            22.00,     16.00,     23.00,      4.00,      1.00,      2.00,      1.00,
+             0.00,      1.00,      4.00,      3.00,      4.00,      1.00,      0.00,
+             1.00};
     const float tolerance = 0.1; // Strict tolerance
 #elif FASTLED_FFT_PRECISION == FASTLED_FFT_FLOAT
     // Float/double precision - needs regeneration with new frequency range.
@@ -824,8 +833,11 @@ FL_TEST_CASE("Binning adversarial - LOG_REBIN vs CQ_OCTAVE peak agreement") {
         FL_CHECK_LE(diff, 2);
     }
     // Known issue: LOG_REBIN vs CQ bin grid mismatch causes disagreements.
+    // This bound records the extent of that mismatch, not a requirement: it
+    // went 3 -> 4 when fl::exp became accurate (#4288) and the CQ centres
+    // moved to where the formula says they are.
     FL_WARN("Cross-mode disagreements: " << disagreements << " of 8 frequencies");
-    FL_CHECK_LE(disagreements, 3);
+    FL_CHECK_LE(disagreements, 4);
 }
 
 // --- 3. Monotonicity sweep ---
@@ -862,7 +874,190 @@ FL_TEST_CASE("Binning adversarial - LOG_REBIN monotonicity sweep") {
     FL_CHECK_EQ(violations, 0);
 }
 
+namespace {
+
+/// One binning mode measured over the declared frequency range.
+struct CoverageResult {
+    int dead;          ///< tones no band answered
+    int centre_hits;   ///< band centres whose tone peaked in their own band
+    int worst_miss;    ///< furthest a centre's peak landed from its band
+};
+
+/// Sweep `steps` log-spaced tones and, separately, one tone per band centre.
+///
+/// "Answered" is a peak above 20 counts, against the 200-2400 a mode returns
+/// when it does resolve a tone -- two orders apart, so the threshold is not
+/// carrying the result.
+CoverageResult measureCoverage(int samples, int bands,
+                               fl::audio::fft::Mode mode, int steps) {
+    const float fmin = fl::audio::fft::Args::DefaultMinFrequency();
+    const float fmax = fl::audio::fft::Args::DefaultMaxFrequency();
+    const float logRatio = fl::logf(fmax / fmin);
+    fl::audio::fft::Args args(samples, bands, fmin, fmax, 44100, mode);
+    fl::audio::fft::Impl fft(args);
+
+    CoverageResult result = {0, 0, 0};
+    for (int s = 0; s < steps; ++s) {
+        const float freq =
+            fmin * fl::expf(logRatio * static_cast<float>(s) /
+                            static_cast<float>(steps - 1));
+        auto pcm = makeAdversarialSine(freq, samples);
+        fl::audio::fft::Bins bins(bands);
+        fft.run(pcm, &bins);
+        if (bins.raw()[findPeakBin(bins.raw())] < 20.0f) {
+            ++result.dead;
+        }
+    }
+    for (int b = 0; b < bands; ++b) {
+        const float freq =
+            fmin * fl::expf(logRatio * static_cast<float>(b) /
+                            static_cast<float>(bands - 1));
+        auto pcm = makeAdversarialSine(freq, samples);
+        fl::audio::fft::Bins bins(bands);
+        fft.run(pcm, &bins);
+        int miss = findPeakBin(bins.raw()) - b;
+        if (miss < 0) {
+            miss = -miss;
+        }
+        if (miss == 0) {
+            ++result.centre_hits;
+        }
+        if (miss > result.worst_miss) {
+            result.worst_miss = miss;
+        }
+    }
+    return result;
+}
+
+}  // namespace
+
+FL_TEST_CASE("CQ_OCTAVE covers its declared range without losing band resolution") {
+    // FastLED#4301. `CQ_OCTAVE`'s sparse kernels are narrower than the
+    // spacing between adjacent band centres in the upper octaves, so they do
+    // not tile the axis and tones between them fall through on the unfixed
+    // implementation. The corrected mode must cover the range while still
+    // locating tones near the expected band, including with longer windows.
+    //
+    // The comparison is what makes that a defect rather than a property of
+    // the problem. `LOG_REBIN` -- which `Args::resolveModeEnums` already
+    // picks for 32 bands or fewer -- answers everywhere, in every
+    // configuration measured here and in the wider sweep on the issue.
+    const int kSteps = 200;
+
+    const int sampleCounts[] = {512, 512, 512, 512, 512, 256, 1024};
+    const int bandCounts[] = {16, 24, 32, 48, 64, 48, 48};
+    // Measured center hits: 14, 21, 27, 36, 44, 29, 42; worst misses:
+    // 1, 2, 3, 3, 6, 32, 1. The 256/48 mode is poorly conditioned at low
+    // frequencies even before gap coverage; keep it from regressing rather
+    // than claiming this fix also improves its center accuracy. One count
+    // of slack accommodates differences in platform floating-point math.
+    const int minCentreHits[] = {13, 20, 26, 35, 43, 28, 41};
+    const int maxWorstMiss[] = {2, 3, 4, 4, 7, 33, 2};
+    for (int i = 0; i < 7; ++i) {
+        const CoverageResult octave = measureCoverage(
+            sampleCounts[i], bandCounts[i], fl::audio::fft::Mode::CQ_OCTAVE,
+            kSteps);
+        const CoverageResult rebin = measureCoverage(
+            sampleCounts[i], bandCounts[i], fl::audio::fft::Mode::LOG_REBIN,
+            kSteps);
+        FL_CHECK_EQ(rebin.dead, 0);
+        FL_CHECK_EQ(octave.dead, 0);
+        FL_CHECK_GE(octave.centre_hits, minCentreHits[i]);
+        FL_CHECK_LE(octave.worst_miss, maxWorstMiss[i]);
+    }
+}
+
+FL_TEST_CASE("CQ_OCTAVE hears a gap tone alongside a resolved tone") {
+    fl::audio::fft::Args args(512, 16, 90.0f, 14080.0f, 44100,
+                             fl::audio::fft::Mode::CQ_OCTAVE);
+    fl::audio::fft::Impl fft(args);
+    auto pcm = makeTwoTone(951.0f, 8348.0f);
+    fl::audio::fft::Bins bins(16);
+    fft.run(pcm, &bins);
+    FL_CHECK_GT(bins.raw()[7], 20.0f);
+    FL_CHECK_GT(bins.raw()[13], 20.0f);
+}
+
+FL_TEST_CASE("answering everywhere is not the same as resolving anything") {
+    // The guard on the case above, and not a hypothetical: `CQ_NAIVE` is a
+    // shipped mode that already fails this way.
+    //
+    // At 256 samples the kernel conditioning `samples * fmin / fmax` is 1.63,
+    // which is the condition `resolveModeEnums` uses to route away from
+    // CQ_NAIVE -- and the measurement says it is right to. CQ_NAIVE answers
+    // every one of the 200 tones and still puts the peak in the correct band
+    // for only 2 of 48 centres, missing by as much as 16 bands.
+    //
+    // So "zero dead tones" alone would be satisfied by a mode that responds
+    // to everything and distinguishes nothing, and any fix for #4301 that
+    // reports zero must clear this too.
+    const int kSteps = 200;
+    const CoverageResult naive_256_48 =
+        measureCoverage(256, 48, fl::audio::fft::Mode::CQ_NAIVE, kSteps);
+    const CoverageResult rebin_256_48 =
+        measureCoverage(256, 48, fl::audio::fft::Mode::LOG_REBIN, kSteps);
+
+    FL_CHECK_EQ(naive_256_48.dead, 0);
+    FL_CHECK_LT(naive_256_48.centre_hits, 8);
+    FL_CHECK_GT(naive_256_48.worst_miss, 8);
+
+    // LOG_REBIN answers everywhere *and* resolves, which is what makes the
+    // first case's comparison meaningful rather than a choice of poisons.
+    FL_CHECK_EQ(rebin_256_48.dead, 0);
+    FL_CHECK_GT(rebin_256_48.centre_hits, 24);
+    FL_CHECK_LT(rebin_256_48.worst_miss, 8);
+}
+
+FL_TEST_CASE("the default configuration does not select CQ_OCTAVE") {
+    // Which is why #4301 is a defect in a mode rather than in what most
+    // sketches get. `Args` defaults to 512 samples and 16 bands with
+    // `Mode::AUTO`, and AUTO takes LOG_REBIN at 32 bands or fewer.
+    //
+    // Recorded because the first report of #4301 measured CQ_OCTAVE at 16
+    // bands and read it as the default path. AUTO never pairs those.
+    fl::audio::fft::Mode mode = fl::audio::fft::Mode::AUTO;
+    fl::audio::fft::Window window = fl::audio::fft::Window::AUTO;
+    fl::audio::fft::Args::resolveModeEnums(
+        mode, window, fl::audio::fft::Args::DefaultBands(),
+        fl::audio::fft::Args::DefaultSamples(),
+        fl::audio::fft::Args::DefaultMinFrequency(),
+        fl::audio::fft::Args::DefaultMaxFrequency());
+    FL_CHECK(mode == fl::audio::fft::Mode::LOG_REBIN);
+
+    // Above 32 bands AUTO chooses on kernel conditioning. With the default
+    // range and 512 samples that is 512 * 90 / 14080 = 3.27, so CQ_NAIVE --
+    // still not CQ_OCTAVE. Reaching CQ_OCTAVE from AUTO needs both more than
+    // 32 bands and a shorter transform.
+    mode = fl::audio::fft::Mode::AUTO;
+    window = fl::audio::fft::Window::AUTO;
+    fl::audio::fft::Args::resolveModeEnums(
+        mode, window, 48, 512, fl::audio::fft::Args::DefaultMinFrequency(),
+        fl::audio::fft::Args::DefaultMaxFrequency());
+    FL_CHECK(mode == fl::audio::fft::Mode::CQ_NAIVE);
+
+    mode = fl::audio::fft::Mode::AUTO;
+    window = fl::audio::fft::Window::AUTO;
+    fl::audio::fft::Args::resolveModeEnums(
+        mode, window, 48, 256, fl::audio::fft::Args::DefaultMinFrequency(),
+        fl::audio::fft::Args::DefaultMaxFrequency());
+    FL_CHECK(mode == fl::audio::fft::Mode::CQ_OCTAVE);
+}
+
 FL_TEST_CASE("Binning adversarial - CQ_OCTAVE monotonicity sweep") {
+    // Rising input frequency must never drive the CQ peak bin backwards.
+    //
+    // The sweep steps the analyser's own band centres rather than an
+    // arbitrary log grid. Before the #4301 coverage supplement, a tone
+    // inside a kernel gap gave no detection at all, so `findPeakBin` returned
+    // whichever band happened to hold the most noise.
+    //
+    // A 30-step grid put 2 of its 30 steps inside those holes, and the peak
+    // there was decided by margins of one count (16 versus 15 at 11502 Hz).
+    // That is why this used to be able to pass or fail on an unrelated change
+    // to `fl::exp`, which moves the grid by a few percent: FastLED#4288.
+    //
+    // The holes were tracked in FastLED#4301. This case is about ordering,
+    // so it sweeps the analyser's band centres and checks each response.
     const int bands = 16;
     const float fmin = fl::audio::fft::Args::DefaultMinFrequency();
     const float fmax = fl::audio::fft::Args::DefaultMaxFrequency();
@@ -870,17 +1065,41 @@ FL_TEST_CASE("Binning adversarial - CQ_OCTAVE monotonicity sweep") {
     fl::audio::fft::Args args(512, bands, fmin, fmax, 44100, fl::audio::fft::Mode::CQ_OCTAVE);
     fl::audio::fft::Impl fft(args);
 
-    const int numSteps = 30;
-    float logRatio = fl::logf(fmax / fmin);
+    // Same expression `_generate_center_freqs` uses, so these are the
+    // frequencies the kernels are actually built for.
+    const float logRatio = fl::logf(fmax / fmin);
     int prevPeak = -1;
     int violations = 0;
+    int weakDetections = 0;
 
-    for (int s = 0; s < numSteps; ++s) {
-        float freq = fmin * fl::expf(logRatio * static_cast<float>(s) /
-                                     static_cast<float>(numSteps - 1));
+    for (int b = 0; b < bands; ++b) {
+        float freq = fmin * fl::expf(logRatio * static_cast<float>(b) /
+                                     static_cast<float>(bands - 1));
         auto samples = makeAdversarialSine(freq);
         fl::audio::fft::Bins bins(bands);
         fft.run(samples, &bins);
+
+        // The vacuity guard. Without it this case would still "pass" if the
+        // analyser stopped responding altogether, by comparing noise -- which
+        // is exactly the failure mode the old grid had.
+        float top = 0.0f;
+        float second = 0.0f;
+        for (fl::size i = 0; i < bins.raw().size(); ++i) {
+            const float v = bins.raw()[i];
+            if (v > top) {
+                second = top;
+                top = v;
+            } else if (v > second) {
+                second = v;
+            }
+        }
+        // The coverage supplement overlaps adjacent low bands, so the
+        // narrow-kernel 1.5x margin is no longer appropriate there.
+        if (top < 20.0f || top < second * 1.3f) {
+            FL_WARN("CQ weak detection at " << freq << " Hz: top " << top
+                         << ", runner-up " << second);
+            weakDetections++;
+        }
 
         int peak = findPeakBin(bins.raw());
         if (prevPeak >= 0 && peak < prevPeak) {
@@ -892,6 +1111,8 @@ FL_TEST_CASE("Binning adversarial - CQ_OCTAVE monotonicity sweep") {
         prevPeak = peak;
     }
     FL_CHECK_EQ(violations, 0);
+    // Every centre must be detectable and lead its runner-up by 30%.
+    FL_CHECK_EQ(weakDetections, 0);
 }
 
 // --- 4. White noise energy uniformity (catches LOG_REBIN high-bin bias) ---
@@ -1400,3 +1621,30 @@ FL_TEST_CASE("Args::resolveModeEnums") {
 }
 
 } // FL_TEST_FILE
+
+FL_TEST_CASE("CQ_OCTAVE coverage floor - integer decision boundaries (#4540)") {
+    using fl::audio::fft::detail::coverageFloorApplies;
+    // Strictly greater: fft/50 == cq does not replace, one more does.
+    FL_CHECK_FALSE(coverageFloorApplies(50u * 7u, 7u, 0u));
+    FL_CHECK(coverageFloorApplies(50u * 7u + 1u, 7u, 0u));
+    // Zero CQ (the coverage hole) takes any non-zero floor; zero never does.
+    FL_CHECK(coverageFloorApplies(1u, 0u, 0u));
+    FL_CHECK_FALSE(coverageFloorApplies(0u, 0u, 0u));
+    // A CQ detection within the main lobe (>= 20) blocks the floor.
+    FL_CHECK(coverageFloorApplies(100000u, 0u, 19u));
+    FL_CHECK_FALSE(coverageFloorApplies(100000u, 0u, 20u));
+    // No u32 overflow at saturation: cq * 50 exceeds 2^32.
+    const fl::u32 kMax = 0xFFFFFFFFu;
+    FL_CHECK_FALSE(coverageFloorApplies(kMax, kMax / 50u + 1u, 0u));
+    FL_CHECK(coverageFloorApplies(kMax, kMax / 50u - 1u, 0u));
+    // Matches the float rule `fft * 0.02f > cq` away from the exact
+    // 50:1 tie, over the magnitude range fastMag() produces.
+    for (fl::u32 cq = 0; cq < 400u; cq += 7u) {
+        for (fl::u32 fft = 0; fft < 25000u; fft += 13u) {
+            if (fft == cq * 50u) continue;
+            const bool asFloat = static_cast<float>(fft) * 0.02f >
+                                 static_cast<float>(cq);
+            FL_CHECK_EQ(coverageFloorApplies(fft, cq, 0u), asFloat);
+        }
+    }
+}

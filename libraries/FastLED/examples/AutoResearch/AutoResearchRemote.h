@@ -12,6 +12,7 @@
 #pragma once
 
 #include "fl/stl/stdint.h"  // for uint32_t, uint8_t
+#include "fl/remote/remote.h"  // for fl::Remote (no longer provided by FastLED.h)
 #include "fl/channels/manager.h"  // for DriverInfo
 #include "fl/stl/shared_ptr.h"
 #include "fl/stl/span.h"
@@ -42,11 +43,17 @@ struct AutoResearchState {
     int default_pin_rx;
     RxDeviceFactory rx_factory;
     bool gpio_baseline_test_done = false;  // Track whether GPIO baseline test has run in loop()
+    bool led_rx_available = false;  // True only after the configured RX path validates
     bool debug_enabled = false;  // Runtime debug logging toggle (default: off)
     bool net_server_active = false;  // Network server autoresearch active
     bool net_client_active = false;  // Network client autoresearch active
     bool ble_server_active = false;  // BLE GATT server autoresearch active
     bool deliberate_hang_requested = false;  // Watchdog autoresearch hang trigger (#2731)
+
+    void invalidateLedRxValidation() {
+        led_rx_available = false;
+        gpio_baseline_test_done = false;
+    }
 };
 
 /// @brief Print JSON directly to Serial, bypassing fl::println and ScopedLogDisable
@@ -104,4 +111,17 @@ private:
     fl::json runSingleTestImpl(const fl::json& args);
     fl::json runParallelTestImpl(const fl::json& args);
     fl::json findConnectedPinsImpl(const fl::json& args);
+
+    // RPC binding helpers — each implemented in its own .cpp file to keep
+    // file sizes below 1 K LOC (#3132 / meta #3127). The Remote target is
+    // passed explicitly so the same partitioning can be used for the BLE
+    // Remote (mBleRemote) or any future transport.
+    void bindSystemMethods(fl::Remote& remote);
+    void bindDriverMethods(fl::Remote& remote);
+    void bindPinMethods(fl::Remote& remote);
+    void bindMathMethods(fl::Remote& remote);
+    void bindNetworkMethods(fl::Remote& remote);
+    void bindAsyncMethods(fl::Remote& remote);
+    void bindBenchmarkMethods(fl::Remote& remote);
+    void bindRpSpiMethods(fl::Remote& remote);
 };

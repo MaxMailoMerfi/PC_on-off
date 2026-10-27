@@ -30,6 +30,7 @@ FASTLED_CHIPSETS: dict[str, tuple[int, int, int]] = {
     "WS2812_800KHZ_LEGACY": (320, 320, 640),
     "WS2813": (320, 320, 640),
     "SK6812": (300, 600, 300),
+    "LC8816E": (300, 600, 300),
     "SK6822": (375, 1000, 375),
     "UCS1903B_800KHZ": (400, 450, 450),
     "UCS1904_800KHZ": (400, 400, 450),
@@ -40,7 +41,7 @@ FASTLED_CHIPSETS: dict[str, tuple[int, int, int]] = {
     "LPD1886_1250KHZ": (200, 400, 200),
     "PL9823": (350, 1010, 350),
     "SM16703": (300, 600, 300),
-    "SM16824E": (300, 900, 100),
+    "SM16824E": (300, 600, 300),
     "UCS1912": (250, 1000, 350),
     # Medium-Speed Chipsets (400kHz - 600kHz)
     "WS2811_400KHZ": (800, 800, 900),
@@ -220,6 +221,7 @@ class TestChipsetDatabase(unittest.TestCase):
             "WS2812_800KHZ",
             "WS2813",
             "SK6812",
+            "LC8816E",
             "SK6822",
             "UCS1903B_800KHZ",
             "UCS1904_800KHZ",
@@ -287,6 +289,7 @@ class TestChipsetDatabase(unittest.TestCase):
         symmetric = [
             "WS2812_800KHZ",
             "SK6812",
+            "LC8816E",
             "SK6822",
             "SM16703",
         ]
@@ -368,6 +371,7 @@ class TestChipsetCount(unittest.TestCase):
             "WS2812_800KHZ",
             "WS2813",
             "SK6812",
+            "LC8816E",
             "SK6822",
             "UCS1903B_800KHZ",
             "UCS1904_800KHZ",

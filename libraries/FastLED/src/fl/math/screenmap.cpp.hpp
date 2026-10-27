@@ -26,12 +26,35 @@
 
 namespace fl {
 
+namespace {
+
+// Every value that reaches `mDiameter` from a caller passes through here.
+//
+// The class accepts any `float` -- three constructors and `setDiameter` all
+// take one unfiltered -- but only two kinds of value mean anything: a
+// positive size, and the -1 sentinel for "unset". A caller who stores 0.0f
+// or -2.0f has named a diameter no LED has. The emitter cannot publish
+// those (a consumer reading `"diameter": -2` learns nothing it can use) and
+// the parsers read an absent key back as -1, so before this normalization a
+// stored 0.0f came back from a round trip as -1.0f: silently different from
+// what was set, and different in a way `getDiameter()` did not show until
+// the file had been through JSON.
+//
+// Folding them to the sentinel at the boundary makes the two agree. A
+// non-positive diameter now reads back as -1 immediately, from the setter
+// onward, so the round trip is the identity on every value the class holds.
+float normalizedDiameter(float diameter) FL_NO_EXCEPT {
+    return diameter > 0.0f ? diameter : -1.0f;
+}
+
+}  // namespace
+
 // Default constructor and destructor - must be in .cpp for proper smart_ptr handling
-ScreenMap::ScreenMap() = default;
-ScreenMap::~ScreenMap() FL_NOEXCEPT = default;
+ScreenMap::ScreenMap() FL_NO_EXCEPT = default;
+ScreenMap::~ScreenMap() FL_NO_EXCEPT = default;
 
 // Helper function to extract a vector of floats from a JSON array
-fl::vector<float> jsonArrayToFloatVector(const fl::json& jsonArray) {
+fl::vector<float> jsonArrayToFloatVector(const fl::json& jsonArray) FL_NO_EXCEPT {
     fl::vector<float> result;
     
     if (!jsonArray.has_value() || !jsonArray.is_array()) {
@@ -61,7 +84,7 @@ fl::vector<float> jsonArrayToFloatVector(const fl::json& jsonArray) {
 }
 
 ScreenMap ScreenMap::Circle(int numLeds, float cm_between_leds,
-                            float cm_led_diameter, float completion) {
+                            float cm_led_diameter, float completion) FL_NO_EXCEPT {
     ScreenMap screenMap(numLeds);
 
     // radius from LED spacing
@@ -91,7 +114,7 @@ ScreenMap ScreenMap::Circle(int numLeds, float cm_between_leds,
 }
 
 ScreenMap ScreenMap::DefaultStrip(int numLeds, float cm_between_leds,
-                                  float cm_led_diameter, float completion) {
+                                  float cm_led_diameter, float completion) FL_NO_EXCEPT {
     return Circle(numLeds, cm_between_leds, cm_led_diameter, completion);
 }
 
@@ -113,7 +136,7 @@ ScreenMap ScreenMap::DefaultStrip(int numLeds, float cm_between_leds,
 // `z` is dropped (firmware-side ScreenMap is 2D today).
 static bool parseV2SegmentArray(const fl::json& segmentsArr,
                                 fl::flat_map<string, ScreenMap> *segmentMaps,
-                                string *err) FL_NOEXCEPT {
+                                string *err) FL_NO_EXCEPT {
     if (!segmentsArr.has_value() || !segmentsArr.is_array()) {
         *err = "v2 'segments' is not an array";
         return false;
@@ -162,6 +185,44 @@ static bool parseV2SegmentArray(const fl::json& segmentsArr,
         }
         fl::vector<float> y_array = jsonArrayToFloatVector(segVal["y"]);
 
+        string type = "led_strip";
+        if (segVal.contains("type") && segVal["type"].has_value()) {
+            auto typeOpt = segVal["type"].as_string();
+            if (!typeOpt) { *err = "v2 segment '" + id + "' has invalid 'type'"; return false; }
+            type = *typeOpt;
+        }
+        const bool isWire = type == "el_wire";
+        const bool isPanel = type == "el_panel";
+        if (type != "led_strip" && !isWire && !isPanel) {
+            *err = "v2 segment '" + id + "' has unsupported type '" + type + "'";
+            return false;
+        }
+        if (x_array.size() != y_array.size()) {
+            *err = "v2 segment '" + id + "' has mismatched x/y lengths";
+            return false;
+        }
+        const size_t minVertices = isWire ? 2 : isPanel ? 3 : 0;
+        if ((isWire || isPanel) && x_array.size() < minVertices) {
+            *err = "v2 segment '" + id + "' has too few vertices";
+            return false;
+        }
+        float thickness = 0.0f;
+        if (isWire) {
+            if (!segVal.contains("thickness") || !segVal["thickness"].has_value()) {
+                *err = "v2 el_wire segment '" + id + "' missing thickness";
+                return false;
+            }
+            auto thicknessOpt = segVal["thickness"].as_float();
+            if (!thicknessOpt || *thicknessOpt <= 0.0f) {
+                *err = "v2 el_wire segment '" + id + "' requires positive thickness";
+                return false;
+            }
+            thickness = static_cast<float>(*thicknessOpt);
+        } else if (segVal.contains("thickness")) {
+            *err = "v2 segment '" + id + "' thickness is only valid for el_wire";
+            return false;
+        }
+
         // Optional: diameter (not in canonical v2 but accepted as a backward-compat
         // hint when present; otherwise the per-group `diameter` could be wired here
         // in a future iteration).
@@ -174,9 +235,17 @@ static bool parseV2SegmentArray(const fl::json& segmentsArr,
         }
 
         auto n = fl::min(x_array.size(), y_array.size());
-        ScreenMap segment_map(n, diameter);
-        for (size_t i = 0; i < n; i++) {
-            segment_map.set(i, vec2f{x_array[i], y_array[i]});
+        ScreenMap segment_map(isWire || isPanel ? 1 : static_cast<u32>(n), diameter);
+        if (isWire || isPanel) {
+            fl::vector<vec2f> vertices;
+            vertices.reserve(n);
+            for (size_t i = 0; i < n; i++) vertices.push_back({x_array[i], y_array[i]});
+            segment_map.setShape(0, isWire ? ScreenMap::Shape::EL_WIRE : ScreenMap::Shape::EL_PANEL, vertices.data(), static_cast<u32>(n), thickness);
+        }
+        if (!isWire && !isPanel) {
+            for (size_t i = 0; i < n; i++) {
+                segment_map.set(static_cast<u16>(i), vec2f{x_array[i], y_array[i]});
+            }
         }
         (*segmentMaps)[id] = fl::move(segment_map);
     }
@@ -184,7 +253,7 @@ static bool parseV2SegmentArray(const fl::json& segmentsArr,
 }
 
 bool ScreenMap::ParseJson(const char *jsonStrScreenMap,
-                          fl::flat_map<string, ScreenMap> *segmentMaps, string *err) {
+                          fl::flat_map<string, ScreenMap> *segmentMaps, string *err) FL_NO_EXCEPT {
 
 #if FASTLED_NO_JSON
     FL_UNUSED(jsonStrScreenMap);
@@ -343,7 +412,7 @@ bool ScreenMap::ParseJson(const char *jsonStrScreenMap,
 
 bool ScreenMap::ParseJson(const char *jsonStrScreenMap,
                           const char *screenMapName, ScreenMap *screenmap,
-                          string *err) {
+                          string *err) FL_NO_EXCEPT {
 
     fl::flat_map<string, ScreenMap> segmentMaps;
     bool ok = ParseJson(jsonStrScreenMap, &segmentMaps, err);
@@ -367,7 +436,7 @@ bool ScreenMap::ParseJson(const char *jsonStrScreenMap,
 }
 
 void ScreenMap::toJson(const fl::flat_map<string, ScreenMap> &segmentMaps,
-                       fl::json *doc) {
+                       fl::json *doc) FL_NO_EXCEPT {
 
 #if FASTLED_NO_JSON
     FL_WARN("ScreenMap::toJson called with FASTLED_NO_JSON");
@@ -381,8 +450,12 @@ void ScreenMap::toJson(const fl::flat_map<string, ScreenMap> &segmentMaps,
     // Emits the v2 screenmap shape (issue ledmapper#143):
     //   { "version": 2,
     //     "groups": { "<name>": { "color": "#hex" } },
-    //     "segments": [ { "id": "<name>", "pin": "pin1", "group": "<name>",
+    //     "segments": [ { "id": "<name>", "group": "<name>",
     //                     "x": [...], "y": [...], "diameter": ... } ] }
+    //
+    // `pin` is part of the v2 shape but is not emitted here -- see the note
+    // at the segment object below. Writing the example value from a comment
+    // as data is how it came to be there.
     // Bilingual readers (`ScreenMap::ParseJson`, ledmapper) accept both v1
     // and v2, so any existing on-disk v1 JSON keeps loading. v1 emission
     // is no longer supported.
@@ -402,7 +475,7 @@ void ScreenMap::toJson(const fl::flat_map<string, ScreenMap> &segmentMaps,
     size_t idx = 0;
     for (const auto& kv : segmentMaps) {
         if (kv.second.getLength() == 0) {
-            FL_WARN("ScreenMap::toJson called with empty segment: " << fl::string(kv.first));
+            FL_WARN("ScreenMap::toJson called with empty segment: " << (fl::string(kv.first)));
             continue;
         }
 
@@ -412,11 +485,11 @@ void ScreenMap::toJson(const fl::flat_map<string, ScreenMap> &segmentMaps,
 
         fl::json xArray = fl::json::array();
         for (u16 i = 0; i < segment.getLength(); i++) {
-            xArray.push_back(fl::json(static_cast<double>(segment[i].x)));
+            xArray.push_back(fl::json(segment[i].x));
         }
         fl::json yArray = fl::json::array();
         for (u16 i = 0; i < segment.getLength(); i++) {
-            yArray.push_back(fl::json(static_cast<double>(segment[i].y)));
+            yArray.push_back(fl::json(segment[i].y));
         }
 
         fl::json groupObj = fl::json::object();
@@ -425,17 +498,45 @@ void ScreenMap::toJson(const fl::flat_map<string, ScreenMap> &segmentMaps,
 
         fl::json segmentObj = fl::json::object();
         segmentObj.set("id", fl::json(fl::string(name)));
-        segmentObj.set("pin", fl::json(fl::string("pin1")));
+        // No `pin`. The v2 shape carries one and the parser above drops it --
+        // it is wiring metadata with nowhere to live on this side -- so there
+        // is nothing here to write. What used to be written was the literal
+        // `"pin1"` from the shape example in the comment above, copied into
+        // the emitter as data.
+        //
+        // That is worse than omitting it, because it is wrong rather than
+        // absent. A three-segment file wired to pin1/pin2/pin3 came back with
+        // all three on pin1, and a numeric `"pin": 7` came back as the string
+        // `"pin1"`. A consumer reading that mis-wires a strip and has no way
+        // to tell; a consumer reading a missing optional key can see that it
+        // is missing.
+        //
+        // Carrying the value through instead is FastLED #3322, which needs
+        // somewhere on `ScreenMap` to put it and a decision about the
+        // `<int|str>` union. Until then this loses the field visibly rather
+        // than rewriting it silently.
         segmentObj.set("group", fl::json(fl::string(name)));
         segmentObj.set("x", xArray);
         segmentObj.set("y", yArray);
-        segmentObj.set("diameter", fl::json(static_cast<double>(diameter)));
+        // Only when there is one. `mDiameter` defaults to -1 as a sentinel
+        // meaning "unset", and writing that out publishes an impossible
+        // physical size: no LED is -1 units across. The parser already reads
+        // an absent key back as -1 (both the v1 and v2 paths default it), so
+        // omitting round-trips to exactly the same value inside FastLED and
+        // stops a consumer from having to know the sentinel.
+        //
+        // The field's own comment in screenmap.h asked for this and had the
+        // sense inverted -- "Only serialized if it's not > 0.0f" -- which is
+        // presumably how the writer came to do the opposite.
+        if (diameter > 0.0f) {
+            segmentObj.set("diameter", fl::json(diameter));
+        }
         segmentsArr.push_back(segmentObj);
 
         idx++;
     }
 
-    doc->set("version", fl::json(static_cast<double>(2)));
+    doc->set("version", fl::json(i64(2)));
     doc->set("groups", groupsObj);
     doc->set("segments", segmentsArr);
 
@@ -445,14 +546,14 @@ void ScreenMap::toJson(const fl::flat_map<string, ScreenMap> &segmentMaps,
 }
 
 void ScreenMap::toJsonStr(const fl::flat_map<string, ScreenMap> &segmentMaps,
-                          string *jsonBuffer) {
+                          string *jsonBuffer) FL_NO_EXCEPT {
     fl::json doc;
     toJson(segmentMaps, &doc);
     *jsonBuffer = doc.to_string();
 }
 
-ScreenMap::ScreenMap(u32 length, float mDiameter)
-    : length(length), mDiameter(mDiameter) {
+ScreenMap::ScreenMap(u32 length, float mDiameter) FL_NO_EXCEPT
+    : length(length), mDiameter(normalizedDiameter(mDiameter)) {
     if (length > 0) {
         mLookUpTable = fl::make_shared<LUTXYFLOAT>(length);
         LUTXYFLOAT &lut = *mLookUpTable.get();
@@ -463,8 +564,8 @@ ScreenMap::ScreenMap(u32 length, float mDiameter)
     }
 }
 
-ScreenMap::ScreenMap(const vec2f *lut, u32 length, float diameter)
-    : length(length), mDiameter(diameter) {
+ScreenMap::ScreenMap(const vec2f *lut, u32 length, float diameter) FL_NO_EXCEPT
+    : length(length), mDiameter(normalizedDiameter(diameter)) {
     mLookUpTable = fl::make_shared<LUTXYFLOAT>(length);
     LUTXYFLOAT &lut16xy = *mLookUpTable.get();
     vec2f *data = lut16xy.getDataMutable();
@@ -473,8 +574,8 @@ ScreenMap::ScreenMap(const vec2f *lut, u32 length, float diameter)
     }
 }
 
-ScreenMap::ScreenMap(int count, float diameter, fl::function<void(int, vec2f& pt_out)> func)
-    : length(count), mDiameter(diameter) {
+ScreenMap::ScreenMap(int count, float diameter, fl::function<void(int, vec2f& pt_out)> func) FL_NO_EXCEPT
+    : length(count), mDiameter(normalizedDiameter(diameter)) {
     if (count > 0) {
         mLookUpTable = fl::make_shared<LUTXYFLOAT>(count);
         LUTXYFLOAT &lut = *mLookUpTable.get();
@@ -485,23 +586,25 @@ ScreenMap::ScreenMap(int count, float diameter, fl::function<void(int, vec2f& pt
     }
 }
 
-ScreenMap::ScreenMap(const ScreenMap &other) {
+ScreenMap::ScreenMap(const ScreenMap &other) FL_NO_EXCEPT {
     mDiameter = other.mDiameter;
     length = other.length;
     mLookUpTable = other.mLookUpTable;
     mSourceXYMap = other.mSourceXYMap;
+    mShapes = other.mShapes;
 }
 
-ScreenMap::ScreenMap(ScreenMap&& other) {
+ScreenMap::ScreenMap(ScreenMap&& other) FL_NO_EXCEPT {
     mDiameter = other.mDiameter;
     length = other.length;
     fl::swap(mLookUpTable, other.mLookUpTable);
     fl::swap(mSourceXYMap, other.mSourceXYMap);
+    fl::swap(mShapes, other.mShapes);
     other.mLookUpTable.reset();
     other.mSourceXYMap.reset();
 }
 
-void ScreenMap::set(u16 index, const vec2f &p) {
+void ScreenMap::set(u16 index, const vec2f &p) FL_NO_EXCEPT {
     if (mLookUpTable) {
         LUTXYFLOAT &lut = *mLookUpTable.get();
         auto *data = lut.getDataMutable();
@@ -509,9 +612,11 @@ void ScreenMap::set(u16 index, const vec2f &p) {
     }
 }
 
-void ScreenMap::setDiameter(float diameter) { mDiameter = diameter; }
+void ScreenMap::setDiameter(float diameter) FL_NO_EXCEPT {
+    mDiameter = normalizedDiameter(diameter);
+}
 
-vec2f ScreenMap::mapToIndex(u32 x) const {
+vec2f ScreenMap::mapToIndex(u32 x) const FL_NO_EXCEPT {
     if (x >= length || !mLookUpTable) {
         return {0, 0};
     }
@@ -520,11 +625,11 @@ vec2f ScreenMap::mapToIndex(u32 x) const {
     return screen_coords;
 }
 
-u32 ScreenMap::getLength() const { return length; }
+u32 ScreenMap::getLength() const FL_NO_EXCEPT { return length; }
 
-float ScreenMap::getDiameter() const { return mDiameter; }
+float ScreenMap::getDiameter() const FL_NO_EXCEPT { return mDiameter; }
 
-vec2f ScreenMap::getBounds() const {
+vec2f ScreenMap::getBounds() const FL_NO_EXCEPT {
 
     if (length == 0 || !mLookUpTable) {
         return {0, 0};
@@ -553,12 +658,36 @@ vec2f ScreenMap::getBounds() const {
     return {maxX - minX, maxY - minY};
 }
 
-const vec2f &ScreenMap::empty() {
+void ScreenMap::setShape(u32 index, Shape::Type type, const vec2f *vertices, u32 count,
+                         float thickness) FL_NO_EXCEPT {
+    if (!vertices || count == 0) return;
+    if (index >= mShapes.size()) mShapes.resize(index + 1);
+    Shape &shape = mShapes[index];
+    shape.type = type;
+    shape.thickness = thickness;
+    shape.vertices.clear();
+    shape.vertices.reserve(count);
+    for (u32 i = 0; i < count; ++i) shape.vertices.push_back(vertices[i]);
+}
+
+bool ScreenMap::hasShapes() const FL_NO_EXCEPT { return !mShapes.empty(); }
+u32 ScreenMap::getShapeCount() const FL_NO_EXCEPT { return static_cast<u32>(mShapes.size()); }
+
+const ScreenMap::Shape &ScreenMap::getShape(u32 index) const FL_NO_EXCEPT {
+    static const Shape emptyShape = [] {
+        Shape shape;
+        shape.type = Shape::EL_PANEL;
+        return shape;
+    }();
+    return index < mShapes.size() ? mShapes[index] : emptyShape;
+}
+
+const vec2f &ScreenMap::empty() FL_NO_EXCEPT {
     static const vec2f s_empty = vec2f(0, 0); // okay static in header
     return s_empty;
 }
 
-const vec2f &ScreenMap::operator[](u32 x) const {
+const vec2f &ScreenMap::operator[](u32 x) const FL_NO_EXCEPT {
     if (x >= length || !mLookUpTable) {
         return empty(); // better than crashing.
     }
@@ -566,7 +695,7 @@ const vec2f &ScreenMap::operator[](u32 x) const {
     return lut[x];
 }
 
-vec2f &ScreenMap::operator[](u32 x) {
+vec2f &ScreenMap::operator[](u32 x) FL_NO_EXCEPT {
     if (x >= length || !mLookUpTable) {
         return const_cast<vec2f &>(empty()); // better than crashing.
     }
@@ -575,45 +704,47 @@ vec2f &ScreenMap::operator[](u32 x) {
     return data[x];
 }
 
-ScreenMap &ScreenMap::operator=(const ScreenMap &other) FL_NOEXCEPT {
+ScreenMap &ScreenMap::operator=(const ScreenMap &other) FL_NO_EXCEPT {
     if (this != &other) {
         mDiameter = other.mDiameter;
         length = other.length;
         mLookUpTable = other.mLookUpTable;
         mSourceXYMap = other.mSourceXYMap;
+        mShapes = other.mShapes;
     }
     return *this;
 }
 
-ScreenMap &ScreenMap::operator=(ScreenMap &&other) FL_NOEXCEPT {
+ScreenMap &ScreenMap::operator=(ScreenMap &&other) FL_NO_EXCEPT {
     if (this != &other) {
         mDiameter = other.mDiameter;
         length = other.length;
         mLookUpTable = fl::move(other.mLookUpTable);
         mSourceXYMap = fl::move(other.mSourceXYMap);
+        mShapes = fl::move(other.mShapes);
         other.length = 0;
         other.mDiameter = -1.0f;
     }
     return *this;
 }
 
-void ScreenMap::setSourceXYMap(const fl::shared_ptr<XYMap>& xymap) {
+void ScreenMap::setSourceXYMap(const fl::shared_ptr<XYMap>& xymap) FL_NO_EXCEPT {
     mSourceXYMap = xymap;
 }
 
-const XYMapPtr& ScreenMap::getSourceXYMapPtr() const {
+const XYMapPtr& ScreenMap::getSourceXYMapPtr() const FL_NO_EXCEPT {
     return mSourceXYMap;
 }
 
-const XYMap* ScreenMap::getXYMap() const {
+const XYMap* ScreenMap::getXYMap() const FL_NO_EXCEPT {
     return mSourceXYMap.get();
 }
 
-bool ScreenMap::hasSourceXYMap() const {
+bool ScreenMap::hasSourceXYMap() const FL_NO_EXCEPT {
     return mSourceXYMap != nullptr;
 }
 
-void ScreenMap::addOffset(const vec2f &p) {
+void ScreenMap::addOffset(const vec2f &p) FL_NO_EXCEPT {
     vec2f *data = mLookUpTable->getDataMutable();
     for (u32 i = 0; i < length; i++) {
         vec2f &curr = data[i];
@@ -622,7 +753,7 @@ void ScreenMap::addOffset(const vec2f &p) {
     }
 }
 
-ScreenMap& ScreenMap::addOffsetX(float x) { addOffset({x, 0}); return *this; }
-ScreenMap& ScreenMap::addOffsetY(float y) { addOffset({0, y}); return *this; }
+ScreenMap& ScreenMap::addOffsetX(float x) FL_NO_EXCEPT { addOffset({x, 0}); return *this; }
+ScreenMap& ScreenMap::addOffsetY(float y) FL_NO_EXCEPT { addOffset({0, y}); return *this; }
 
 } // namespace fl

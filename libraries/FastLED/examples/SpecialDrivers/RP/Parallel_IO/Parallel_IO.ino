@@ -2,8 +2,8 @@
 /// @brief Example: Automatic parallel WS2812 strips on RP2040/RP2350
 ///
 /// This sketch demonstrates the new automatic parallel grouping feature for
-/// RP2040/RP2350 boards. Unlike the manual ParallelClocklessController, this
-/// uses the standard FastLED.addLeds() API and automatically detects consecutive
+/// RP2040/RP2350 boards. It uses the standard FastLED.addLeds() API and
+/// automatically detects consecutive
 /// GPIO pins for parallel output.
 ///
 /// ## Hardware Setup
@@ -41,7 +41,7 @@
 /// #include <FastLED.h>
 /// ```
 
-// @filter: (platform is rp2040)
+// @filter: (platform is rp)
 
 // Enable automatic parallel grouping driver
 #define FASTLED_RP2040_CLOCKLESS_PIO_AUTO 1
@@ -204,9 +204,9 @@ void rotate(CRGB* array, int length, uint8_t amount) {
 // FastLED.addLeds<WS2812, 3>(...);  //
 // FastLED.addLeds<WS2812, 4>(...);  //
 // FastLED.addLeds<WS2812, 5>(...);  //
-// FastLED.addLeds<WS2812, 10>(...); // Group 2: GPIO 10 (sequential fallback)
-// FastLED.addLeds<WS2812, 15>(...); // Group 3: GPIO 15 (sequential fallback)
+// FastLED.addLeds<WS2812, 10>(...); // Group 2: GPIO 10 (independent lane)
+// FastLED.addLeds<WS2812, 15>(...); // Group 3: GPIO 15 (independent lane)
 //
 // The driver automatically creates:
-// - One 4-pin parallel group for GPIO 2-5 (uses 1 PIO SM + 1 DMA channel)
-// - Two single-pin sequential groups for GPIO 10 and 15
+// - One 4-lane batch for GPIO 2-5 (1 PIO SM + 1 DMA channel on ChannelEngineRpPio)
+// - Independent single-lane strips for GPIO 10 and 15, output concurrently (#4620)

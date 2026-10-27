@@ -15,7 +15,7 @@ Key features:
 
 import datetime
 import os
-import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,12 +23,13 @@ from typing import Any
 import psutil
 import serial.tools.list_ports
 from psutil import Process
+from running_process import PIPE, RunningProcess, TimeoutExpired
 from serial.tools.list_ports_common import ListPortInfo
 
 from ci.util.global_interrupt_handler import handle_keyboard_interrupt
 
 
-# Mapping from detected ESP chip type to PlatformIO environment
+# Mapping from detected ESP chip type to fbuild environment
 CHIP_TO_ENVIRONMENT: dict[str, str] = {
     "ESP32-S3": "esp32s3",
     "ESP32-C6": "esp32c6",
@@ -45,7 +46,7 @@ NO_WIFI_ENVIRONMENTS: set[str] = {"esp32h2", "esp32p4"}
 
 
 def environment_has_wifi(environment: str) -> bool:
-    """Check if a PlatformIO environment has WiFi hardware."""
+    """Check if a board environment has WiFi hardware."""
     return environment.lower() not in NO_WIFI_ENVIRONMENTS
 
 
@@ -66,18 +67,100 @@ class ComportResult:
     all_ports: list[ListPortInfo] = field(default_factory=lambda: [])
 
 
-def auto_detect_upload_port(expected_environment: str | None) -> ComportResult:
+def port_exists(port: str) -> bool:
+    """Return True if `port` is currently enumerated by the OS.
+
+    Uses OS-level port enumeration (list_ports), NOT a device serial
+    connection — this is the sanctioned way to poll for a port
+    (re)appearing (e.g. after an OTA reboot) without opening raw pyserial
+    on the device. Callers in the AutoResearch complex must use this
+    instead of `serial.Serial(port)` availability probes (see the PYS001
+    ban in ci/lint_python/pyserial_checker.py).
+    """
+    try:
+        names = {p.device for p in serial.tools.list_ports.comports()}
+    except KeyboardInterrupt as ki:
+        handle_keyboard_interrupt(ki)
+        raise
+    except Exception:
+        return False
+    # Windows `\\.\COM10` prefix vs bare `COM10` — normalize both ways.
+    stripped = port.replace("\\\\.\\", "").replace("\\.\\", "")
+    return port in names or stripped in names
+
+
+def get_port_serial_number(port: str) -> str | None:
+    """Return the USB serial identity for an enumerated application port."""
+    stripped = port.replace("\\\\.\\", "").replace("\\.\\", "")
+    try:
+        for candidate in serial.tools.list_ports.comports():
+            candidate_name = candidate.device.replace("\\\\.\\", "").replace(
+                "\\.\\", ""
+            )
+            if candidate_name == stripped:
+                return candidate.serial_number
+    except KeyboardInterrupt as ki:
+        handle_keyboard_interrupt(ki)
+        raise
+    except Exception:
+        return None
+    return None
+
+
+def find_port_by_serial(
+    serial_number: str, exclude: str | None = None, wait_s: float = 5.0
+) -> str | None:
+    """Return the device path currently carrying ``serial_number``.
+
+    Used to follow a USB-JTAG board that re-enumerates under a new ``/dev``
+    name after the post-flash reset. Polls for up to ``wait_s`` seconds
+    because the new node appears a moment after the old one disappears.
+    """
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            for candidate in serial.tools.list_ports.comports():
+                if candidate.serial_number == serial_number and (
+                    exclude is None or candidate.device != exclude
+                ):
+                    return candidate.device
+        except KeyboardInterrupt as ki:
+            handle_keyboard_interrupt(ki)
+            raise
+        except Exception:
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.25)
+
+
+def auto_detect_upload_port(
+    expected_environment: str | None,
+    *,
+    expected_serial_number: str | None = None,
+) -> ComportResult:
     """Auto-detect the upload port from available serial ports.
 
     Only considers USB devices - filters out Bluetooth and other non-USB ports.
     Returns a structured result with success status, selected port, error details,
     and all scanned ports for diagnostics.
 
-    Prefers common ESP32/Arduino USB-to-serial chips:
+    Uses an exact serial-number match when one is supplied, and probes ESP
+    chips for ESP environments. A known non-ESP environment is not guessed
+    from generic USB descriptors; callers must defer to fbuild or supply an
+    explicit port.
+
+    Without an expected environment, prefers common USB-to-serial chips:
         - CP2102/CP210x (Silicon Labs)
         - CH340/CH341 (WCH)
         - FTDI chips
         - Generic USB-Serial converters
+
+    Args:
+        expected_environment: Board environment used for ESP chip probing and
+            to prevent unsafe generic selection for known non-ESP boards.
+        expected_serial_number: Optional stable USB identity that a matching
+            board must retain across re-enumeration.
 
     Returns:
         ComportResult with detection status and diagnostics
@@ -130,12 +213,35 @@ def auto_detect_upload_port(expected_environment: str | None) -> ComportResult:
         )
 
     expected_env = expected_environment.lower() if expected_environment else None
+
+    if expected_serial_number:
+        for port in usb_ports:
+            if port.serial_number == expected_serial_number:
+                return ComportResult(
+                    ok=True,
+                    selected_port=port.device,
+                    error_message=None,
+                    all_ports=all_ports,
+                )
+        return ComportResult(
+            ok=False,
+            selected_port=None,
+            error_message=(
+                "No USB serial port matched expected serial number "
+                f"'{expected_serial_number}'"
+            ),
+            all_ports=all_ports,
+        )
+
     esp_environments = {env.lower() for env in CHIP_TO_ENVIRONMENT.values()}
     if expected_env in esp_environments:
         probe_notes: list[str] = []
         saw_positive_detection = False
         for port in usb_ports:
-            chip_result = detect_attached_chip(port.device, timeout=3.0)
+            # FastLED #3446: drop the explicit 3.0 s override so the call
+            # picks up `detect_attached_chip`'s richer 15 s default and the
+            # reset-strategy fallback chain (default → usb → no-reset).
+            chip_result = detect_attached_chip(port.device)
             if chip_result.ok:
                 saw_positive_detection = True
                 detected_env = chip_result.environment or "unknown"
@@ -167,6 +273,17 @@ def auto_detect_upload_port(expected_environment: str | None) -> ComportResult:
                 all_ports=all_ports,
             )
         # Probe was inconclusive; fall through to the USB descriptor heuristic.
+
+    if expected_env and expected_env not in esp_environments:
+        return ComportResult(
+            ok=False,
+            selected_port=None,
+            error_message=(
+                f"USB port for environment '{expected_environment}' cannot be "
+                "identified safely without fbuild board selection or an explicit port"
+            ),
+            all_ports=all_ports,
+        )
 
     # Select best USB port (prefer ESP32/Arduino chips if available)
     selected_port = None
@@ -234,7 +351,7 @@ def kill_port_users(port: str) -> None:
     Safety features:
         - Never kills current process or any parent process
         - Never kills Python processes (could be agent backend)
-        - Only kills known serial tools (pio, esptool, miniterm, etc.)
+        - Only kills known serial tools (esptool, miniterm, etc.)
         - Logs all actions for auditing
 
     Args:
@@ -262,12 +379,8 @@ def kill_port_users(port: str) -> None:
     # Kill dedicated serial tools AND orphaned Python serial processes
     # (but protect agent backend: clud, claude, node.exe, etc.)
     safe_serial_exes = [
-        "pio.exe",
-        "pio",
         "esptool.exe",
         "esptool",
-        "platformio.exe",
-        "platformio",
         "miniterm.exe",
         "miniterm",
         "putty.exe",
@@ -297,8 +410,6 @@ def kill_port_users(port: str) -> None:
     ]
 
     cmdline_patterns = [
-        "pio monitor",
-        "pio device monitor",
         "device monitor",
         "miniterm",
         "esptool",
@@ -399,7 +510,7 @@ class ChipDetectionResult:
     Attributes:
         ok: True if chip was detected, False otherwise
         chip_type: Detected chip type (e.g., "ESP32-S3", "ESP32-C6")
-        environment: Suggested PlatformIO environment (e.g., "esp32s3", "esp32c6")
+        environment: Suggested board environment (e.g., "esp32s3", "esp32c6")
         error_message: Optional error description if detection failed
     """
 
@@ -409,21 +520,18 @@ class ChipDetectionResult:
     error_message: str | None = None
 
 
-def detect_attached_chip(port: str, timeout: float = 10.0) -> ChipDetectionResult:
-    """Detect ESP chip type using esptool.
+def _probe_chip_with_reset_mode(
+    port: str, reset_mode: str, timeout: float
+) -> tuple[str | None, str | None]:
+    """Run esptool chip-id with a specific --before reset strategy.
 
-    Uses esptool with auto chip detection to identify the connected ESP device.
-    This allows automatic selection of the correct PlatformIO environment.
-
-    Args:
-        port: Serial port name (e.g., "COM13", "/dev/ttyUSB0")
-        timeout: Maximum time to wait for esptool in seconds
-
-    Returns:
-        ChipDetectionResult with chip type, suggested environment, or error details
+    Returns ``(chip_type, error)``. Exactly one of the two is non-None on
+    a clean call. The caller is responsible for combining results across
+    multiple strategies and surfacing the final error if every strategy
+    fails.
     """
     try:
-        result = subprocess.run(
+        result = RunningProcess.run(
             [
                 "uv",
                 "run",
@@ -434,67 +542,138 @@ def detect_attached_chip(port: str, timeout: float = 10.0) -> ChipDetectionResul
                 "auto",
                 "-p",
                 port,
+                "--before",
+                reset_mode,
                 "chip-id",
             ],
-            capture_output=True,
-            text=True,
+            stdout=PIPE,
+            stderr=PIPE,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
-
-        # Parse output for "Detecting chip type... ESP32-S3" line
-        chip_type = None
-        for line in result.stdout.split("\n"):
-            if "Detecting chip type..." in line:
-                # Extract chip type after "..."
-                chip_type = line.split("...")[-1].strip()
-                break
-
-        if not chip_type:
-            # Also check for "Chip is ESP32-S3" pattern in case output format varies
-            for line in result.stdout.split("\n"):
-                if line.strip().startswith("Chip is "):
-                    chip_type = line.strip().replace("Chip is ", "").strip()
-                    break
-
-        if not chip_type:
-            return ChipDetectionResult(
-                ok=False,
-                chip_type=None,
-                environment=None,
-                error_message="Could not parse chip type from esptool output",
-            )
-
-        # Map chip type to environment
-        environment = chip_to_environment(chip_type)
-
-        return ChipDetectionResult(
-            ok=True,
-            chip_type=chip_type,
-            environment=environment,
-            error_message=None,
-        )
-
-    except subprocess.TimeoutExpired:
-        return ChipDetectionResult(
-            ok=False,
-            chip_type=None,
-            environment=None,
-            error_message=f"esptool timed out after {timeout}s - device may not be in bootloader mode",
+    except TimeoutExpired:
+        return (
+            None,
+            f"esptool --before {reset_mode} timed out after {timeout:.1f}s",
         )
     except KeyboardInterrupt as ki:
         handle_keyboard_interrupt(ki)
         raise
     except Exception as e:
+        return None, f"esptool --before {reset_mode} crashed: {e}"
+
+    # Parse output for "Detecting chip type... ESP32-S3" line
+    chip_type: str | None = None
+    for line in result.stdout.split("\n"):
+        if "Detecting chip type..." in line:
+            chip_type = line.split("...")[-1].strip()
+            break
+
+    if not chip_type:
+        # Also check for "Chip is ESP32-S3" pattern in case output format varies
+        for line in result.stdout.split("\n"):
+            if line.strip().startswith("Chip is "):
+                chip_type = line.strip().replace("Chip is ", "").strip()
+                break
+
+    if chip_type:
+        return chip_type, None
+
+    stderr_tail = (result.stderr or "").strip().splitlines()
+    tail_line = stderr_tail[-1] if stderr_tail else ""
+    return (
+        None,
+        f"esptool --before {reset_mode} produced no chip-id; last stderr: {tail_line!r}",
+    )
+
+
+def detect_attached_chip(port: str, timeout: float = 7.0) -> ChipDetectionResult:
+    """Detect ESP chip type using esptool.
+
+    Uses esptool with auto chip detection to identify the connected ESP device.
+    This allows automatic selection of the correct board environment.
+
+    FastLED #3446: previously hardcoded at 3.0 s with one reset strategy.
+    That budget undershoots the CP210x worst-case auto-reset path (slow
+    USB driver init + ~4 s of esptool SYNC retries + bootloader
+    handshake), so devkits with even a slightly sluggish reset circuit
+    failed to be recognised on the first try.
+
+    Detection budget per port:
+
+    1. **Primary**: ``--before default-reset`` (the classic DTR/RTS
+       auto-reset). Bounded by ``timeout``. Catches all healthy boards
+       on the first pass.
+    2. **Fallback chain**, ONLY triggered when the primary attempt
+       actually *timed out* (i.e. esptool was still in the
+       reset/sync loop, not "no device on this port" — those fail fast):
+       - ``--before usb-reset`` — native USB-CDC chips
+         (S2/S3/C2/C3/H2/C6) whose reset path is over USB, not DTR/RTS.
+       - ``--before no-reset`` — boards where the user (or a
+         previous flash) already left the device in the bootloader.
+
+       Each fallback gets the same ``timeout``. Skipped on "no chip-id
+       produced" so empty ports don't drag the total probe out — keeps
+       a 5-port-all-empty sweep under ~10 s.
+
+    Args:
+        port: Serial port name (e.g., "COM13", "/dev/ttyUSB0")
+        timeout: Per-strategy wall-clock budget. Default 7 s — covers
+            the CP210x worst case while keeping a multi-port sweep
+            with no devices well under 30 s total.
+
+    Returns:
+        ChipDetectionResult with chip type, suggested environment, or
+        an aggregated error describing what each reset strategy saw.
+    """
+    primary_mode = "default-reset"
+    chip_type, primary_err = _probe_chip_with_reset_mode(port, primary_mode, timeout)
+    if chip_type:
+        return ChipDetectionResult(
+            ok=True,
+            chip_type=chip_type,
+            environment=chip_to_environment(chip_type),
+            error_message=None,
+        )
+
+    # Only escalate to the fallback chain if the primary attempt was
+    # cut off by `timeout` — that's the signature of a struggling reset
+    # circuit. A primary that returned "no chip-id produced" means the
+    # port is dead or the device isn't an ESP, so additional strategies
+    # are a waste.
+    if primary_err and "timed out" not in primary_err:
         return ChipDetectionResult(
             ok=False,
             chip_type=None,
             environment=None,
-            error_message=f"Failed to detect chip: {e}",
+            error_message=primary_err,
         )
+
+    attempts: list[str] = [primary_err or f"esptool --before {primary_mode}: timed out"]
+    for mode in ("usb-reset", "no-reset"):
+        chip_type, err = _probe_chip_with_reset_mode(port, mode, timeout)
+        if chip_type:
+            return ChipDetectionResult(
+                ok=True,
+                chip_type=chip_type,
+                environment=chip_to_environment(chip_type),
+                error_message=None,
+            )
+        attempts.append(err or f"esptool --before {mode}: unknown failure")
+
+    return ChipDetectionResult(
+        ok=False,
+        chip_type=None,
+        environment=None,
+        error_message=(
+            "esptool reset-strategy fallback chain exhausted: " + "; ".join(attempts)
+        ),
+    )
 
 
 def chip_to_environment(chip_type: str) -> str | None:
-    """Map an ESP chip type to a PlatformIO environment name.
+    """Map an ESP chip type to a board environment name.
 
     Handles chip variants like "ESP32-S3 (QFN56)" by matching the base chip type.
 
@@ -502,7 +681,7 @@ def chip_to_environment(chip_type: str) -> str | None:
         chip_type: Chip type string from esptool (e.g., "ESP32-S3", "ESP32-C6 (QFN40)")
 
     Returns:
-        PlatformIO environment name (e.g., "esp32s3") or None if no mapping found
+        Board environment name (e.g., "esp32s3") or None if no mapping found
     """
     # Normalize chip type for comparison
     chip_upper = chip_type.upper()
@@ -521,7 +700,7 @@ def chip_to_environment(chip_type: str) -> str | None:
 
 
 def environment_to_chip(environment: str) -> str | None:
-    """Map a PlatformIO environment name to its base ESP chip type."""
+    """Map a board environment name to its base ESP chip type."""
     env_lower = environment.lower()
     for chip_type, env in CHIP_TO_ENVIRONMENT.items():
         if env.lower() == env_lower:

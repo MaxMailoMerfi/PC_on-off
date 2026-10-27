@@ -17,7 +17,7 @@ class COctoWS2811Controller : public CPixelLEDController<RGB_ORDER, 8, 0xFF> {
   OctoWS2811  *pocto;
   u8 *drawbuffer,*framebuffer;
 
-  void _init(int nLeds) FL_NOEXCEPT {
+  void _init(int nLeds) FL_NO_EXCEPT {
     if(pocto == nullptr) {
       drawbuffer = (u8*)fl::malloc(nLeds * 8 * 3);
       framebuffer = (u8*)fl::malloc(nLeds * 8 * 3);
@@ -33,7 +33,7 @@ class COctoWS2811Controller : public CPixelLEDController<RGB_ORDER, 8, 0xFF> {
   }
 public:
   COctoWS2811Controller() { pocto = nullptr; }
-  virtual int size() { return CLEDController::size() * 8; }
+  int size() const FL_NO_EXCEPT override { return CLEDController::size() * 8; }
 
   virtual void init() { /* do nothing yet */ }
 
@@ -42,7 +42,7 @@ public:
     u32 raw[2];
   } Lines;
 
-  virtual void showPixels(PixelController<RGB_ORDER, 8, 0xFF> & pixels) FL_NOEXCEPT {
+  virtual void showPixels(PixelController<RGB_ORDER, 8, 0xFF> & pixels) FL_NO_EXCEPT {
     _init(pixels.size());
 
     u8 *pData = drawbuffer;

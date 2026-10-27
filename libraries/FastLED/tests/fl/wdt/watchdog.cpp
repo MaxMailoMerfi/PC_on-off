@@ -10,6 +10,8 @@
 #define FASTLED_STUB_WATCHDOG_NO_ABORT 1
 
 #include "fl/wdt/watchdog.h"
+#include "fl/wdt/boot_guard.h"
+#include "platforms/stub/watchdog_stub.h"
 #include "fl/stl/atomic.h"
 #include "fl/stl/chrono.h"
 #include "fl/stl/thread.h"
@@ -162,9 +164,24 @@ FL_TEST_CASE("fl::Watchdog — feeding before timeout prevents fire") {
     fired.store(false);
     dog.onTimeout([](void*) { fired.store(true); }, nullptr);
 
+    static fl::atomic<fl::u64> now_ms;
+    now_ms.store(1000);
+    struct ClockGuard {
+        ClockGuard() {
+            fl::platforms::setStubWatchdogClockForTesting(+[]() {
+                return fl::chrono::steady_clock::time_point(
+                    fl::chrono::milliseconds(now_ms.load()));
+            });
+        }
+        ~ClockGuard() { fl::platforms::clearStubWatchdogClockForTesting(); }
+    } clock_guard;
+
     dog.begin(200);
     for (int i = 0; i < 10; ++i) {
-        fl::this_thread::sleep_for(fl::chrono::milliseconds(50));  // ok sleep for
+        now_ms.store(now_ms.load() + 50);
+        // Give the worker a chance to observe each deterministic clock step.
+        // Wall-clock overshoot is harmless because it cannot advance now_ms.
+        fl::this_thread::sleep_for(fl::chrono::milliseconds(15));  // ok sleep for
         dog.feed();
     }
     dog.disable();
@@ -190,6 +207,105 @@ FL_TEST_CASE("fl::Watchdog — isInSafeMode trips at threshold") {
 
     dog.markCleanShutdown();
     FL_CHECK_FALSE(dog.isInSafeMode());
+}
+
+// =============================================================================
+// Boot-loop bootloader escape (issue #3713 / #3714)
+//
+// A board that wedges before USB bring-up is invisible to the host, so no
+// host-side tool can recover it. The escape lets the device break its own
+// boot loop by rebooting into the bootloader, where it is flashable again.
+// =============================================================================
+
+FL_TEST_CASE("fl::Watchdog - bootloader escape is opt-in and defaults to off") {
+    Watchdog& dog = Watchdog::instance();
+    FL_CHECK_EQ(dog.bootloaderEscapeThreshold(), 0);
+    FL_CHECK_FALSE(dog.shouldEscapeToBootloader());
+}
+
+FL_TEST_CASE("fl::Watchdog - setBootloaderEscapeThreshold round-trips") {
+    Watchdog& dog = Watchdog::instance();
+    dog.setBootloaderEscapeThreshold(3);
+    FL_CHECK_EQ(dog.bootloaderEscapeThreshold(), 3);
+    dog.setBootloaderEscapeThreshold(0);   // restore the default
+    FL_CHECK_EQ(dog.bootloaderEscapeThreshold(), 0);
+}
+
+FL_TEST_CASE("fl::Watchdog - a threshold of zero never escapes, however many crashes") {
+    Watchdog& dog = Watchdog::instance();
+    dog.markCleanShutdown();
+    dog.setBootloaderEscapeThreshold(0);
+
+    for (int i = 0; i < 2; ++i) {
+        dog.onTimeout([](void*) {}, nullptr);
+        dog.begin(30);
+        fl::this_thread::sleep_for(fl::chrono::milliseconds(200));  // ok sleep for
+    }
+    dog.disable();
+
+    FL_CHECK(dog.consecutiveCrashCount() >= 2);
+    // Disabled is disabled -- this is what keeps the escape opt-in.
+    FL_CHECK_FALSE(dog.shouldEscapeToBootloader());
+    FL_CHECK_FALSE(dog.escapeToBootloaderIfLooping());
+
+    dog.markCleanShutdown();
+}
+
+FL_TEST_CASE("fl::Watchdog - escape trips once consecutive crashes reach the threshold") {
+    Watchdog& dog = Watchdog::instance();
+    dog.markCleanShutdown();
+    dog.setBootloaderEscapeThreshold(2);
+
+    FL_CHECK_FALSE(dog.shouldEscapeToBootloader());   // no crashes yet
+
+    for (int i = 0; i < 2; ++i) {
+        dog.onTimeout([](void*) {}, nullptr);
+        dog.begin(30);
+        fl::this_thread::sleep_for(fl::chrono::milliseconds(200));  // ok sleep for
+    }
+    dog.disable();
+
+    FL_CHECK(dog.consecutiveCrashCount() >= 2);
+    FL_CHECK(dog.shouldEscapeToBootloader());
+
+    // A clean boot breaks the loop, so the next boot must not escape.
+    dog.markCleanShutdown();
+    FL_CHECK_FALSE(dog.shouldEscapeToBootloader());
+
+    dog.setBootloaderEscapeThreshold(0);
+}
+
+FL_TEST_CASE("fl::Watchdog - escape preserves the crash count when unsupported") {
+    // The stub has no bootloader reboot, so the escape reports failure. It
+    // must not zero the counter on the way out: discarding the evidence would
+    // hide the very boot loop we are trying to detect.
+    Watchdog& dog = Watchdog::instance();
+    dog.markCleanShutdown();
+    dog.setBootloaderEscapeThreshold(1);
+
+    dog.onTimeout([](void*) {}, nullptr);
+    dog.begin(30);
+    fl::this_thread::sleep_for(fl::chrono::milliseconds(200));  // ok sleep for
+    dog.disable();
+
+    const fl::u16 before = dog.consecutiveCrashCount();
+    FL_CHECK(before >= 1);
+    FL_CHECK(dog.shouldEscapeToBootloader());
+
+    FL_CHECK_FALSE(dog.escapeToBootloaderIfLooping());   // stub: unsupported
+    FL_CHECK_EQ(dog.consecutiveCrashCount(), before);
+
+    dog.setBootloaderEscapeThreshold(0);
+    dog.markCleanShutdown();
+}
+
+FL_TEST_CASE("fl::Watchdog - escape and safe mode are independent knobs") {
+    Watchdog& dog = Watchdog::instance();
+    dog.setSafeModeThreshold(2);
+    dog.setBootloaderEscapeThreshold(7);
+    FL_CHECK_EQ(dog.safeModeThreshold(), 2);
+    FL_CHECK_EQ(dog.bootloaderEscapeThreshold(), 7);
+    dog.setBootloaderEscapeThreshold(0);
 }
 
 // =============================================================================
@@ -318,4 +434,127 @@ FL_TEST_CASE("fl::ScopedWatchdog — nesting detection counter") {
         FL_CHECK_EQ(ScopedWatchdog::activeScopeCount(), baseline + 1);
     }
     FL_CHECK_EQ(ScopedWatchdog::activeScopeCount(), baseline);
+}
+
+// ---------------------------------------------------------------------------
+// Early-boot loop guard (fl/wdt/boot_guard.h)
+// ---------------------------------------------------------------------------
+
+FL_TEST_CASE("fl::bootGuardOnBoot — counts up, escapes at the threshold, then restarts") {
+    fl::u32 stored = 0;
+    BootGuardDecision d = bootGuardOnBoot(stored, 3);
+    FL_CHECK_FALSE(d.escape);
+    FL_CHECK_EQ(d.boots, 1u);
+    d = bootGuardOnBoot(d.boots, 3);
+    FL_CHECK_FALSE(d.escape);
+    FL_CHECK_EQ(d.boots, 2u);
+    d = bootGuardOnBoot(d.boots, 3);
+    FL_CHECK(d.escape);
+    FL_CHECK_EQ(d.boots, 0u);  // flashed firmware gets a fresh budget
+    d = bootGuardOnBoot(d.boots, 3);
+    FL_CHECK_FALSE(d.escape);
+    FL_CHECK_EQ(d.boots, 1u);
+}
+
+FL_TEST_CASE("fl::bootGuardOnBoot — threshold 0 never escapes") {
+    BootGuardDecision d = bootGuardOnBoot(1000, 0);
+    FL_CHECK_FALSE(d.escape);
+    FL_CHECK_EQ(d.boots, 1001u);
+}
+
+FL_TEST_CASE("fl::BootGuardRecord — round-trips and rejects garbage") {
+    const fl::u32 image = 0x1234u;
+    BootGuardRecord r{};
+    FL_CHECK_EQ(bootGuardDecode(r, image), 0u);  // all-zero RAM is not a record
+    bootGuardEncode(r, image, 2);
+    FL_CHECK_EQ(bootGuardDecode(r, image), 2u);
+    r.boots = 7;  // corrupted count without a matching check word
+    FL_CHECK_EQ(bootGuardDecode(r, image), 0u);
+    r.magic = 0xDEADBEEFu;
+    r.check = 0;
+    FL_CHECK_EQ(bootGuardDecode(r, image), 0u);
+}
+
+// Defect 1: a reflash is a warm reset, so the record survives it.
+FL_TEST_CASE("fl::BootGuardRecord — a record of another image reads as 0") {
+    BootGuardRecord r{};
+    bootGuardStore(r, 0xAAAAu, 2, 5);
+    FL_CHECK_EQ(bootGuardDecode(r, 0xAAAAu), 2u);
+    FL_CHECK_EQ(bootGuardDecode(r, 0xBBBBu), 0u);
+    FL_CHECK_EQ(bootGuardDecodeCrashes(r, 0xBBBBu), 0u);
+}
+
+// Defect 4: the crash count shares the reset-persistent record.
+FL_TEST_CASE("fl::BootGuardRecord — boot and crash counts are independent") {
+    BootGuardRecord r{};
+    bootGuardEncodeCrashes(r, 1, 3);
+    bootGuardEncode(r, 1, 2);
+    FL_CHECK_EQ(bootGuardDecodeCrashes(r, 1), 3u);  // writing boots keeps crashes
+    FL_CHECK_EQ(bootGuardDecode(r, 1), 2u);
+    bootGuardEncodeCrashes(r, 1, 0);
+    FL_CHECK_EQ(bootGuardDecode(r, 1), 2u);         // and vice versa
+    bootGuardEncodeCrashes(r, 2, 1);                // new image: boots restart
+    FL_CHECK_EQ(bootGuardDecode(r, 2), 0u);
+    FL_CHECK_EQ(bootGuardDecodeCrashes(r, 2), 1u);
+}
+
+FL_TEST_CASE("fl::Watchdog — markBootHealthy zeroes the boot-guard count") {
+    Watchdog& dog = Watchdog::instance();
+    fl::platforms::watchdogBootGuardWrite(2);  // as if two boots never got healthy
+    FL_CHECK_EQ(dog.bootGuardCount(), 2u);
+    dog.markBootHealthy();
+    FL_CHECK_EQ(dog.bootGuardCount(), 0u);
+}
+
+// Defect 5: every platform's write stores, including over a count of 0
+// (the Teensy 4 write used to drop it).
+FL_TEST_CASE("fl::Watchdog — boot-guard write stores even when the count is 0") {
+    Watchdog& dog = Watchdog::instance();
+    dog.markBootHealthy();
+    FL_REQUIRE_EQ(dog.bootGuardCount(), 0u);
+    fl::platforms::watchdogBootGuardWrite(4);
+    FL_CHECK_EQ(dog.bootGuardCount(), 4u);
+    dog.markBootHealthy();
+}
+
+// Defect 1, end to end: reflashing after two failed boots must not inherit
+// them and escape on the new firmware's first boot.
+FL_TEST_CASE("fl::Watchdog — boot guard: a reflash starts the count from 0") {
+    using namespace fl::platforms;
+    Watchdog& dog = Watchdog::instance();
+    setStubBootGuardImageForTesting(0x0101u);
+    dog.markBootHealthy();
+    FL_CHECK_FALSE(stubBootGuardEarlyBootForTesting(3, 60000));
+    FL_CHECK_FALSE(stubBootGuardEarlyBootForTesting(3, 60000));
+    FL_CHECK_EQ(dog.bootGuardCount(), 2u);
+    setStubBootGuardImageForTesting(0x0202u);  // reflash
+    FL_CHECK_EQ(dog.bootGuardCount(), 0u);
+    FL_CHECK_FALSE(stubBootGuardEarlyBootForTesting(3, 60000));
+    FL_CHECK_EQ(dog.bootGuardCount(), 1u);
+    FL_CHECK_FALSE(stubBootGuardEarlyBootForTesting(3, 60000));
+    FL_CHECK(stubBootGuardEarlyBootForTesting(3, 60000));  // third bad boot
+    dog.disable();
+    dog.markBootHealthy();
+    setStubBootGuardImageForTesting(0);
+}
+
+// Defect 6: the early timer must not outlive a healthy boot when the sketch
+// never took the watchdog over.
+FL_TEST_CASE("fl::Watchdog — markBootHealthy disables an unclaimed early timer") {
+    using namespace fl::platforms;
+    Watchdog& dog = Watchdog::instance();
+    FL_CHECK_FALSE(stubBootGuardEarlyBootForTesting(0, 60000));
+    FL_REQUIRE(stubWatchdogEnabledForTesting());
+    dog.markBootHealthy();
+    FL_CHECK_FALSE(stubWatchdogEnabledForTesting());
+}
+
+FL_TEST_CASE("fl::Watchdog — markBootHealthy keeps a watchdog the sketch armed") {
+    using namespace fl::platforms;
+    Watchdog& dog = Watchdog::instance();
+    FL_CHECK_FALSE(stubBootGuardEarlyBootForTesting(0, 60000));
+    dog.begin(60000);  // sketch takes it over
+    dog.markBootHealthy();
+    FL_CHECK(stubWatchdogEnabledForTesting());
+    dog.disable();
 }

@@ -27,6 +27,8 @@
     #include "platforms/arm/stm32/pin_stm32.hpp"
 #elif defined(FL_IS_SAMD)
     #include "platforms/arm/samd/pin_samd.hpp"
+#elif defined(FL_IS_SAME53)
+    #include "platforms/arm/same53/pin_same53.hpp"
 #elif defined(FL_IS_SAM)
     #include "platforms/arm/sam/pin_sam.hpp"
 #elif defined(FL_IS_RP)
@@ -41,6 +43,8 @@
     #include "platforms/arm/silabs/pin_silabs.hpp"
 #elif defined(FL_IS_APOLLO3)
     #include "platforms/apollo3/pin_apollo3.hpp"
+#elif defined(FL_IS_CI13XX)
+    #include "platforms/ci13xx/pin_ci13xx.hpp"
 #elif defined(FL_IS_STUB)
     // Stub platform for testing — tracks pin state via fl::stub::setPinState
     #include "platforms/stub/pin_stub.hpp"

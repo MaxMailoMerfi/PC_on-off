@@ -6,6 +6,7 @@ import re
 import sys
 import threading
 import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, cast
@@ -14,17 +15,33 @@ from running_process import RunningProcess
 
 from ci.meson.build_optimizer import BuildOptimizer
 from ci.meson.compile import (
+    _LLD_PERM_DENIED_MAX_RETRIES,
+    _ZCCACHE_TRANSIENT_MAX_RETRIES,
+    _CompileDeadlineExceeded,
     _create_error_context_filter,
     _is_compilation_error,
+    _monitored_compile_lines,
+    _retry_ninja,
+    _run_precompile_passes,
 )
 from ci.meson.compiler import get_meson_executable
 from ci.meson.link_retry import (
     is_link_permission_denied_error,
     kill_stale_runner_processes,
 )
-from ci.meson.mtime_stabilizer import stabilize_dll_mtimes
+from ci.meson.mtime_stabilizer import (
+    restore_executable_bits,
+    stabilize_dll_mtimes,
+)
+from ci.meson.native_input_guard import save_native_inputs
 from ci.meson.output import print_error, print_success
 from ci.meson.phase_tracker import PhaseTracker
+from ci.meson.zccache_retry import (
+    find_zccache_transient_failures,
+    format_zccache_transient_message,
+    is_zccache_transient_failure,
+)
+from ci.util.cpu_count import cpu_count
 from ci.util.global_interrupt_handler import handle_keyboard_interrupt
 from ci.util.tee import StreamTee
 from ci.util.timestamp_print import ts_print as _ts_print
@@ -33,6 +50,10 @@ from ci.util.timestamp_print import ts_print as _ts_print
 # Maximum number of retries when ld.lld fails with 'permission denied' on
 # runner.exe / example_runner.exe (Windows-only transient failure; see #2268).
 _LLD_PERM_DENIED_MAX_RETRIES = 3
+
+# DLL mtime optimization should take milliseconds. Bound the wait so a hung
+# filesystem operation cannot stall the entire build indefinitely.
+_DLL_TOUCH_MAX_WAIT_SECONDS = 30.0
 
 
 @dataclass
@@ -45,6 +66,72 @@ class StreamingResult:
     compile_output: str = ""
     failed_names: list[str] = field(default_factory=list)
     compile_sub_phases: dict[str, float] = field(default_factory=dict)
+    # Subset of the totals above contributed by example targets. Only
+    # artifacts Ninja relinked this run are executed, so a population whose
+    # binaries were already up to date silently contributes zero -- callers
+    # need the split to say so out loud rather than shrinking one total
+    # (#3779).
+    num_passed_examples: int = 0
+    num_failed_examples: int = 0
+
+
+# Ninja line announcing a test/example executable link, e.g.
+# ``[35/1084] Linking CXX executable tests/fl/test_foo``.
+_LINK_PATTERN = re.compile(r"^\[\d+/\d+\]\s+Linking (?:CXX executable|target)\s+(.+)$")
+
+
+def link_line_test_path(line: str, build_dir: Path) -> Optional[Path]:
+    """Return the runnable test/example path a Ninja link line announces.
+
+    ``None`` when the line is not a link line, or links something the test
+    runner must not execute (the runner binaries themselves, profile
+    harnesses, anything outside ``tests/`` and ``examples/``). Shared by the
+    streamed parser and the retry path (#4132) so a test that only links
+    during a successful retry is still collected and run.
+    """
+    match = _LINK_PATTERN.match(line.strip())
+    if not match:
+        return None
+    rel_path = match.group(1)
+    if not (
+        "tests/" in rel_path
+        or "tests\\" in rel_path
+        or "examples/" in rel_path
+        or "examples\\" in rel_path
+    ):
+        return None
+    test_path = build_dir / rel_path
+    if test_path.stem in ("runner", "test_runner", "example_runner"):
+        return None
+    if "tests/profile/" in rel_path or "tests\\profile\\" in rel_path:
+        return None
+    return test_path
+
+
+def collect_test_paths(output: str, build_dir: Path) -> list[Path]:
+    """Collect every test/example path linked in a block of Ninja output."""
+    paths: list[Path] = []
+    for line in output.splitlines():
+        test_path = link_line_test_path(line, build_dir)
+        if test_path is not None:
+            paths.append(test_path)
+    return paths
+
+
+def is_example_artifact(test_path: Path) -> bool:
+    """True when a built artifact is an example rather than a unit test.
+
+    The build lays unit-test binaries under ``<build>/tests/`` and example
+    binaries under ``<build>/examples/``; that directory is the only surviving
+    marker of which population an artifact belongs to.
+
+    Phrased as "not a unit test" so this stays the single discriminator: the
+    streaming runner calls it to choose between ``runner`` and
+    ``example_runner``, and counting an artifact as a unit test while handing
+    it to ``example_runner`` would let the two disagree -- exactly the kind of
+    silent miscount #3779 is about.
+    """
+    return test_path.parent.name != "tests"
 
 
 @dataclass
@@ -65,6 +152,17 @@ class CompileOnlyResult:
     compile_sub_phases: dict[str, float] = field(default_factory=dict)
 
 
+def _wait_for_dll_touch(done: threading.Event, timeout: float) -> bool:
+    """Wait for DLL mtime optimization while keeping Ctrl+C responsive."""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return done.is_set()
+        if done.wait(timeout=min(0.2, remaining)):
+            return True
+
+
 def stream_compile_only(
     build_dir: Path,
     target: Optional[str] = None,
@@ -72,13 +170,13 @@ def stream_compile_only(
     compile_timeout: int = 600,
     build_optimizer: Optional[BuildOptimizer] = None,
     build_timer=None,
-    on_test_compiled: Optional[Callable[[Path], None]] = None,
 ) -> CompileOnlyResult:
     """
     Stream compilation only - collect all compiled test paths without running them.
 
-    Monitors Ninja output to detect when test executables finish linking,
-    collecting them for later execution.
+    Monitors Ninja output to collect test artifacts for later execution.
+    Ninja's ``Linking target`` line is a pre-link announcement, so callers
+    must not execute collected artifacts until this function returns success.
 
     Args:
         build_dir: Meson build directory
@@ -88,12 +186,15 @@ def stream_compile_only(
         build_optimizer: Optional BuildOptimizer for DLL relink suppression.
         build_timer: Optional BuildTimer for recording compile_done checkpoint.
     """
+    native_inputs = _run_precompile_passes(build_dir)
     cmd = [get_meson_executable(), "compile", "-C", str(build_dir)]
 
     # Determine build mode from build directory name
     build_mode = "unknown"
     if "meson-quick" in str(build_dir):
         build_mode = "quick"
+    elif "meson-debug-thin" in str(build_dir):
+        build_mode = "debug-thin"
     elif "meson-debug" in str(build_dir):
         build_mode = "debug"
     elif "meson-release" in str(build_dir):
@@ -131,9 +232,7 @@ def stream_compile_only(
         _ts_print(f"[MESON] 🧹 Killed {_killed} stale runner process(es) before link")
 
     # Pattern to detect test executable linking
-    link_pattern = re.compile(
-        r"^\[\d+/\d+\]\s+Linking (?:CXX executable|target)\s+(.+)$"
-    )
+    link_pattern = _LINK_PATTERN
 
     # Pattern to detect static library archiving
     archive_pattern = re.compile(r"^\[\d+/\d+\]\s+Linking static target\s+(.+)$")
@@ -175,6 +274,7 @@ def stream_compile_only(
 
         # Create tee for error log capture
         stderr_tee = StreamTee(error_log_path, echo=False)
+        tee_closed = False
         last_error_lines: list[str] = []
 
         # Track progress for periodic updates during long silent compilations
@@ -194,7 +294,16 @@ def stream_compile_only(
             )
 
             # Stream output line by line
-            with proc.line_iter(timeout=None) as it:
+            compile_started = time.monotonic()
+            with closing(
+                _monitored_compile_lines(
+                    proc,
+                    command=cmd,
+                    target=target,
+                    started=compile_started,
+                    deadline_seconds=float(compile_timeout),
+                )
+            ) as it:
                 for line in it:
                     # Write to error log
                     stderr_tee.write_line(line)
@@ -349,47 +458,21 @@ def stream_compile_only(
                         _ts_print(f"[BUILD] Compiling... [{last_step}/{total_steps}]")
                         last_progress_time = time.time()
 
-                    # Collect compiled test paths
-                    match = (
-                        link_match if link_match else link_pattern.match(line.strip())
-                    )
-                    if match:
-                        rel_path = match.group(1)
-                        test_path = build_dir / rel_path
-
-                        # Only collect if it's a test executable
-                        if (
-                            "tests/" in rel_path
-                            or "tests\\" in rel_path
-                            or "examples/" in rel_path
-                            or "examples\\" in rel_path
-                        ):
-                            test_name = test_path.stem
-                            if test_name in ("runner", "test_runner", "example_runner"):
-                                continue
-                            if (
-                                "tests/profile/" in rel_path
-                                or "tests\\profile\\" in rel_path
-                            ):
-                                continue
-                            # DLLs/.so/.dylib are handled by runner in test_callback
-
-                            if verbose:
-                                _ts_print(f"[MESON] Test built: {test_path.name}")
-                            compiled_tests.append(test_path)
-                            if on_test_compiled is not None:
-                                # Wait for DLL touch thread to finish before
-                                # submitting tests — os.utime() on Windows
-                                # conflicts with LoadLibrary (error 126).
-                                dll_touch_done.wait()
-                                on_test_compiled(test_path)
+                    # Collect compiled test paths. DLLs/.so/.dylib are
+                    # handled by runner in test_callback.
+                    test_path = link_line_test_path(line, build_dir)
+                    if test_path is not None:
+                        if verbose:
+                            _ts_print(f"[MESON] Test built: {test_path.name}")
+                        compiled_tests.append(test_path)
 
             # Check compilation result
-            returncode = cast(int, proc.wait())
+            returncode = cast(int, proc.wait(timeout=1))
 
             # Write standardized footer to error log
             stderr_tee.write_footer(returncode)
             stderr_tee.close()
+            tee_closed = True
 
             # Save last error snippet if compilation failed
             if returncode != 0 and last_error_lines:
@@ -405,6 +488,12 @@ def stream_compile_only(
                     f.write("\n".join(last_error_lines))
 
             compilation_output = str(proc.stdout)
+            # Output of the most recent ninja attempt alone. Retry
+            # classification must look at this, not the accumulated log:
+            # an ld.lld failure that a retry already recovered from must
+            # not mask a zccache exit 113 on that retry (#4132).
+            latest_output = compilation_output
+            retried = False
 
             # Windows ld.lld 'permission denied' retry (#2268).
             # If the link failed because runner.exe / example_runner.exe was
@@ -412,58 +501,82 @@ def stream_compile_only(
             # ninja invocation a few times with a short backoff. No-op on
             # non-Windows platforms because ``is_link_permission_denied_error``
             # returns False off-Windows.
-            if returncode != 0 and is_link_permission_denied_error(compilation_output):
-                for _attempt in range(_LLD_PERM_DENIED_MAX_RETRIES):
-                    _ts_print(
-                        f"[MESON] ⚠️  ld.lld permission denied on runner binary "
-                        f"(attempt {_attempt + 1}/{_LLD_PERM_DENIED_MAX_RETRIES}) - "
-                        f"killing stale runner processes and retrying",
-                        file=sys.stderr,
+            if returncode != 0 and is_link_permission_denied_error(latest_output):
+
+                def _describe_lld(_latest: str, attempt: int) -> str:
+                    return (
+                        f"ld.lld permission denied on runner binary "
+                        f"(attempt {attempt}/{_LLD_PERM_DENIED_MAX_RETRIES}) - "
+                        f"killing stale runner processes and retrying"
                     )
+
+                def _before_lld_retry() -> None:
                     _killed_retry = kill_stale_runner_processes(build_dir)
                     if _killed_retry:
                         _ts_print(
                             f"[MESON] 🧹 Killed {_killed_retry} stale runner process(es)",
                             file=sys.stderr,
                         )
-                    # Backoff 0.5s, 1.0s, 1.5s — gives Windows / antivirus
-                    # time to release any remaining handles on the .exe.
-                    time.sleep(0.5 * (_attempt + 1))
 
-                    try:
-                        retry_proc = RunningProcess(
-                            cmd,
-                            timeout=compile_timeout,
-                            auto_run=True,
-                            check=False,
-                            env=os.environ.copy(),
-                        )
-                        retry_proc.wait(echo=False)
-                        returncode = cast(int, retry_proc.returncode)
-                        retry_output = str(retry_proc.stdout)
-                        compilation_output = compilation_output + "\n" + retry_output
-                    except KeyboardInterrupt as ki:
-                        handle_keyboard_interrupt(ki)
-                        raise
-                    except Exception as retry_error:
-                        _ts_print(
-                            f"[MESON] ⚠️  Retry invocation failed: {retry_error}",
-                            file=sys.stderr,
-                        )
-                        break
+                _outcome = _retry_ninja(
+                    cmd,
+                    compilation_output,
+                    max_retries=_LLD_PERM_DENIED_MAX_RETRIES,
+                    backoff_seconds=0.5,
+                    still_transient=is_link_permission_denied_error,
+                    describe=_describe_lld,
+                    before_retry=_before_lld_retry,
+                    label="Link",
+                    started=compile_started,
+                    deadline_seconds=float(compile_timeout),
+                    env=os.environ.copy(),
+                    output_formatter=None,
+                )
+                returncode = _outcome.returncode
+                compilation_output = _outcome.output
+                latest_output = _outcome.latest
+                retried = True
 
-                    if returncode == 0:
-                        _ts_print(
-                            f"[MESON] ✅ Link retry succeeded on attempt {_attempt + 1}",
-                            file=sys.stderr,
-                        )
-                        break
+            # zccache exit-113 retry (#4132). This is the path CI takes; see
+            # compile.py for the same block on the non-streaming path.
+            if returncode != 0 and is_zccache_transient_failure(latest_output):
 
-                    # Only keep retrying while the failure is still the same
-                    # permission-denied pattern. Non-retryable failures fall
-                    # through to the normal error path below.
-                    if not is_link_permission_denied_error(retry_output):
-                        break
+                def _describe_zccache(latest: str, attempt: int) -> str:
+                    return (
+                        format_zccache_transient_message(
+                            find_zccache_transient_failures(latest)
+                        )
+                        + f"\n  Retrying the build "
+                        f"(attempt {attempt}/{_ZCCACHE_TRANSIENT_MAX_RETRIES})"
+                    )
+
+                _outcome = _retry_ninja(
+                    cmd,
+                    compilation_output,
+                    max_retries=_ZCCACHE_TRANSIENT_MAX_RETRIES,
+                    backoff_seconds=2.0,
+                    still_transient=is_zccache_transient_failure,
+                    describe=_describe_zccache,
+                    before_retry=None,
+                    label="zccache",
+                    started=compile_started,
+                    deadline_seconds=float(compile_timeout),
+                    env=os.environ.copy(),
+                    output_formatter=None,
+                )
+                returncode = _outcome.returncode
+                compilation_output = _outcome.output
+                latest_output = _outcome.latest
+                retried = True
+
+            # A retry that succeeded ran without the streaming parser above,
+            # so any test it linked has not been collected yet.
+            if retried and returncode == 0:
+                for test_path in collect_test_paths(latest_output, build_dir):
+                    if test_path not in compiled_tests:
+                        if verbose:
+                            _ts_print(f"[MESON] Test built: {test_path.name}")
+                        compiled_tests.append(test_path)
 
             if returncode != 0:
                 phase_tracker.set_phase("LINK", target=target, path="streaming")
@@ -507,6 +620,17 @@ def stream_compile_only(
                 if verbose:
                     _ts_print(f"[MESON] Compilation completed successfully")
 
+        except _CompileDeadlineExceeded as exc:
+            compilation_failed = True
+            compilation_output = str(exc)
+            if not tee_closed:
+                stderr_tee.write_line(compilation_output)
+                stderr_tee.write_footer(-1)
+                stderr_tee.close()
+            else:
+                with error_log_path.open("a", encoding="utf-8") as error_log:
+                    error_log.write(compilation_output + "\n")
+            _ts_print(f"[MESON] {compilation_output}", file=sys.stderr)
         except KeyboardInterrupt as ki:
             handle_keyboard_interrupt(ki)
             raise
@@ -524,6 +648,21 @@ def stream_compile_only(
     while producer.is_alive():
         producer.join(timeout=0.2)
 
+    # The build optimizer may still be touching DLL mtimes after Ninja exits.
+    # Wait before stabilization and before returning artifacts to the caller;
+    # loading a DLL concurrently with os.utime() fails intermittently on
+    # Windows and can race the macOS dynamic loader.
+    # Poll so Ctrl+C remains responsive, but fail instead of hanging forever
+    # if the optimizer thread stalls in a filesystem operation.
+    touch_timeout = min(float(compile_timeout), _DLL_TOUCH_MAX_WAIT_SECONDS)
+    if not _wait_for_dll_touch(dll_touch_done, touch_timeout):
+        timeout_message = (
+            f"[MESON] DLL mtime optimization timed out after {touch_timeout:.1f}s"
+        )
+        print_error(timeout_message)
+        compilation_output = f"{compilation_output}\n{timeout_message}".strip()
+        compilation_failed = True
+
     # Record compilation completion checkpoint and end time for sub-phases
     compile_sub_phases["compile_done"] = time.time()
     if build_timer is not None:
@@ -535,6 +674,10 @@ def stream_compile_only(
     # Touch stale outputs to break the loop (~5ms, saves ~1-2s per build).
     if not compilation_failed:
         stabilize_dll_mtimes(build_dir, verbose=verbose)
+        # Same cache-restore defect, different attribute: cached link results
+        # come back without the executable bit (FastLED#4205).
+        restore_executable_bits(build_dir, verbose=verbose)
+        save_native_inputs(native_inputs)
 
     return CompileOnlyResult(
         success=not compilation_failed,
@@ -556,11 +699,10 @@ def stream_compile_and_run_tests(
     max_failures: int = 10,
 ) -> StreamingResult:
     """
-    Stream test compilation and execution with overlap.
+    Compile test artifacts, then execute them concurrently.
 
-    Tests start executing as soon as they finish linking, while remaining
-    tests continue compiling. This reduces total wall-clock time compared
-    to a sequential compile-then-run approach.
+    Ninja emits link status before a library is safe to load. Compilation must
+    finish successfully before any test process starts (FastLED #3642).
 
     Args:
         build_dir: Meson build directory
@@ -575,15 +717,13 @@ def stream_compile_and_run_tests(
         max_failures: Maximum number of test failures before halting (default: 10, 0 = unlimited).
     """
     # Pass test file filter to the callback via an attribute so it can
-    # inject it into the subprocess environment (os.environ is stale after
+    # inject it into the child-process environment (os.environ is stale after
     # _streaming_env was copied).
     if test_file_filter:
         setattr(test_callback, "_test_file_filter", test_file_filter)
 
-    # Prepare concurrent test execution infrastructure.
-    # Tests are submitted to the executor as they finish linking (during
-    # compilation), overlapping test execution with ongoing compilation.
-    max_workers = min(os.cpu_count() or 4, 16)
+    # Respect --no-parallel/NO_PARALLEL while retaining the existing cap.
+    max_workers = min(cpu_count(), 16)
     halt_event = threading.Event()
     _kill_all = getattr(test_callback, "kill_all", None)
 
@@ -607,38 +747,13 @@ def stream_compile_and_run_tests(
         except Exception as e:
             return _WorkerResult(test_path, TestResult(success=False), str(e))
 
-    # Do NOT use `with` for the executor — its __exit__ calls
-    # shutdown(wait=True) which blocks until every running worker
-    # finishes, making Ctrl+C unresponsive for up to 600s per test.
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    futures: list[concurrent.futures.Future[_WorkerResult]] = []
-    futures_lock = threading.Lock()
-
     # Prepare filter for test_file_filter
     filter_needle = (
         test_file_filter.replace(".hpp", "").lower() if test_file_filter else None
     )
 
-    def _on_test_compiled(test_path: Path) -> None:
-        """Submit a newly compiled test for execution immediately.
-
-        Called from the Ninja producer thread as each test finishes linking,
-        allowing test execution to overlap with ongoing compilation.
-        """
-        if halt_event.is_set():
-            return
-        if filter_needle and filter_needle not in test_path.name.lower():
-            return
-        try:
-            future = executor.submit(_run_one_test, test_path)
-        except RuntimeError:
-            # Executor was shut down (e.g. compilation failed concurrently)
-            return
-        with futures_lock:
-            futures.append(future)
-
-    # Compile and run tests with overlap — tests start executing as soon
-    # as they finish linking while remaining tests continue compiling.
+    # Compile every artifact before launching a dynamic-library runner. Ninja's
+    # link progress line is emitted before ld64/lld finishes writing the file.
     cr = stream_compile_only(
         build_dir=build_dir,
         target=target,
@@ -646,27 +761,56 @@ def stream_compile_and_run_tests(
         compile_timeout=compile_timeout,
         build_optimizer=build_optimizer,
         build_timer=build_timer,
-        on_test_compiled=_on_test_compiled,
     )
 
     if not cr.success:
-        # Compilation failed — cancel pending tests and shutdown
-        halt_event.set()
-        if _kill_all:
-            _kill_all()
-        with futures_lock:
-            for f in futures:
-                f.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
         return StreamingResult(
             success=False,
             compile_output=cr.compile_output,
             compile_sub_phases=cr.compile_sub_phases,
         )
 
-    # Take snapshot of futures (no more will be added after compile returns)
-    with futures_lock:
-        all_futures = list(futures)
+    # Do NOT use `with` for the executor — its __exit__ calls
+    # shutdown(wait=True) which blocks until every running worker
+    # finishes, making Ctrl+C unresponsive for up to 600s per test.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    futures: list[concurrent.futures.Future[_WorkerResult]] = []
+
+    def _submit_test(test_path: Path) -> None:
+        """Submit a test only after the complete build succeeds."""
+        if halt_event.is_set():
+            return
+        if filter_needle and filter_needle not in test_path.name.lower():
+            return
+        try:
+            future = executor.submit(_run_one_test, test_path)
+        except RuntimeError:
+            # Executor was shut down during interruption/failure cleanup.
+            return
+        futures.append(future)
+
+    try:
+        for test_path in cr.compiled_tests:
+            _submit_test(test_path)
+    except KeyboardInterrupt as ki:
+        halt_event.set()
+        if _kill_all:
+            _kill_all()
+        for f in futures:
+            f.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        handle_keyboard_interrupt(ki)
+        raise
+    except Exception:
+        halt_event.set()
+        if _kill_all:
+            _kill_all()
+        for f in futures:
+            f.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+
+    all_futures = list(futures)
 
     if not all_futures:
         # No tests found during compilation (build was fully cached).
@@ -685,21 +829,25 @@ def stream_compile_and_run_tests(
 
     num_passed = 0
     num_failed = 0
+    num_passed_examples = 0
+    num_failed_examples = 0
     failed_names: list[str] = []
     tests_completed = 0
 
     try:
         # Wait sequentially so output order matches submission order
         # (tests still execute in parallel across worker threads).
-        # Many tests will have already completed during compilation.
         for future in all_futures:
             if halt_event.is_set():
                 break
             wr = future.result()
             tests_completed += 1
             idx = tests_completed
+            is_example = is_example_artifact(wr.test_path)
             if wr.test_result.success:
                 num_passed += 1
+                if is_example:
+                    num_passed_examples += 1
                 if not verbose:
                     print_success(f"  [{idx}/{total}] ✓ {wr.test_path.stem}")
                 else:
@@ -709,6 +857,8 @@ def stream_compile_and_run_tests(
                             _ts_print(f"  {line}")
             else:
                 num_failed += 1
+                if is_example:
+                    num_failed_examples += 1
                 failed_names.append(wr.test_path.stem)
                 if wr.error_msg:
                     _ts_print(
@@ -771,4 +921,6 @@ def stream_compile_and_run_tests(
         compile_output=cr.compile_output,
         failed_names=failed_names,
         compile_sub_phases=cr.compile_sub_phases,
+        num_passed_examples=num_passed_examples,
+        num_failed_examples=num_failed_examples,
     )

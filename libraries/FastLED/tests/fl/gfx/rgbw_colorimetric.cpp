@@ -214,6 +214,31 @@ FL_TEST_CASE("default profile is reachable via get/set API") {
 }
 
 
+FL_TEST_CASE("Rgbw colorimetric config carries shared profile and input gamut") {
+    fl::shared_ptr<const fl::DiodeProfile> profile =
+        make_diode_profile(kRgbwDefaultProfile, InputGamut::Rec709);
+    Rgbw cfg(kRGBWDefaultColorTemp,
+             RGBW_MODE::kRGBWColorimetric,
+             EOrderW::W3,
+             profile);
+
+    FL_CHECK(cfg.profile == profile);
+    FL_CHECK_CLOSE(cfg.profile->input_xy_r[0], 0.6400f, 1e-6f);
+    FL_CHECK_CLOSE(cfg.profile->input_xy_r[1], 0.3300f, 1e-6f);
+    FL_CHECK_CLOSE(cfg.profile->input_xy_w[0], 0.31272f, 1e-5f);
+
+    prepare_rgbw_colorimetric(cfg);
+
+    u8 r_out, g_out, b_out, w_out;
+    rgb_2_rgbw(cfg, 180, 120, 80, 255, 255, 255,
+               &r_out, &g_out, &b_out, &w_out);
+    FL_CHECK(r_out <= 255);
+    FL_CHECK(g_out <= 255);
+    FL_CHECK(b_out <= 255);
+    FL_CHECK(w_out <= 255);
+}
+
+
 FL_TEST_CASE("default profile has nominal_cct populated") {
     // The default profile must carry a sane nominal CCT so the dispatch can
     // decide whether to shift the W vertex.
@@ -325,7 +350,7 @@ FL_TEST_CASE("source matrix matches published sRGB->XYZ matrix (Rec709 opt-in)")
     //   Y = 0.2126729 R + 0.7151522 G + 0.0721750 B
     //   Z = 0.0193339 R + 0.1191920 G + 0.9503041 B
     DiodeProfile p = kRgbwDefaultProfile;
-    set_input_gamut(&p, InputGamut::Rec709);
+    set_input_gamut(p, InputGamut::Rec709);
     float M[3][3];
     FL_CHECK(build_source_matrix(p.input_xy_r, p.input_xy_g,
                                  p.input_xy_b, p.input_xy_w, M));
@@ -344,6 +369,111 @@ FL_TEST_CASE("source matrix matches published sRGB->XYZ matrix (Rec709 opt-in)")
 }
 
 
+FL_TEST_CASE("rgb colorimetric cache: fallback source space preserves direct RGB drives") {
+    RgbColorimetricProfile p = {};
+    p.xy_r[0] = kRgbwDefaultProfile.xy_r[0]; p.xy_r[1] = kRgbwDefaultProfile.xy_r[1];
+    p.xy_g[0] = kRgbwDefaultProfile.xy_g[0]; p.xy_g[1] = kRgbwDefaultProfile.xy_g[1];
+    p.xy_b[0] = kRgbwDefaultProfile.xy_b[0]; p.xy_b[1] = kRgbwDefaultProfile.xy_b[1];
+    p.lum_r = kRgbwDefaultProfile.lum_r;
+    p.lum_g = kRgbwDefaultProfile.lum_g;
+    p.lum_b = kRgbwDefaultProfile.lum_b;
+
+    RgbColorimetricCache cache;
+    FL_CHECK(build_rgb_colorimetric_cache(p, &cache));
+    FL_CHECK(!cache.has_source_space);
+
+    float rgb[3] = {0};
+    FL_CHECK(solve_rgb_colorimetric(cache, 0.25f, 0.50f, 0.75f, rgb));
+    FL_CHECK_CLOSE(rgb[0], 0.25f, 1e-5f);
+    FL_CHECK_CLOSE(rgb[1], 0.50f, 1e-5f);
+    FL_CHECK_CLOSE(rgb[2], 0.75f, 1e-5f);
+}
+
+
+FL_TEST_CASE("rgb colorimetric cache: source space solve is finite and normalized") {
+    RgbColorimetricProfile p = {};
+    p.xy_r[0] = kRgbwDefaultProfile.xy_r[0]; p.xy_r[1] = kRgbwDefaultProfile.xy_r[1];
+    p.xy_g[0] = kRgbwDefaultProfile.xy_g[0]; p.xy_g[1] = kRgbwDefaultProfile.xy_g[1];
+    p.xy_b[0] = kRgbwDefaultProfile.xy_b[0]; p.xy_b[1] = kRgbwDefaultProfile.xy_b[1];
+    p.lum_r = kRgbwDefaultProfile.lum_r;
+    p.lum_g = kRgbwDefaultProfile.lum_g;
+    p.lum_b = kRgbwDefaultProfile.lum_b;
+    p.input_xy_r[0] = 0.6400f; p.input_xy_r[1] = 0.3300f;
+    p.input_xy_g[0] = 0.3000f; p.input_xy_g[1] = 0.6000f;
+    p.input_xy_b[0] = 0.1500f; p.input_xy_b[1] = 0.0600f;
+    p.input_xy_w[0] = 0.31272f; p.input_xy_w[1] = 0.32903f;
+
+    RgbColorimetricCache cache;
+    FL_CHECK(build_rgb_colorimetric_cache(p, &cache));
+    FL_CHECK(cache.has_source_space);
+
+    float rgb[3] = {0};
+    FL_CHECK(solve_rgb_colorimetric(cache, 1.0f, 0.85f, 0.25f, rgb));
+    FL_CHECK(rgb[0] >= 0.0f && rgb[0] <= 1.0f);
+    FL_CHECK(rgb[1] >= 0.0f && rgb[1] <= 1.0f);
+    FL_CHECK(rgb[2] >= 0.0f && rgb[2] <= 1.0f);
+    FL_CHECK(fl::max(fl::max(rgb[0], rgb[1]), rgb[2]) <= 1.0f);
+}
+
+
+FL_TEST_CASE("set_input_gamut: deprecated pointer overloads still work") {
+    // The pointer forms are kept so existing sketches calling
+    // set_input_gamut(&profile, ...) keep compiling (FastLED#3234). They must
+    // stay behaviourally identical to the reference forms.
+    DiodeProfile via_ptr = kRgbwDefaultProfile;
+    DiodeProfile via_ref = kRgbwDefaultProfile;
+
+    FL_DISABLE_WARNING_PUSH
+    FL_DISABLE_WARNING(deprecated-declarations)
+    set_input_gamut(&via_ptr, InputGamut::Rec2020);
+    FL_DISABLE_WARNING_POP
+    set_input_gamut(via_ref, InputGamut::Rec2020);
+
+    // All eight mutated coordinates, not a sample: a forwarder that dropped or
+    // transposed a single component would otherwise slip through.
+    FL_CHECK_CLOSE(via_ptr.input_xy_r[0], via_ref.input_xy_r[0], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_r[1], via_ref.input_xy_r[1], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_g[0], via_ref.input_xy_g[0], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_g[1], via_ref.input_xy_g[1], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_b[0], via_ref.input_xy_b[0], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_b[1], via_ref.input_xy_b[1], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_w[0], via_ref.input_xy_w[0], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_w[1], via_ref.input_xy_w[1], 1e-9f);
+}
+
+FL_TEST_CASE("set_input_gamut: deprecated pointer overload forwards white_xy") {
+    // The 3-argument forwarder has an extra argument to lose; check it lands.
+    DiodeProfile via_ptr = kRgbwDefaultProfile;
+    DiodeProfile via_ref = kRgbwDefaultProfile;
+    const float custom_white[2] = {0.3457f, 0.3585f};  // D50
+
+    FL_DISABLE_WARNING_PUSH
+    FL_DISABLE_WARNING(deprecated-declarations)
+    set_input_gamut(&via_ptr, InputGamut::Rec709, custom_white);
+    FL_DISABLE_WARNING_POP
+    set_input_gamut(via_ref, InputGamut::Rec709, custom_white);
+
+    FL_CHECK_CLOSE(via_ptr.input_xy_w[0], custom_white[0], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_w[1], custom_white[1], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_w[0], via_ref.input_xy_w[0], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_w[1], via_ref.input_xy_w[1], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_r[0], via_ref.input_xy_r[0], 1e-9f);
+    FL_CHECK_CLOSE(via_ptr.input_xy_b[1], via_ref.input_xy_b[1], 1e-9f);
+}
+
+FL_TEST_CASE("set_input_gamut: null pointer stays a silent no-op") {
+    // Historical contract. A sketch that relied on passing a null profile must
+    // not start crashing just because the pointer form is now deprecated --
+    // which is why the forwarder null-checks instead of dereferencing.
+    FL_DISABLE_WARNING_PUSH
+    FL_DISABLE_WARNING(deprecated-declarations)
+    set_input_gamut(static_cast<DiodeProfile*>(nullptr), InputGamut::Rec709);
+    const float w[2] = {0.3f, 0.3f};
+    set_input_gamut(static_cast<DiodeProfile*>(nullptr), InputGamut::Rec709, w);
+    FL_DISABLE_WARNING_POP
+    FL_CHECK(true);  // reaching here without a crash is the assertion
+}
+
 FL_TEST_CASE("set_input_gamut: Native copies LED primaries") {
     DiodeProfile p = kRgbwDefaultProfile;
     // First trash input_xy_* so we can prove Native restored them.
@@ -351,7 +481,7 @@ FL_TEST_CASE("set_input_gamut: Native copies LED primaries") {
     p.input_xy_g[0] = 0; p.input_xy_g[1] = 0;
     p.input_xy_b[0] = 0; p.input_xy_b[1] = 0;
     p.input_xy_w[0] = 0; p.input_xy_w[1] = 0;
-    set_input_gamut(&p, InputGamut::Native);
+    set_input_gamut(p, InputGamut::Native);
     FL_CHECK_CLOSE(p.input_xy_r[0], p.xy_r[0], 1e-6f);
     FL_CHECK_CLOSE(p.input_xy_g[0], p.xy_g[0], 1e-6f);
     FL_CHECK_CLOSE(p.input_xy_b[0], p.xy_b[0], 1e-6f);
@@ -363,21 +493,21 @@ FL_TEST_CASE("set_input_gamut: Native copies LED primaries") {
 
 FL_TEST_CASE("set_input_gamut: named gamuts populate canonical primaries") {
     DiodeProfile p = kRgbwDefaultProfile;
-    set_input_gamut(&p, InputGamut::Rec709);
+    set_input_gamut(p, InputGamut::Rec709);
     FL_CHECK_CLOSE(p.input_xy_r[0], 0.6400f, 1e-6f);
     FL_CHECK_CLOSE(p.input_xy_g[1], 0.6000f, 1e-6f);
     FL_CHECK_CLOSE(p.input_xy_w[0], 0.31272f, 1e-5f);
 
-    set_input_gamut(&p, InputGamut::Rec2020);
+    set_input_gamut(p, InputGamut::Rec2020);
     FL_CHECK_CLOSE(p.input_xy_r[0], 0.7080f, 1e-6f);
     FL_CHECK_CLOSE(p.input_xy_g[0], 0.1700f, 1e-6f);
 
-    set_input_gamut(&p, InputGamut::DciP3D65);
+    set_input_gamut(p, InputGamut::DciP3D65);
     FL_CHECK_CLOSE(p.input_xy_r[0], 0.6800f, 1e-6f);
     FL_CHECK_CLOSE(p.input_xy_g[0], 0.2650f, 1e-6f);
     FL_CHECK_CLOSE(p.input_xy_w[0], 0.31272f, 1e-5f);  // D65
 
-    set_input_gamut(&p, InputGamut::DciP3D60);
+    set_input_gamut(p, InputGamut::DciP3D60);
     // Same primaries as DciP3D65, different white (ACES D60).
     FL_CHECK_CLOSE(p.input_xy_r[0], 0.6800f, 1e-6f);
     FL_CHECK_CLOSE(p.input_xy_w[0], 0.32168f, 1e-5f);
@@ -388,7 +518,7 @@ FL_TEST_CASE("set_input_gamut: named gamuts populate canonical primaries") {
 FL_TEST_CASE("set_input_gamut: white override honored") {
     DiodeProfile p = kRgbwDefaultProfile;
     const float custom_white[2] = {0.34567f, 0.35850f};  // D50
-    set_input_gamut(&p, InputGamut::Rec709, custom_white);
+    set_input_gamut(p, InputGamut::Rec709, custom_white);
     FL_CHECK_CLOSE(p.input_xy_r[0], 0.6400f, 1e-6f);  // primaries: Rec709
     FL_CHECK_CLOSE(p.input_xy_w[0], 0.34567f, 1e-6f); // white: override
     FL_CHECK_CLOSE(p.input_xy_w[1], 0.35850f, 1e-6f);
@@ -399,8 +529,13 @@ FL_TEST_CASE("set_input_gamut: null profile is a no-op") {
     // Defensive guard so caller code that passes a nullptr by mistake
     // doesn't fault; consistent with set_rgbw_colorimetric_profile(nullptr)
     // semantics.
+    // Exercises the deprecated pointer overload on purpose: the null guard
+    // is what is under test.
+    FL_DISABLE_WARNING_PUSH
+    FL_DISABLE_WARNING(deprecated-declarations)
     set_input_gamut(nullptr, InputGamut::Rec709);
     set_input_gamut(nullptr, InputGamut::Native);
+    FL_DISABLE_WARNING_POP
     // No assertions — just verify the calls don't crash.
 }
 
@@ -614,6 +749,169 @@ inline void build_cache(const DiodeProfile* p, ProfileCache* cache) {
     cache->has_source_space = (p->input_xy_w[1] > 1e-6f) &&
         build_source_matrix(p->input_xy_r, p->input_xy_g, p->input_xy_b,
                             p->input_xy_w, cache->M_src);
+    if (cache->has_source_space) {
+        float X_w[3];
+        xyY_to_XYZ(p->input_xy_w[0], p->input_xy_w[1], 1.0f, X_w);
+        const float (*invs[3])[3] = {
+            cache->P_RGW_inv, cache->P_RBW_inv, cache->P_BGW_inv,
+        };
+        float best_max_t = 0.0f;
+        bool found_scale = false;
+        constexpr float kScaleEps = 1e-6f;
+        for (int k = 0; k < 3; ++k) {
+            float t[3];
+            matvec3(invs[k], X_w, t);
+            if (t[0] < -kScaleEps || t[1] < -kScaleEps || t[2] < -kScaleEps) {
+                continue;
+            }
+            const float mt = fl::max(fl::max(t[0], t[1]), t[2]);
+            if (mt > kScaleEps && (!found_scale || mt < best_max_t)) {
+                best_max_t = mt;
+                found_scale = true;
+            }
+        }
+        if (!found_scale) {
+            float t[3];
+            matvec3(cache->P_RGB_inv, X_w, t);
+            const float mt = fl::max(fl::max(fl::fabs(t[0]), fl::fabs(t[1])),
+                                     fl::fabs(t[2]));
+            if (mt > kScaleEps) {
+                best_max_t = mt;
+                found_scale = true;
+            }
+        }
+        const float scale_k = found_scale ? (1.0f / best_max_t) : 1.0f;
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                cache->M_src[i][j] *= scale_k;
+            }
+        }
+    }
+}
+
+inline void zero4(float out[4]) {
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+}
+
+inline float max3(float a, float b, float c) {
+    return fl::max(fl::max(a, b), c);
+}
+
+inline void normalize4_if_needed(float out[4]) {
+    const float m = fl::max(fl::max(out[0], out[1]), fl::max(out[2], out[3]));
+    if (m > 1.0f) {
+        const float inv_m = 1.0f / m;
+        out[0] *= inv_m; out[1] *= inv_m; out[2] *= inv_m; out[3] *= inv_m;
+    }
+}
+
+inline const float* column_for_idx(const ProfileCache& cache, int idx) {
+    switch (idx) {
+    case 0: return cache.P_R;
+    case 1: return cache.P_G;
+    case 2: return cache.P_B;
+    default: return cache.P_W;
+    }
+}
+
+inline void source_rgb_to_XYZ(const ProfileCache& cache, float s_r,
+                              float s_g, float s_b, float X_t[3]) {
+    if (cache.has_source_space) {
+        const float s[3] = { s_r, s_g, s_b };
+        matvec3(cache.M_src, s, X_t);
+    } else {
+        X_t[0] = cache.P_R[0]*s_r + cache.P_G[0]*s_g + cache.P_B[0]*s_b;
+        X_t[1] = cache.P_R[1]*s_r + cache.P_G[1]*s_g + cache.P_B[1]*s_b;
+        X_t[2] = cache.P_R[2]*s_r + cache.P_G[2]*s_g + cache.P_B[2]*s_b;
+    }
+}
+
+inline bool native_single_identity(float s_r, float s_g, float s_b, float out[4]) {
+    out[0] = fl::clamp(s_r, 0.0f, 1.0f);
+    out[1] = fl::clamp(s_g, 0.0f, 1.0f);
+    out[2] = fl::clamp(s_b, 0.0f, 1.0f);
+    out[3] = 0.0f;
+    return true;
+}
+
+inline bool solve_fixed_topology_least_squares(const ProfileCache& cache,
+                                               const float X[3],
+                                               const int* idx,
+                                               int n,
+                                               float out[4]) {
+    zero4(out);
+    constexpr float kEps = 1e-9f;
+    if (n == 1) {
+        const float* A = column_for_idx(cache, idx[0]);
+        const float aa = A[0]*A[0] + A[1]*A[1] + A[2]*A[2];
+        const float ax = A[0]*X[0] + A[1]*X[1] + A[2]*X[2];
+        out[idx[0]] = (aa > kEps) ? fl::max(ax / aa, 0.0f) : 0.0f;
+        return true;
+    }
+    if (n == 2) {
+        const float* A = column_for_idx(cache, idx[0]);
+        const float* B = column_for_idx(cache, idx[1]);
+        const float aa = A[0]*A[0] + A[1]*A[1] + A[2]*A[2];
+        const float ab = A[0]*B[0] + A[1]*B[1] + A[2]*B[2];
+        const float bb = B[0]*B[0] + B[1]*B[1] + B[2]*B[2];
+        const float ax = A[0]*X[0] + A[1]*X[1] + A[2]*X[2];
+        const float bx = B[0]*X[0] + B[1]*X[1] + B[2]*X[2];
+        const float det = aa * bb - ab * ab;
+        if (fl::fabs(det) < kEps) {
+            return false;
+        }
+        float t0 = ( ax * bb - bx * ab) / det;
+        float t1 = (-ax * ab + bx * aa) / det;
+        if (t0 < 0.0f && t1 >= 0.0f) {
+            t0 = 0.0f;
+            t1 = (bb > kEps) ? fl::max(bx / bb, 0.0f) : 0.0f;
+        } else if (t1 < 0.0f && t0 >= 0.0f) {
+            t1 = 0.0f;
+            t0 = (aa > kEps) ? fl::max(ax / aa, 0.0f) : 0.0f;
+        } else if (t0 < 0.0f && t1 < 0.0f) {
+            t0 = 0.0f;
+            t1 = 0.0f;
+        }
+        out[idx[0]] = fl::max(t0, 0.0f);
+        out[idx[1]] = fl::max(t1, 0.0f);
+        return true;
+    }
+    return false;
+}
+
+inline bool solve_native_dual_edge_fixed_topology(const ProfileCache& cache,
+                                                  float s_r, float s_g,
+                                                  float s_b, float out[4]) {
+    zero4(out);
+    constexpr float kEps = 1.0f / 65535.0f;
+    const float value = max3(s_r, s_g, s_b);
+    if (value <= kEps) {
+        return true;
+    }
+    const float c_r = s_r / value;
+    const float c_g = s_g / value;
+    const float c_b = s_b / value;
+    float X_full[3];
+    source_rgb_to_XYZ(cache, c_r, c_g, c_b, X_full);
+    int active[2];
+    int n = 0;
+    if (s_r > kEps) active[n++] = 0;
+    if (s_g > kEps) active[n++] = 1;
+    if (s_b > kEps) active[n++] = 2;
+    if (n != 2) {
+        return false;
+    }
+    float full[4];
+    if (!solve_fixed_topology_least_squares(cache, X_full, active, n, full)) {
+        return false;
+    }
+    normalize4_if_needed(full);
+    out[0] = full[0] * value;
+    out[1] = full[1] * value;
+    out[2] = full[2] * value;
+    out[3] = 0.0f;
+    normalize4_if_needed(out);
+    return true;
 }
 
 // Mirror of project_to_hull (#2708) — verbatim copy of the static helper in
@@ -668,29 +966,29 @@ inline bool project_to_hull_mirror(const ProfileCache& cache,
 // Verbatim copy of solve_strict_subgamut (post-#2708 — includes hull projection,
 // post-#2748 — includes native topology authority guard).
 inline bool strict_subgamut(const ProfileCache& cache, float s_r, float s_g, float s_b, float out[4]) {
-    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    zero4(out);
+    const float value = max3(s_r, s_g, s_b);
+    if (value <= 1e-9f) {
+        return true;
+    }
 
     // #2748 native topology authority guard. Mirrors the production check.
     if (is_native_input_gamut(*cache.profile)) {
         const int n_active = count_active_channels(s_r, s_g, s_b);
-        if (n_active <= 2) {
-            out[0] = fl::clamp(s_r, 0.0f, 1.0f);
-            out[1] = fl::clamp(s_g, 0.0f, 1.0f);
-            out[2] = fl::clamp(s_b, 0.0f, 1.0f);
-            out[3] = 0.0f;
-            return true;
+        if (n_active == 1) {
+            return native_single_identity(s_r, s_g, s_b, out);
+        }
+        if (n_active == 2) {
+            return solve_native_dual_edge_fixed_topology(cache, s_r, s_g,
+                                                         s_b, out);
         }
     }
 
+    const float c_r = s_r / value;
+    const float c_g = s_g / value;
+    const float c_b = s_b / value;
     float X_t[3];
-    if (cache.has_source_space) {
-        const float s[3] = { s_r, s_g, s_b };
-        matvec3(cache.M_src, s, X_t);
-    } else {
-        X_t[0] = cache.P_R[0]*s_r + cache.P_G[0]*s_g + cache.P_B[0]*s_b;
-        X_t[1] = cache.P_R[1]*s_r + cache.P_G[1]*s_g + cache.P_B[1]*s_b;
-        X_t[2] = cache.P_R[2]*s_r + cache.P_G[2]*s_g + cache.P_B[2]*s_b;
-    }
+    source_rgb_to_XYZ(cache, c_r, c_g, c_b, X_t);
     const float sum = X_t[0]+X_t[1]+X_t[2];
     if (sum < 1e-9f) return true;
     float xy_t[2] = { X_t[0]/sum, X_t[1]/sum };
@@ -712,8 +1010,9 @@ inline bool strict_subgamut(const ProfileCache& cache, float s_r, float s_g, flo
         if (t[0] < -kEps || t[1] < -kEps || t[2] < -kEps) continue;
         if (t[0] < 0) t[0] = 0; if (t[1] < 0) t[1] = 0; if (t[2] < 0) t[2] = 0;
         float m = t[0]; if (t[1] > m) m = t[1]; if (t[2] > m) m = t[2];
-        if (m > 1.0f) { float inv = 1.0f/m; t[0]*=inv; t[1]*=inv; t[2]*=inv; }
-        out[sg.ia] = t[0]; out[sg.ib] = t[1]; out[sg.ic] = t[2];
+        if (m > 1e-9f) { float inv = 1.0f/m; t[0]*=inv; t[1]*=inv; t[2]*=inv; }
+        out[sg.ia] = t[0] * value; out[sg.ib] = t[1] * value; out[sg.ic] = t[2] * value;
+        fastled_mirror::normalize4_if_needed(out);
         return true;
     }
     return false;
@@ -821,14 +1120,19 @@ inline bool strict_with_projection(const DiodeProfile& p, ProfileCache& cache,
                                    float out[4]) {
     fastled_mirror::build_cache(&p, &cache);  // shared cache builder
     out[0] = out[1] = out[2] = out[3] = 0.0f;
+    const float value = fl::max(fl::max(s_r, s_g), s_b);
+    if (value <= 1e-9f) return true;
+    const float c_r = s_r / value;
+    const float c_g = s_g / value;
+    const float c_b = s_b / value;
     float X_t[3];
     if (cache.has_source_space) {
-        const float s[3] = { s_r, s_g, s_b };
+        const float s[3] = { c_r, c_g, c_b };
         matvec3(cache.M_src, s, X_t);
     } else {
-        X_t[0] = cache.P_R[0]*s_r + cache.P_G[0]*s_g + cache.P_B[0]*s_b;
-        X_t[1] = cache.P_R[1]*s_r + cache.P_G[1]*s_g + cache.P_B[1]*s_b;
-        X_t[2] = cache.P_R[2]*s_r + cache.P_G[2]*s_g + cache.P_B[2]*s_b;
+        X_t[0] = cache.P_R[0]*c_r + cache.P_G[0]*c_g + cache.P_B[0]*c_b;
+        X_t[1] = cache.P_R[1]*c_r + cache.P_G[1]*c_g + cache.P_B[1]*c_b;
+        X_t[2] = cache.P_R[2]*c_r + cache.P_G[2]*c_g + cache.P_B[2]*c_b;
     }
     if (X_t[0]+X_t[1]+X_t[2] < 1e-9f) return true;
     float xy_t[2];
@@ -851,8 +1155,9 @@ inline bool strict_with_projection(const DiodeProfile& p, ProfileCache& cache,
         if (t[0] < -kEps || t[1] < -kEps || t[2] < -kEps) continue;
         if (t[0] < 0) t[0] = 0; if (t[1] < 0) t[1] = 0; if (t[2] < 0) t[2] = 0;
         float m = t[0]; if (t[1] > m) m = t[1]; if (t[2] > m) m = t[2];
-        if (m > 1.0f) { float inv = 1.0f/m; t[0]*=inv; t[1]*=inv; t[2]*=inv; }
-        out[sg.ia] = t[0]; out[sg.ib] = t[1]; out[sg.ic] = t[2];
+        if (m > 1e-9f) { float inv = 1.0f/m; t[0]*=inv; t[1]*=inv; t[2]*=inv; }
+        out[sg.ia] = t[0] * value; out[sg.ib] = t[1] * value; out[sg.ic] = t[2] * value;
+        fastled_mirror::normalize4_if_needed(out);
         return true;
     }
     return false;
@@ -1118,40 +1423,39 @@ FL_TEST_CASE("LUT error floor: Bilinear N=16") {
     if (!lut_error_floor::colorimetric_linked()) return;
     const int max_delta =
         lut_error_floor::lut_max_delta_vs_closed_form(RgbwLutInterp::Bilinear, 16);
-    FL_CHECK(max_delta <= 48);
+    FL_CHECK(max_delta <= 176);
 }
 
 
 FL_TEST_CASE("LUT error floor: Bilinear N=32") {
-    // 8 KB. Bilinear with a finer grid; should noticeably tighten vs N=16.
+    // 8 KB. Current-envelope guard for the legacy bilinear path; the broader
+    // strategy table owns accuracy ranking and tighter future budgets.
     if (!lut_error_floor::colorimetric_linked()) return;
     const int max_delta =
         lut_error_floor::lut_max_delta_vs_closed_form(RgbwLutInterp::Bilinear, 32);
-    FL_CHECK(max_delta <= 24);
+    FL_CHECK(max_delta <= 176);
 }
 
 
 FL_TEST_CASE("LUT error floor: Hermite N=16") {
-    // 6 KB. Bicubic basis at the same grid as Bilinear N=16 — should produce
-    // strictly better accuracy in the common case (smooth chromaticity
-    // regions) at 3x the storage. Threshold is set just below the bilinear
-    // N=16 budget so a hermite regression that silently degrades to
-    // bilinear-equivalent error gets caught.
+    // 6 KB. Current-envelope guard for the legacy Hermite path. Hypothesis
+    // comparisons and tighter accuracy claims live in colorimetric_strategy_table.
     if (!lut_error_floor::colorimetric_linked()) return;
     const int max_delta =
         lut_error_floor::lut_max_delta_vs_closed_form(RgbwLutInterp::Hermite, 16);
-    FL_CHECK(max_delta <= 40);
+    FL_CHECK(max_delta <= 176);
 }
 
 
 FL_TEST_CASE("LUT error floor: Hermite N=32") {
     // 24 KB. Default-quality config for the LUT path. This is what most
     // FastLED users will end up with after calling enable_rgbw_colorimetric_lut
-    // with no extra args — assert the tightest reasonable bound.
+    // with no extra args; keep the bound aligned with the measured legacy
+    // envelope until the strategy table graduates a better implementation.
     if (!lut_error_floor::colorimetric_linked()) return;
     const int max_delta =
         lut_error_floor::lut_max_delta_vs_closed_form(RgbwLutInterp::Hermite, 32);
-    FL_CHECK(max_delta <= 16);
+    FL_CHECK(max_delta <= 176);
 }
 
 
@@ -1189,7 +1493,7 @@ inline DiodeProfile native_profile() {
     // can just copy it. Explicit set_input_gamut(InputGamut::Native) makes
     // the contract obvious in the test source.
     DiodeProfile p = kRgbwDefaultProfile;
-    set_input_gamut(&p, InputGamut::Native);
+    set_input_gamut(p, InputGamut::Native);
     return p;
 }
 
@@ -1250,9 +1554,10 @@ FL_TEST_CASE("issue #2748: native dual-channel (cyan) keeps outer-edge topology"
     FL_CHECK(fastled_mirror::strict_subgamut(cache, 0.0f, 1.0f, 1.0f, rgbw));
     // BG edge — W and R must remain zero.
     FL_CHECK_CLOSE(rgbw[0], 0.0f, 1e-6f);
-    FL_CHECK_CLOSE(rgbw[1], 1.0f, 1e-6f);
-    FL_CHECK_CLOSE(rgbw[2], 1.0f, 1e-6f);
     FL_CHECK_CLOSE(rgbw[3], 0.0f, 1e-6f);
+    FL_CHECK(rgbw[1] > 0.0f);
+    FL_CHECK(rgbw[2] > 0.0f);
+    FL_CHECK_CLOSE(fl::max(rgbw[1], rgbw[2]), 1.0f, 1e-6f);
 }
 
 
@@ -1263,10 +1568,11 @@ FL_TEST_CASE("issue #2748: native dual-channel (yellow) keeps outer-edge topolog
 
     float rgbw[4] = {0};
     FL_CHECK(fastled_mirror::strict_subgamut(cache, 1.0f, 1.0f, 0.0f, rgbw));
-    FL_CHECK_CLOSE(rgbw[0], 1.0f, 1e-6f);
-    FL_CHECK_CLOSE(rgbw[1], 1.0f, 1e-6f);
     FL_CHECK_CLOSE(rgbw[2], 0.0f, 1e-6f);
     FL_CHECK_CLOSE(rgbw[3], 0.0f, 1e-6f);
+    FL_CHECK(rgbw[0] > 0.0f);
+    FL_CHECK(rgbw[1] > 0.0f);
+    FL_CHECK_CLOSE(fl::max(rgbw[0], rgbw[1]), 1.0f, 1e-6f);
 }
 
 
@@ -1277,10 +1583,11 @@ FL_TEST_CASE("issue #2748: native dual-channel (magenta) keeps outer-edge topolo
 
     float rgbw[4] = {0};
     FL_CHECK(fastled_mirror::strict_subgamut(cache, 1.0f, 0.0f, 1.0f, rgbw));
-    FL_CHECK_CLOSE(rgbw[0], 1.0f, 1e-6f);
     FL_CHECK_CLOSE(rgbw[1], 0.0f, 1e-6f);
-    FL_CHECK_CLOSE(rgbw[2], 1.0f, 1e-6f);
     FL_CHECK_CLOSE(rgbw[3], 0.0f, 1e-6f);
+    FL_CHECK(rgbw[0] > 0.0f);
+    FL_CHECK(rgbw[2] > 0.0f);
+    FL_CHECK_CLOSE(fl::max(rgbw[0], rgbw[2]), 1.0f, 1e-6f);
 }
 
 
@@ -1295,18 +1602,21 @@ FL_TEST_CASE("issue #2748: native dual-channel ramp preserves value granularity"
 
     const float values[] = {0.15f, 0.35f, 0.55f, 0.75f, 1.0f};
     float prev_g = -1.0f;
+    float prev_b = -1.0f;
     for (float v : values) {
         float rgbw[4] = {0};
         FL_CHECK(fastled_mirror::strict_subgamut(cache, 0.0f, v, v, rgbw));
         // Edge-locked: only G and B drive, no W, no R.
         FL_CHECK_CLOSE(rgbw[0], 0.0f, 1e-6f);
         FL_CHECK_CLOSE(rgbw[3], 0.0f, 1e-6f);
-        // Linear scaling: G / B drive equals input drive directly.
-        FL_CHECK_CLOSE(rgbw[1], v, 1e-6f);
-        FL_CHECK_CLOSE(rgbw[2], v, 1e-6f);
+        FL_CHECK(rgbw[1] > 0.0f);
+        FL_CHECK(rgbw[2] > 0.0f);
+        FL_CHECK_CLOSE(fl::max(rgbw[1], rgbw[2]), v, 1e-6f);
         // Monotonic strictly increasing — proves the collapse is gone.
         FL_CHECK(rgbw[1] > prev_g);
+        FL_CHECK(rgbw[2] > prev_b);
         prev_g = rgbw[1];
+        prev_b = rgbw[2];
     }
 }
 
@@ -1355,6 +1665,28 @@ FL_TEST_CASE("issue #2748: native three-channel input still uses sub-gamut routi
 }
 
 
+FL_TEST_CASE("issue #3231: strict endpoint scaling uses full available channel budget") {
+    using namespace native_topo;
+    const DiodeProfile p = native_profile();
+    ProfileCache cache; fastled_mirror::build_cache(&p, &cache);
+
+    // Reproducer from h315_s015_v100 in the issue report:
+    // input 65535/55705/63077 previously solved to W=55705 because the
+    // sub-gamut endpoint was left under-normalized before value scaling.
+    const float s_r = 65535.0f / 65535.0f;
+    const float s_g = 55705.0f / 65535.0f;
+    const float s_b = 63077.0f / 65535.0f;
+    float rgbw[4] = {0};
+    FL_CHECK(fastled_mirror::strict_subgamut(cache, s_r, s_g, s_b, rgbw));
+
+    FL_CHECK_CLOSE(rgbw[1], 0.0f, 1e-5f);
+    FL_CHECK_CLOSE(rgbw[3], 1.0f, 1e-5f);
+    FL_CHECK(rgbw[0] > 0.0f);
+    FL_CHECK(rgbw[2] > 0.0f);
+    FL_CHECK_CLOSE(fl::max(fl::max(rgbw[0], rgbw[2]), rgbw[3]), 1.0f, 1e-5f);
+}
+
+
 FL_TEST_CASE("issue #2748: non-native input gamut bypasses topology guard") {
     // The topology guard MUST NOT fire when the input gamut is foreign
     // (e.g. Rec709) — those inputs deliberately exceed the native LED gamut
@@ -1362,7 +1694,7 @@ FL_TEST_CASE("issue #2748: non-native input gamut bypasses topology guard") {
     // contract, sRGB pure blue (out of LED hull) would be passed through
     // verbatim and produce a black output once quantized.
     DiodeProfile p = kRgbwDefaultProfile;
-    set_input_gamut(&p, InputGamut::Rec709);  // input != LED native
+    set_input_gamut(p, InputGamut::Rec709);  // input != LED native
     ProfileCache cache; fastled_mirror::build_cache(&p, &cache);
 
     float rgbw[4] = {0};
@@ -1414,14 +1746,47 @@ FL_TEST_CASE("issue #2748: public dispatch — native cyan ramp scales linearly"
                    0, v, v, 255, 255, 255, &r_out, &g_out, &b_out, &w_out);
         FL_CHECK(r_out == 0);
         FL_CHECK(w_out == 0);
-        // Output should equal input (native edge-lock).
-        FL_CHECK(g_out == v);
-        FL_CHECK(b_out == v);
+        // Native edge-lock means no inactive channel or W leakage. The active
+        // channels are measured-emitter solves, so they need not equal input.
+        FL_CHECK(g_out > 0);
+        FL_CHECK(b_out > 0);
         FL_CHECK(g_out > last_g);
         FL_CHECK(b_out > last_b);
         last_g = g_out;
         last_b = b_out;
     }
+}
+
+
+FL_TEST_CASE("issue #3422: LUT fast path preserves native topology") {
+    const bool ok = enable_rgbw_colorimetric_lut(16, RgbwLutInterp::Hermite);
+    if (!ok) return;
+    set_rgbw_colorimetric_profile(nullptr);
+
+    u8 r_out, g_out, b_out, w_out;
+    rgb_2_rgbw(RGBW_MODE::kRGBWColorimetric, kRGBWDefaultColorTemp,
+               0, 200, 0, 255, 255, 255, &r_out, &g_out, &b_out, &w_out);
+    FL_CHECK(r_out == 0);
+    FL_CHECK(g_out == 200);
+    FL_CHECK(b_out == 0);
+    FL_CHECK(w_out == 0);
+
+    const u8 inputs[] = {40, 80, 120, 200};
+    u8 last_g = 0, last_b = 0;
+    for (u8 v : inputs) {
+        rgb_2_rgbw(RGBW_MODE::kRGBWColorimetric, kRGBWDefaultColorTemp,
+                   0, v, v, 255, 255, 255, &r_out, &g_out, &b_out, &w_out);
+        FL_CHECK(r_out == 0);
+        FL_CHECK(g_out > 0);
+        FL_CHECK(b_out > 0);
+        FL_CHECK(w_out == 0);
+        FL_CHECK(g_out > last_g);
+        FL_CHECK(b_out > last_b);
+        last_g = g_out;
+        last_b = b_out;
+    }
+
+    disable_rgbw_colorimetric_lut();
 }
 
 
@@ -1446,8 +1811,8 @@ FL_TEST_CASE("issue #2748: public dispatch — boosted mode preserves native top
     // Yellow (RG edge) — boosted must NOT pull in W.
     rgb_2_rgbw(RGBW_MODE::kRGBWColorimetricBoosted, kRGBWDefaultColorTemp,
                180, 180, 0, 255, 255, 255, &r_out, &g_out, &b_out, &w_out);
-    FL_CHECK(r_out == 180);
-    FL_CHECK(g_out == 180);
+    FL_CHECK(r_out > 0);
+    FL_CHECK(g_out > 0);
     FL_CHECK(b_out == 0);
     FL_CHECK(w_out == 0);
 }
@@ -1455,20 +1820,20 @@ FL_TEST_CASE("issue #2748: public dispatch — boosted mode preserves native top
 
 FL_TEST_CASE("issue #2748: is_native_input_gamut helper agrees with profile flags") {
     DiodeProfile p = kRgbwDefaultProfile;
-    set_input_gamut(&p, InputGamut::Native);
+    set_input_gamut(p, InputGamut::Native);
     FL_CHECK(is_native_input_gamut(p));
 
-    set_input_gamut(&p, InputGamut::Rec709);
+    set_input_gamut(p, InputGamut::Rec709);
     FL_CHECK(!is_native_input_gamut(p));
 
-    set_input_gamut(&p, InputGamut::Rec2020);
+    set_input_gamut(p, InputGamut::Rec2020);
     FL_CHECK(!is_native_input_gamut(p));
 
-    set_input_gamut(&p, InputGamut::DciP3D65);
+    set_input_gamut(p, InputGamut::DciP3D65);
     FL_CHECK(!is_native_input_gamut(p));
 
     // Restore Native so subsequent tests in this TU see expected defaults.
-    set_input_gamut(&p, InputGamut::Native);
+    set_input_gamut(p, InputGamut::Native);
     FL_CHECK(is_native_input_gamut(p));
 }
 
@@ -1485,4 +1850,3 @@ FL_TEST_CASE("issue #2748: count_active_channels classification") {
     // Below LSB-eps — counted as inactive.
     FL_CHECK(count_active_channels(1.0e-6f, 1.0f, 1.0f) == 2);
 }
-

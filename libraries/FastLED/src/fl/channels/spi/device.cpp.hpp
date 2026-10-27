@@ -19,12 +19,11 @@ namespace spi {
 // ============================================================================
 
 Device::Device(const Config& config)
-    : pImpl(fl::make_unique<Impl>(config)) {
-    FL_LOG_SPI("SPI Device: Created with clock=" << config.clock_pin
-           << " data_pins.size()=" << config.data_pins.size());
+    FL_NO_EXCEPT : pImpl(fl::make_unique<Impl>(config)) {
+    FL_LOG_SPI("SPI Device: Created with clock=" << config.clock_pin << " data_pins.size()=" << config.data_pins.size());
 }
 
-Device::~Device() FL_NOEXCEPT {
+Device::~Device() FL_NO_EXCEPT {
     FL_LOG_SPI("SPI Device: Destructor called");
     if (pImpl && pImpl->initialized) {
         FL_LOG_SPI("SPI Device: Calling end() from destructor");
@@ -42,7 +41,7 @@ Device::~Device() FL_NOEXCEPT {
     FL_LOG_SPI("SPI Device: Destructor complete");
 }
 
-fl::optional<fl::task::Error> Device::begin() {
+fl::optional<fl::task::Error> Device::begin() FL_NO_EXCEPT {
     if (!pImpl) {
         return fl::task::Error("Device not initialized");
     }
@@ -61,8 +60,7 @@ fl::optional<fl::task::Error> Device::begin() {
     // Note: SPI mode configuration is not yet supported by the hardware layer
     // All devices currently operate in mode 0 (CPOL=0, CPHA=0)
     if (pImpl->config.spi_mode != 0) {
-        FL_WARN("SPI Device: SPI mode " << pImpl->config.spi_mode
-                << " requested but hardware layer only supports mode 0 - ignoring");
+        FL_WARN("SPI Device: SPI mode " << pImpl->config.spi_mode << " requested but hardware layer only supports mode 0 - ignoring");
     }
 
     // Register with SPIBusManager
@@ -124,7 +122,7 @@ fl::optional<fl::task::Error> Device::begin() {
     return fl::nullopt;
 }
 
-void Device::end() {
+void Device::end() FL_NO_EXCEPT {
     if (!pImpl || !pImpl->initialized) {
         return;
     }
@@ -149,7 +147,7 @@ void Device::end() {
     FL_LOG_SPI("SPI Device: Shutdown complete");
 }
 
-bool Device::isReady() const {
+bool Device::isReady() const FL_NO_EXCEPT {
     return pImpl && pImpl->initialized;
 }
 
@@ -181,7 +179,7 @@ bool Device::isReady() const {
 // Transaction API (Primary Interface)
 // ============================================================================
 
-Result<Transaction> Device::writeAsync(const u8* data, size_t size) {
+Result<Transaction> Device::writeAsync(const u8* data, size_t size) FL_NO_EXCEPT {
     if (!isReady()) {
         return Result<Transaction>::failure(SPIError::NOT_INITIALIZED, "Device not initialized");
     }
@@ -256,7 +254,7 @@ Result<Transaction> Device::writeAsync(const u8* data, size_t size) {
 //         "Async full-duplex transfer not supported - LED strips are TX-only. Use writeAsync() for transmission.");
 // }
 
-DMABuffer Device::acquireBuffer(size_t size) {
+DMABuffer Device::acquireBuffer(size_t size) FL_NO_EXCEPT {
     if (!isReady()) {
         return DMABuffer(SPIError::NOT_INITIALIZED);
     }
@@ -283,7 +281,7 @@ DMABuffer Device::acquireBuffer(size_t size) {
     return buffer;
 }
 
-fl::optional<fl::task::Error> Device::transmit(DMABuffer& buffer, bool async) {
+fl::optional<fl::task::Error> Device::transmit(DMABuffer& buffer, bool async) FL_NO_EXCEPT {
     if (!isReady()) {
         return fl::task::Error("Device not initialized");
     }
@@ -318,11 +316,11 @@ fl::optional<fl::task::Error> Device::transmit(DMABuffer& buffer, bool async) {
         }
     }
 
-    FL_LOG_SPI("SPI Device: Transmission started (" << (async ? "async" : "blocking") << ")");
+    FL_LOG_SPI("SPI Device: Transmission started (" << ((async ? "async" : "blocking")) << ")");
     return fl::nullopt;
 }
 
-bool Device::waitComplete(u32 timeout_ms) {
+bool Device::waitComplete(u32 timeout_ms) FL_NO_EXCEPT {
     if (!isReady()) {
         return false;
     }
@@ -339,7 +337,7 @@ bool Device::waitComplete(u32 timeout_ms) {
     return hw->waitComplete(timeout_ms);
 }
 
-bool Device::isBusy() const {
+bool Device::isBusy() const FL_NO_EXCEPT {
     if (!isReady()) {
         return false;
     }
@@ -355,7 +353,7 @@ bool Device::isBusy() const {
     return hw->isBusy();
 }
 
-fl::optional<fl::task::Error> Device::setClockSpeed(u32 speed_hz) {
+fl::optional<fl::task::Error> Device::setClockSpeed(u32 speed_hz) FL_NO_EXCEPT {
     if (!pImpl) {
         return fl::task::Error("Device not initialized");
     }
@@ -368,8 +366,7 @@ fl::optional<fl::task::Error> Device::setClockSpeed(u32 speed_hz) {
     // To apply immediately, call end() followed by begin().
 
     if (pImpl->initialized) {
-        FL_LOG_SPI("SPI Device: Clock speed updated to " << speed_hz
-               << " Hz (will take effect on next begin())");
+        FL_LOG_SPI("SPI Device: Clock speed updated to " << speed_hz << " Hz (will take effect on next begin())");
     } else {
         FL_LOG_SPI("SPI Device: Clock speed set to " << speed_hz << " Hz");
     }
@@ -377,7 +374,7 @@ fl::optional<fl::task::Error> Device::setClockSpeed(u32 speed_hz) {
     return fl::nullopt;
 }
 
-const Config& Device::getConfig() const {
+const Config& Device::getConfig() const FL_NO_EXCEPT {
     // Note: Caller must ensure Device is valid
     return pImpl->config;
 }
@@ -386,20 +383,20 @@ const Config& Device::getConfig() const {
 // Transaction Implementation (Stub)
 // ============================================================================
 
-Transaction::Transaction() : pImpl(nullptr) {}
+Transaction::Transaction() FL_NO_EXCEPT : pImpl(nullptr) {}
 
-Transaction::Transaction(Transaction&& other) FL_NOEXCEPT
+Transaction::Transaction(Transaction&& other) FL_NO_EXCEPT
     : pImpl(fl::move(other.pImpl)) {
 }
 
-Transaction& Transaction::operator=(Transaction&& other) FL_NOEXCEPT {
+Transaction& Transaction::operator=(Transaction&& other) FL_NO_EXCEPT {
     if (this != &other) {
         pImpl = fl::move(other.pImpl);
     }
     return *this;
 }
 
-Transaction::~Transaction() FL_NOEXCEPT {
+Transaction::~Transaction() FL_NO_EXCEPT {
     if (pImpl) {
         // Auto-wait for completion if not already done
         if (!pImpl->completed) {
@@ -408,7 +405,7 @@ Transaction::~Transaction() FL_NOEXCEPT {
     }
 }
 
-bool Transaction::wait(u32 timeout_ms) {
+bool Transaction::wait(u32 timeout_ms) FL_NO_EXCEPT {
     if (!pImpl) {
         return true;  // Already completed (or invalid)
     }
@@ -435,8 +432,10 @@ bool Transaction::wait(u32 timeout_ms) {
         return false;
     }
 
-    // Wait for the hardware to complete
+#ifdef FASTLED_LOG_SPI_ENABLED
     u32 start_time = fl::millis();
+#endif
+    // Wait for the hardware to complete
     bool success = pImpl->device->waitComplete(timeout_ms);
 
     if (success) {
@@ -447,8 +446,9 @@ bool Transaction::wait(u32 timeout_ms) {
         pImpl->completed = true;
         pImpl->result = fl::nullopt;
 
-        u32 elapsed = fl::millis() - start_time;
-        FL_LOG_SPI("Transaction: Completed successfully (waited " << elapsed << "ms)");
+#ifdef FASTLED_LOG_SPI_ENABLED
+        FL_LOG_SPI("Transaction: Completed successfully (waited " << (fl::millis() - start_time) << "ms)");
+#endif
         return true;
     } else {
         // Timeout occurred
@@ -459,15 +459,15 @@ bool Transaction::wait(u32 timeout_ms) {
     }
 }
 
-bool Transaction::isDone() const {
+bool Transaction::isDone() const FL_NO_EXCEPT {
     return pImpl ? pImpl->completed : true;
 }
 
-bool Transaction::isPending() const {
+bool Transaction::isPending() const FL_NO_EXCEPT {
     return pImpl ? !pImpl->completed : false;
 }
 
-bool Transaction::cancel() {
+bool Transaction::cancel() FL_NO_EXCEPT {
     if (!pImpl || pImpl->completed) {
         return false;  // Already completed or invalid
     }
@@ -489,7 +489,7 @@ bool Transaction::cancel() {
     return true;
 }
 
-fl::optional<fl::task::Error> Transaction::getResult() const {
+fl::optional<fl::task::Error> Transaction::getResult() const FL_NO_EXCEPT {
     if (!pImpl) {
         return fl::task::Error("Invalid transaction");
     }

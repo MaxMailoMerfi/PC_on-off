@@ -10,7 +10,35 @@
 
 ### Board Build Backend: fbuild
 
-All board compiles use `fbuild`. Do not add board allowlists or PlatformIO fallback paths when a board does not compile; file board build compatibility problems at https://github.com/FastLED/fbuild/issues and fix them in fbuild.
+All board compiles use `fbuild`. Do not add board allowlists or legacy-backend fallback paths when a board does not compile; file board build compatibility problems at https://github.com/FastLED/fbuild/issues and fix them in fbuild.
+
+### Board examples run on explicit CI labels (#4543)
+
+`bash compile <board> smoke` remains available for local focused validation: it builds `tests/platforms/_standard/SMOKE_SKETCHES.txt` plus every example the PR changes (diffed against `GITHUB_BASE_REF`, or `FASTLED_SMOKE_BASE_REF` locally). Routine PR and master events skip the costly board workflows. An internal PR with `ci-full` or a matching `ci-platform:` label runs each selected board's full example set, including esp32s3, teensy41, and uno. Use `bash ci-labels list --json` to choose a label. The smoke manifest still records sketches that uniquely caught real defects; do not remove an entry without replacement evidence.
+
+### 🚨 Deployment (flash / upload) is fbuild's job — ALWAYS
+
+**FastLED code MUST NOT invoke flash tools directly.** No `pyocd`, `lpc21isp`, `esptool`, `avrdude`, `bossac`, `stm32flash`, `openocd load`, `dfu-util`, `teensy_loader_cli`, `JLinkExe`, or equivalents anywhere under `ci/`, `tests/`, `examples/`, or `src/`. The only permitted deployment entrypoint from FastLED code is `fbuild deploy`.
+
+**Why this rule exists:** on 2026-07-01 the LPC-Link2 CMSIS-DAP v1.0.7 firmware wedged pyocd's Windows HID backend for 8 minutes per attempt in `bash autoresearch lpc845`, silenced the shared VCOM, and blocked a whole afternoon of silicon validation. The wedge is a fbuild-owned platform-integration problem (timeout guards, probe preflight, UART ISP fallback, VCOM unwedge) that belongs in one place with proper hardening — not scattered across every FastLED script that wants to flash a board. See `ci/autoresearch/phases.py::_build_and_deploy_nxplpc` for the current shape (build + deploy, both delegated to fbuild). The nxplpc deployer (lpc21isp UART ISP path, sidesteps CMSIS-DAP HID entirely) shipped in FastLED/fbuild#595 (refined in #923 path resolver + #928 Windows COM prefix / `-bin` handling).
+
+**What to do if fbuild is missing a deploy backend for your target:**
+1. File a fbuild issue with the acceptance criteria you need.
+2. Have `bash autoresearch` (or the caller) fail loudly with a pointer to that issue.
+3. **Do NOT** re-add a direct pyocd/lpc21isp/etc. call as a "temporary" fallback. The fallbacks become permanent, they don't get the hardening the fbuild path gets, and the next agent hits the same wedge again.
+
+**What to do if you find a direct flash-tool call in FastLED code:** rip it out and route through `fbuild deploy`. Reference this section in the commit message.
+
+### Root `./platformio.ini` is a frozen surface (#3274)
+
+Root `./platformio.ini` is owned by `bash autoresearch` and `bash debug`. CI compile, size-check, bloat, and regression tests consume `ci/boards.py` — NOT root `platformio.ini`. The two surfaces are orthogonal and must NOT be conflated.
+
+Rules:
+
+- **No new CI code path may depend on `./platformio.ini`.** Reading, parsing, or importing it from anywhere under `ci/` (other than `ci/autoresearch/` and `ci/debug_attached.py`) is forbidden. See parent #3274.
+- **Every change to `./platformio.ini` requires justification.** Each added non-comment line must carry an adjacent `; justification: <reason>` comment plus `; added-in: PR-<NNN>` (or 40-char SHA). The `bash lint` root-ini lockdown stage and the matching CodeRabbit rule (`.coderabbit.yaml` path: `platformio.ini`) enforce this.
+- **When porting a flag from root → `ci/boards.py`, do NOT remove it from root.** Both surfaces independently need it (CI vs. local-dev). Removing from one because it's "now in the other" silently breaks the audience the file actually serves.
+- **Roadmap:** `bash autoresearch` is on a path to stop consuming this file entirely and synthesise its own `platformio.ini` from `ci/boards.py` prior to launch (see #3281). Once that lands, root `./platformio.ini` becomes append-only for `bash debug` use cases with a clear path to retirement. Any new functionality should plan for this — prefer extending `ci/boards.py` first and only touch root if `bash debug` truly needs it.
 
 ### Use These Commands
 
@@ -79,7 +107,7 @@ CXX=... meson setup builddir         # WRONG - use bash scripts
 rm -rf .build/meson-quick
 rm -rf .build/meson-debug
 rm -rf .build/meson-release
-rm -rf .build/pio
+rm -rf .build/fbuild
 rm -rf .fbuild
 
 # ❌ WRONG - Never combine cache deletion with commands
@@ -176,7 +204,8 @@ CXX=clang-tool-chain-cpp CC=clang-tool-chain-c meson setup builddir
 
 ## Unified GNU Build (Windows = Linux)
 clang-tool-chain provides a uniform GNU-style build environment across all platforms:
-- **Same link flags**: `-fuse-ld=lld`, `-pthread`, `-static`, `-rdynamic` work identically on Windows and Linux
+- **One linker everywhere: reld.** Every host-native link (tests, examples, profiles; all build modes, Linux/macOS/Windows) goes through [reld](https://github.com/zackees/reld), provisioned and SHA-256-pinned by `ci/tools/reld.py` into `.cached/reld/`. reld links ELF natively and routes ThinLTO and COFF/Mach-O links to its bridge (the clang-tool-chain lld, exported as `RELD_BRIDGE_LINKER`). `FASTLED_NATIVE_LINKER` may point at another reld build only. `bash lint` (`ci/lint/banned_linkers.py`) fails on any other linker selection in `ci/`, `.github/` or Meson files. Board links (fbuild, vendor GCC `ld`) and WebAssembly (`wasm-ld`) are out of scope.
+- **Same link flags**: `-pthread`, `-static`, `-rdynamic` work identically on Windows and Linux
 - **Same libraries**: Libraries like `libunwind` are available on Windows via DLL injection - no platform-specific code needed
 - **Meson configuration**: The root `meson.build` defines shared `runner_link_args`, `runner_cpp_args`, and `dll_link_args` used by both tests and examples
 - **Platform differences are minimal**: Only `dbghelp`/`psapi` (Windows debug libs) and macOS static linking restrictions require platform checks
@@ -243,4 +272,4 @@ clang-tool-chain provides a uniform GNU-style build environment across all platf
 **Current Architecture** (after refactoring):
 - `meson.build` (root): Source discovery + library compilation (still has duplication - needs refactoring)
 - `tests/meson.build`: Uses `organize_tests.py` for test discovery (refactored)
-- `examples/meson.build`: PlatformIO target registration (clean)
+- `examples/meson.build`: fbuild board target registration (clean)

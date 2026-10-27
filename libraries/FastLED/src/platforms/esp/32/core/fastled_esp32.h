@@ -12,6 +12,10 @@
 // ESP32 always uses hardware SPI via GPIO matrix - no conditional needed
 // IWYU pragma: begin_keep
 #include "platforms/esp/32/core/fastspi_esp32.h"
+#include "platforms/esp/32/drivers/i2s_spi/bus_traits.h"
+#include "platforms/esp/32/drivers/lcd_spi/bus_traits.h"
+#include "platforms/esp/32/drivers/parlio/bus_traits.h"
+#include "platforms/shared/bitbang/bus_traits.h"
 // IWYU pragma: end_keep
 
 
@@ -31,18 +35,12 @@
 #include "platforms/esp/32/drivers/spi/idf5_clockless_spi_esp32.h"
 #endif
 
-#ifdef FASTLED_ESP32_I2S
-#include "platforms/esp/esp_version.h"
-#if ESP_IDF_VERSION_6_OR_HIGHER
-// I2S parallel driver is not yet ported to ESP-IDF 6.0+.
-// PERIPH_I2S1_MODULE was removed; the driver needs LL API migration.
-// Falling through to RMT/SPI/blocking driver instead.
-#else
-#ifndef FASTLED_INTERNAL
-#include "platforms/esp/32/drivers/i2s/clockless_i2s_esp32.h"
-#endif
-#endif // ESP_IDF_VERSION_6_OR_HIGHER
-#endif // FASTLED_ESP32_I2S
+// The former Yves I2S parallel-out clockless driver
+// (`clockless_i2s_esp32.h` + `i2s_esp32dev.{h,cpp.hpp}`) was deleted at
+// FastLED#3526 Phase 2e. The modern I2S engine lives on
+// `Bus::FLEX_IO, 0` via the channel manager; users select it at runtime
+// via `FastLED.enableDriver<fl::Bus::FLEX_IO, 0>()` or
+// `FastLED.setExclusiveDriver<fl::Bus::FLEX_IO, 0>()`.
 
 // Bulk controller implementations have been replaced by the Channel API
 // See src/fl/channels/README.md for multi-strip support

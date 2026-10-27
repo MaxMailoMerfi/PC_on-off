@@ -602,8 +602,8 @@ Provides zero-cost network activity detection (WiFi, Ethernet, or Bluetooth) usi
 class NetworkDetector {
 public:
     // Individual network types
-    static bool isAnyNetworkActive();         // network mode != NULL
-    static bool isWiFiConnected();      // Connected to AP
+    static bool isWiFiActive();         // Wi-Fi STA/AP netif exists (esp_netif, weak-linked)
+    static bool isWiFiConnected();      // STA netif up with an IP address
     static bool isEthernetActive();     // Ethernet interface up
     static bool isEthernetConnected();  // Ethernet has IP address
     static bool isBluetoothActive();    // BT controller enabled
@@ -785,7 +785,7 @@ void loop() {
 // Higher priority levels (4+) require assembly ISR handlers (not yet implemented)
 ```
 
-#### Example 5: PlatformIO Build Flags
+#### Example 5: `platformio.ini` Build Flags
 
 ```ini
 # platformio.ini
@@ -1551,13 +1551,16 @@ All lint checks: PASS
 
 ### QEMU Test Framework
 
-```bash
-# Install QEMU for ESP32 emulation
-uv run ci/install-qemu.py
+Use fbuild's native QEMU runner — the same invocation as CI in `.github/workflows/qemu_template.yml`:
 
-# Run tests on different architectures
-uv run test.py --qemu esp32s3  # Xtensa LX7
-uv run test.py --qemu esp32c3  # RISC-V
+```bash
+# Stage + emulate on ESP32-S3 (Xtensa LX7)
+uv run ci/stage_fbuild_project.py --board esp32s3 --example BlinkParallel --define FASTLED_ESP32_IS_QEMU --build-dir .build/fbuild/esp32s3
+uv run fbuild test-emu --emulator qemu --environment esp32s3 --timeout 120 --halt-on-success "Initialized 4 LED strips with 256 LEDs each" --halt-on-error "Guru Meditation|abort\\(\\)|Backtrace:|TEST_SUITE_COMPLETE: FAIL|QEMU_LCD_CLOCKLESS_REGISTRATION: FAIL" .build/fbuild/esp32s3
+
+# Stage + emulate on ESP32-C3 (RISC-V) — same shape
+uv run ci/stage_fbuild_project.py --board esp32c3 --example BlinkParallel --define FASTLED_ESP32_IS_QEMU --build-dir .build/fbuild/esp32c3
+uv run fbuild test-emu --emulator qemu --environment esp32c3 --timeout 120 --halt-on-success "Initialized 4 LED strips with 256 LEDs each" --halt-on-error "Guru Meditation|abort\\(\\)|Backtrace:|TEST_SUITE_COMPLETE: FAIL|QEMU_LCD_CLOCKLESS_REGISTRATION: FAIL" .build/fbuild/esp32c3
 ```
 
 ### Test Scenarios

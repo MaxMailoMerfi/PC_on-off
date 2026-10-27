@@ -1,3 +1,4 @@
+#include "fl/stl/chrono.h"  // fl::micros
 #include "fl/task/executor.h"
 #include "fl/task/task.h"
 #include "fl/task/promise.h"
@@ -15,6 +16,7 @@
 #include "fl/stl/utility.h"
 #include "fl/stl/atomic.h"
 #include "fl/system/delay.h"
+#include "fl/system/yield.h"  // fl::yield — control for the timing check
 #include "platforms/stub/mutex_stub_stl.h"
 #include "platforms/stub/thread_stub_stl.h"
 #include "fl/stl/vector.h"
@@ -641,6 +643,109 @@ fl::task::Promise<T> delayed_reject(const fl::task::Error& error, uint32_t delay
     return p;
 }
 
+FL_TEST_CASE("fl::task::await - the wait is bounded") {
+    // The wait used to have no cap of any kind, so a promise nothing can
+    // resolve never returned to its caller. On a microcontroller that stops
+    // the sketch until the watchdog resets the board. FastLED#4369.
+    FL_SUBCASE("a promise that never resolves gives up inside its budget") {
+        auto promise = fl::task::Promise<int>::create();  // nothing will resolve it
+        const u32 budget_ms = 50;
+        const u32 start = fl::millis();
+        auto result = fl::task::await(promise, budget_ms);
+        const u32 elapsed = fl::millis() - start;
+
+        FL_CHECK(!result.ok());
+        FL_CHECK_EQ(result.error().message,
+                    "await timeout - promise did not complete");
+        // The point is that it returned at all. Bound the upper end loosely --
+        // the loop yields ~1 ms per turn and the scheduler decides how long
+        // that really takes -- but it must not be the old behaviour, which
+        // never came back.
+        FL_CHECK(elapsed < 5000u);
+    }
+
+    FL_SUBCASE("a pending promise resolved during the wait returns its value") {
+        // Reaches the polling loop, unlike the completed cases below, and
+        // proves the bound does not cost a legitimate wait its result.
+        auto promise = delayed_resolve<int>(99, 20);
+        auto result = fl::task::await(promise, 5000);
+
+        FL_CHECK(result.ok());
+        FL_CHECK_EQ(result.value(), 99);
+        fl::platforms::cleanup_background_threads();
+    }
+
+    FL_SUBCASE("a pending promise outliving its budget times out") {
+        // Same promise, a budget too small for it. The loop exits on the
+        // deadline rather than on completion.
+        auto promise = delayed_resolve<int>(99, 400);
+        const u32 start = fl::millis();
+        auto result = fl::task::await(promise, 20);
+        const u32 elapsed = fl::millis() - start;
+
+        // The error is the proof: had the call waited for resolution it would
+        // have returned ok() with 99, whatever the clock said.
+        FL_CHECK(!result.ok());
+        FL_CHECK_EQ(result.error().message,
+                    "await timeout - promise did not complete");
+        // Deliberately far above the 400 ms resolver delay rather than under
+        // it. A descheduled host can stretch a correctly-timed-out 20 ms wait
+        // past 400 ms, which would make a tighter bound flaky without adding
+        // anything the error assertion does not already establish -- see the
+        // measurements under load in FastLED#3772. This is a sanity ceiling,
+        // not the discriminator.
+        FL_CHECK(elapsed < 5000u);
+        fl::platforms::cleanup_background_threads();
+    }
+
+    FL_SUBCASE("an already-completed promise returns whatever the budget") {
+        // Returns before the loop, so no budget applies -- including zero.
+        auto resolved = fl::task::Promise<int>::resolve(7);
+        auto result = fl::task::await(resolved, 0);
+        FL_CHECK(result.ok());
+        FL_CHECK_EQ(result.value(), 7);
+
+        auto resolved_again = fl::task::Promise<int>::resolve(42);
+        auto result_again = fl::task::await(resolved_again, 1);
+        FL_CHECK(result_again.ok());
+        FL_CHECK_EQ(result_again.value(), 42);
+    }
+
+    FL_SUBCASE("an already-rejected promise still reports its own error") {
+        // The timeout error must not displace the promise's.
+        auto promise =
+            fl::task::Promise<int>::reject(fl::task::Error("Original error"));
+        auto result = fl::task::await(promise, 1);
+
+        FL_CHECK(!result.ok());
+        FL_CHECK_EQ(result.error().message, "Original error");
+    }
+
+    FL_SUBCASE("an invalid promise is rejected before the wait") {
+        fl::task::Promise<int> invalid_promise;
+        auto result = fl::task::await(invalid_promise, 1);
+
+        FL_CHECK(!result.ok());
+        FL_CHECK_EQ(result.error().message, "Invalid promise");
+    }
+
+    FL_SUBCASE("the budget is a bound, not a delay") {
+        // A resolvable promise must return as soon as it completes. If the
+        // deadline were waited on rather than checked, this would take the
+        // whole budget.
+        auto promise = fl::task::Promise<int>::create();
+        promise.complete_with_value(123);
+
+        const u32 start = fl::millis();
+        auto result = fl::task::await(promise, 5000);
+        const u32 elapsed = fl::millis() - start;
+
+        FL_CHECK(result.ok());
+        FL_CHECK_EQ(result.value(), 123);
+        FL_CHECK(elapsed < 1000u);
+    }
+}
+
 FL_TEST_CASE("await in coroutine - basic resolution") {
     fl::atomic<bool> test_completed(false);
     fl::atomic<int> result_value(0);
@@ -756,7 +861,7 @@ FL_TEST_CASE("await in coroutine - multiple concurrent coroutines") {
     fl::atomic<int> completed_count(0);
     fl::atomic<int> sum(0);
 
-    printf("Test: Spawning 5 coroutines\n");
+    fl::printf("Test: Spawning 5 coroutines\n");
 
     // Store task objects to keep coroutines alive
     fl::vector<task::Handle> tasks;
@@ -765,38 +870,38 @@ FL_TEST_CASE("await in coroutine - multiple concurrent coroutines") {
     for (int i = 0; i < 5; i++) {
         CoroutineConfig config;
         config.func = [&, i]() {
-            printf("  Coroutine %d: Started\n", i);
+            fl::printf("  Coroutine %d: Started\n", i);
             // Each promise resolves to i*10 after (i*2)ms
             auto p = delayed_resolve<int>(i * 10, i * 2);
-            printf("  Coroutine %d: Created promise, calling await()\n", i);
+            fl::printf("  Coroutine %d: Created promise, calling await()\n", i);
             auto result = fl::task::await(p);
-            printf("  Coroutine %d: await() returned, ok=%d\n", i, result.ok());
+            fl::printf("  Coroutine %d: await() returned, ok=%d\n", i, result.ok());
 
             if (result.ok()) {
-                printf("  Coroutine %d: Adding value %d to sum\n", i, result.value());
+                fl::printf("  Coroutine %d: Adding value %d to sum\n", i, result.value());
                 sum.fetch_add(result.value());
             }
 
             completed_count.fetch_add(1);
-            printf("  Coroutine %d: Completed\n", i);
+            fl::printf("  Coroutine %d: Completed\n", i);
         };
         config.name = fl::string("TestCoro") + fl::to_string(i);
         tasks.push_back(task::coroutine(config));
-        printf("Test: Spawned coroutine %d\n", i);
+        fl::printf("Test: Spawned coroutine %d\n", i);
     }
 
     // Wait for all coroutines to complete (max 500ms to account for slow CI)
     int timeout = 0;
-    printf("Test: Waiting for coroutines to complete...\n");
+    fl::printf("Test: Waiting for coroutines to complete...\n");
     while (completed_count.load() < 5 && timeout < 500) {
         if (timeout % 100 == 0) {
-            printf("Test: timeout=%d, completed=%d, sum=%d\n", timeout, completed_count.load(), sum.load());
+            fl::printf("Test: timeout=%d, completed=%d, sum=%d\n", timeout, completed_count.load(), sum.load());
         }
         run(1000);
         delay(5);
         timeout += 5;
     }
-    printf("Test: Wait complete. completed=%d, sum=%d\n", completed_count.load(), sum.load());
+    fl::printf("Test: Wait complete. completed=%d, sum=%d\n", completed_count.load(), sum.load());
 
     FL_CHECK(completed_count.load() == 5);
     FL_CHECK(sum.load() == 0 + 10 + 20 + 30 + 40);  // Sum of 0, 10, 20, 30, 40
@@ -1070,3 +1175,93 @@ FL_TEST_CASE("global coordination - await releases lock for other threads") {
 #endif // FASTLED_STUB_IMPL
 
 } // FL_TEST_FILE
+
+FL_TEST_CASE("fl::task::run SYSTEM yield paths") {
+    // FastLED#3765.
+    //
+    // NOTE ON COVERAGE, because it is easy to over-read this test: the
+    // microseconds>0 branch is NOT observable here. Host CoroutineRunner::run()
+    // early-returns when no coroutine is registered (coroutine_context.cpp.hpp,
+    // `if (mCount == 0) return;`), and on ESP32 any non-zero request floors to
+    // one FreeRTOS tick regardless of the value. So clamping the request to the
+    // caller's remaining budget is a correctness/consistency change with no
+    // behavior change on either platform as exercised by this suite. It is only
+    // observable with coroutines registered, where the old hardcoded 1000 would
+    // pump them past the caller's deadline.
+    //
+    // What IS observable, and what this pins, is the zero-budget path: it must
+    // take the cheap fl::yield() and must not sleep.
+    using fl::task::ExecFlags;
+
+    FL_SUBCASE("a zero budget does not sleep") {
+        run(0, ExecFlags::SYSTEM);  // warm up lazy init
+
+        // This bounds a wall clock, so it is only meaningful when the machine
+        // is idle enough to measure. Alongside the candidate we time a bare
+        // fl::yield() -- the very call the zero-budget path is supposed to
+        // take, and one that by definition cannot sleep. Interleaving the two
+        // means OS preemption inflates both together, so the control tells us
+        // whether the measurement is trustworthy at all.
+        //
+        // Why a control and not just a bigger threshold (FastLED#3772): under
+        // real full-suite load the *minimum* of 5 samples was measured at
+        // 6.6ms and 17ms on a 16-core box -- 26x and 69x the 250us bound. At
+        // that noise level a 1ms sleep is undetectable by any wall-clock
+        // method, so raising the threshold cannot fix it and would only blunt
+        // the check on the idle machines where it does work. Instead: keep the
+        // tight bound, and decline to assert when the control proves the
+        // environment cannot support the measurement.
+        const int kSamples = 32;
+        fl::u32 best_run = 0xFFFFFFFFu;
+        fl::u32 best_yield = 0xFFFFFFFFu;
+        for (int i = 0; i < kSamples; ++i) {
+            const fl::u32 t0 = fl::micros();
+            run(0, ExecFlags::SYSTEM);
+            const fl::u32 dt_run = fl::micros() - t0;
+            if (dt_run < best_run) {
+                best_run = dt_run;
+            }
+
+            const fl::u32 t1 = fl::micros();
+            fl::yield();
+            const fl::u32 dt_yield = fl::micros() - t1;
+            if (dt_yield < best_yield) {
+                best_yield = dt_yield;
+            }
+        }
+
+        // The control cannot sleep. If even it exceeds the bound, the box is
+        // too contended for this to mean anything -- report inconclusive
+        // rather than a false failure.
+        if (best_yield < 250u) {
+            FL_CHECK_LT(best_run, 250u);
+        } else {
+            FL_WARN("zero-budget sleep check skipped: machine too contended "
+                    "to measure (bare fl::yield() best-of-"
+                    << kSamples << " was " << best_yield
+                    << "us, over the 250us bound)");
+        }
+    }
+
+    FL_SUBCASE("a small budget still terminates") {
+        // Guards against the deadline loop failing to make progress.
+        const fl::u32 t0 = fl::micros();
+        run(50, ExecFlags::SYSTEM);
+        FL_CHECK_LT(fl::micros() - t0, 100000u);
+    }
+}
+
+FL_TEST_CASE("yield_system matches run(us, SYSTEM) budget semantics (#4797)") {
+    FL_SUBCASE("zero budget returns immediately") {
+        const fl::u32 t0 = fl::micros();
+        fl::task::yield_system(0);
+        FL_CHECK_LT(fl::micros() - t0, 100000u);
+    }
+    FL_SUBCASE("non-zero budget is spent, then returns") {
+        const fl::u32 t0 = fl::micros();
+        fl::task::yield_system(200);
+        const fl::u32 dt = fl::micros() - t0;
+        FL_CHECK_GE(dt, 200u);
+        FL_CHECK_LT(dt, 100000u);
+    }
+}

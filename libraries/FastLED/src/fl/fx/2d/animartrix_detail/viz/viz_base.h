@@ -16,8 +16,8 @@ namespace fl {
 
 class IAnimartrix2Viz {
 public:
-    virtual ~IAnimartrix2Viz() FL_NOEXCEPT = default;
-    virtual void draw(Context &ctx) = 0;
+    virtual ~IAnimartrix2Viz() FL_NO_EXCEPT = default;
+    virtual void draw(Context &ctx) FL_NO_EXCEPT = 0;
 };
 
 } // namespace fl

@@ -9,29 +9,43 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 from colorama import Fore, Style
+from running_process import RunningProcess
 
 from ci.autoresearch.args import Args
-from ci.autoresearch.build_driver import select_build_driver
+from ci.autoresearch.build_driver import DeployResult, select_build_driver
 from ci.autoresearch.context import (
     DEFAULT_EXPECT_PATTERNS,
     DEFAULT_FAIL_ON_PATTERN,
     EXIT_ON_ERROR_PATTERNS,
-    PIN_RX,
-    PIN_TX,
     QuietContext,
     RunContext,
+    default_pins_for_environment,
+    display_objectfled_diagnostics,
     display_pattern_details,
     display_tight_timing,
 )
-from ci.autoresearch.gpio import run_gpio_pretest, run_pin_discovery
+from ci.autoresearch.gpio import (
+    run_gpio_pretest,
+    run_pin_discovery,
+    run_pin_discovery_segmented,
+)
+from ci.autoresearch.usb_power import absent_port_error, warn_selective_suspend
 from ci.debug_attached import run_cpp_lint
-from ci.rpc_client import RpcClient, RpcCrashError, RpcTimeoutError
+from ci.rpc_client import (
+    RpcClient,
+    RpcCrashError,
+    RpcError,
+    RpcResponse,
+    RpcTimeoutError,
+)
+from ci.util.blocker_alert import blocker_alert
 from ci.util.crash_trace_decoder import CrashTraceDecoder
 from ci.util.global_interrupt_handler import (
     handle_keyboard_interrupt,
@@ -42,7 +56,10 @@ from ci.util.port_utils import (
     auto_detect_upload_port,
     detect_attached_chip,
     environment_has_wifi,
+    find_port_by_serial,
+    get_port_serial_number,
     kill_port_users,
+    port_exists,
 )
 from ci.util.sketch_resolver import parse_timeout
 
@@ -55,7 +72,437 @@ if TYPE_CHECKING:
 # Helpers
 # ============================================================
 
+# Grace period added on top of the user's --timeout before the wrapper-level
+# watchdog force-terminates. The deadline_epoch in RunContext is the user's
+# hard wall; this is the additional headroom for any in-flight RPC to
+# unwind cleanly before we kill the process. Per session 2026-06-22 spec.
+WATCHDOG_GRACE_SECONDS = 20.0
+FLEX_IO_TEENSY_DEFAULT_TX_PIN = 6
+RP2040_ENVIRONMENTS = frozenset({"rp2040", "rpipico", "rpipicow"})
+RP2350_ENVIRONMENTS = frozenset({"rp2350", "rpipico2", "rp2350w", "rpipico2w"})
+RP2XXX_ENVIRONMENTS = RP2040_ENVIRONMENTS | RP2350_ENVIRONMENTS
+
+
+def _active_rp2xxx_environment(environment: str | None) -> str | None:
+    normalized = (environment or "").strip().lower()
+    return normalized if normalized in RP2XXX_ENVIRONMENTS else None
+
+
+def _canonical_board_environment(environment: str | None) -> str | None:
+    """Resolve a real board alias to its registered CI environment."""
+    if not environment:
+        return None
+    from ci.boards import create_board
+
+    return create_board(environment.strip()).board_name
+
+
+def _is_teensy4_environment(final_environment: str | None) -> bool:
+    return final_environment is not None and final_environment.lower() in (
+        "teensy40",
+        "teensy41",
+    )
+
+
+def _is_spi_family_driver(driver: str) -> bool:
+    """Whether a driver name denotes an SPI transmitter on any platform.
+
+    Platforms spell this differently: the portable "SPI", Teensy's
+    "SPI_UNIFIED", and RP's concrete per-block "SPI0"/"SPI1". Anything
+    keying off the bare literal silently skips the RP names, which is how
+    the two-frame SPI default stopped applying there.
+    """
+    if driver in ("SPI", "SPI_UNIFIED"):
+        return True
+    return driver.startswith("SPI") and driver[3:].isdigit()
+
+
+def _resolved_rp_pio_index(args: Args) -> int:
+    """Return the RP PIO engine index, applying the mode-dependent default.
+
+    Legacy ``addLeds<>()`` templates are compile-time bound to PIO0
+    (``BusTraits<Bus::FLEX_IO, 0>``), so ``--legacy`` defaults to PIO0; the
+    Channel API path keeps its historical PIO1 default (#4623).
+    """
+    if args.rp_pio_index is not None:
+        return args.rp_pio_index
+    return 0 if args.legacy else 1
+
+
+def _rp_legacy_pio_index_invalid(args: Args, environment: str | None) -> bool:
+    """Report and return True when an RP ``--legacy`` run selects a non-PIO0 engine."""
+    if (
+        args.legacy
+        and args.flex_io
+        and _active_rp2xxx_environment(environment) is not None
+        and _resolved_rp_pio_index(args) != 0
+    ):
+        print(
+            f"{Fore.RED}❌ --legacy on RP2040/RP2350 requires --rp-engine-index 0; "
+            f"legacy chipset templates are compile-time bound to PIO0{Style.RESET_ALL}"
+        )
+        return True
+    return False
+
+
+def _legacy_lane_rx_overlap(
+    args: Args, max_lanes: int, environment: str | None
+) -> bool:
+    """Report and return True when a legacy multi-lane TX lane drives the RX pin.
+
+    Lane i transmits on ``tx_pin + i`` and only lane 0 is captured, so RX on
+    ``tx_pin`` is the supported RMT internal loopback while RX on lanes
+    1..N-1 reads garbage and reports a misleading zero_capture. Without
+    ``--rx-pin`` the firmware default for ``environment`` applies; with no
+    environment yet (auto-detect) the check is re-run after detection.
+    """
+    if not args.legacy or args.tx_pin is None or max_lanes < 2:
+        return False
+    rx_pin = args.rx_pin
+    if rx_pin is None and environment:
+        rx_pin = default_pins_for_environment(environment)[1]
+    max_pin = args.tx_pin + max_lanes - 1
+    if rx_pin is None or not args.tx_pin < rx_pin <= max_pin:
+        return False
+    print(
+        f"\u274c Error: --legacy {max_lanes} lanes use TX pins "
+        f"{args.tx_pin}-{max_pin}, which include RX pin {rx_pin}; "
+        "wire the loopback to an RX pin outside lanes 1+"
+    )
+    return True
+
+
+def _legacy_command_max_lanes(commands: list[dict[str, Any]]) -> int:
+    """Largest lane count any runSingleTest command requests."""
+    counts = [
+        len(params.get("laneSizes", []))
+        for params in (command.get("params") for command in commands)
+        if isinstance(params, dict)
+    ]
+    return max(counts, default=1)
+
+
+def _driver_name_for_environment(
+    driver: str,
+    final_environment: str | None,
+    rp_pio_index: int = 1,
+    rp_uart_index: int = 0,
+    rp_spi_index: int = 0,
+) -> str:
+    if driver == "SPI" and _is_teensy4_environment(final_environment):
+        return "SPI_UNIFIED"
+    if driver == "SPI" and _active_rp2xxx_environment(final_environment) is not None:
+        # RP registers its two fixed PL022 blocks as concrete "SPI0"/"SPI1"
+        # engines; the portable "SPI" bus name is not a runtime driver here, so
+        # sending it fails with `UnknownDriver: Driver 'SPI' not available`.
+        # Same shape as the FLEX_IO and UART cases below.
+        return f"SPI{rp_spi_index}"
+    if (
+        driver == "FLEX_IO"
+        and _active_rp2xxx_environment(final_environment) is not None
+    ):
+        # RP2040 exposes PIO0/PIO1; RP2350 adds PIO2. Their
+        # concrete names must remain distinct so a runtime-exclusive test can
+        # select one physical PIO block without replacing the other.
+        return f"PIO{rp_pio_index}"
+    if driver == "UART" and _active_rp2xxx_environment(final_environment) is not None:
+        # RP exposes two concrete PL011 engines. The portable "UART" bus name
+        # is not registered as a runtime driver on this platform.
+        return f"UART{rp_uart_index}"
+    return driver
+
+
+def _replace_driver_selection(
+    ctx: RunContext, current: str, replacements: list[str]
+) -> None:
+    """Replace a deferred driver name in the inventory and generated RPCs."""
+    expanded_drivers: list[str] = []
+    for driver in ctx.drivers:
+        expanded_drivers.extend(replacements if driver == current else (driver,))
+    ctx.drivers = expanded_drivers
+
+    for command in ctx.json_rpc_commands:
+        params = command.get("params")
+        if not isinstance(params, dict):
+            continue
+        if params.get("driver") == current:
+            # Multi-target replacements are generated only for parallel mode.
+            params["driver"] = replacements[0]
+        driver_entries = params.get("drivers")
+        if not isinstance(driver_entries, list):
+            continue
+        expanded_entries: list[Any] = []
+        for entry in driver_entries:
+            if not isinstance(entry, dict) or entry.get("driver") != current:
+                expanded_entries.append(entry)
+                continue
+            for replacement in replacements:
+                replacement_entry = dict(entry)
+                replacement_entry["driver"] = replacement
+                expanded_entries.append(replacement_entry)
+        params["drivers"] = expanded_entries
+
+
+def _prune_unavailable_drivers(ctx: RunContext, available: set[str]) -> list[str]:
+    """Drop drivers the device does not register from the inventory and RPCs.
+
+    `--all` is a cross-platform superset; sending a driver the firmware never
+    registered fails the run with `UnknownDriver`. Returns the skipped names.
+    """
+    skipped = [driver for driver in ctx.drivers if driver not in available]
+    ctx.drivers = [driver for driver in ctx.drivers if driver in available]
+
+    kept: list[dict[str, Any]] = []
+    for command in ctx.json_rpc_commands:
+        params = command.get("params")
+        if isinstance(params, dict):
+            driver = params.get("driver")
+            if isinstance(driver, str) and driver not in available:
+                continue
+            entries = params.get("drivers")
+            if isinstance(entries, list):
+                params["drivers"] = [
+                    entry
+                    for entry in entries
+                    if not isinstance(entry, dict) or entry.get("driver") in available
+                ]
+                # Firmware rejects a parallel test with fewer than two drivers.
+                if (
+                    command.get("method") == "runParallelTest"
+                    and len(params["drivers"]) < 2
+                ):
+                    continue
+        kept.append(command)
+    ctx.json_rpc_commands = kept
+    return skipped
+
+
+def _normalize_deferred_driver_names(ctx: RunContext) -> None:
+    """Apply platform-specific names after USB board auto-detection."""
+    environment = ctx.final_environment
+    args = ctx.args
+    if _active_rp2xxx_environment(environment) is not None:
+        _replace_driver_selection(ctx, "UART", [f"UART{args.rp_uart_index}"])
+        # --all appends the portable "SPI", which is not a runtime driver on
+        # RP; without this it reaches the device as UnknownDriver.
+        _replace_driver_selection(ctx, "SPI", [f"SPI{args.rp_spi_index}"])
+        pio_names = (
+            ["PIO0", "PIO1"]
+            if args.rp_pio_both and args.flex_io
+            else [f"PIO{_resolved_rp_pio_index(args)}"]
+        )
+        _replace_driver_selection(ctx, "FLEX_IO", pio_names)
+    elif _is_teensy4_environment(environment):
+        _replace_driver_selection(ctx, "SPI", ["SPI_UNIFIED"])
+
+
+def _uses_teensy_flex_io_default_tx(
+    args: Args, final_environment: str, drivers: list[str]
+) -> bool:
+    return (
+        args.tx_pin is None
+        and final_environment in {"teensy40", "teensy41"}
+        and "FLEX_IO" in drivers
+    )
+
+
+def _autoresearch_watchdog_thread(
+    ctx: "RunContext", cancel_event: "threading.Event"
+) -> None:
+    """Force-terminate the process if --timeout + grace expires.
+
+    Runs on a daemon `threading.Thread` -- deliberately NOT on the
+    asyncio event loop, because the failure modes we're guarding
+    against (wedged DMA, hung serial monitor, blocking call that never
+    yields control to the loop) can starve the loop's coroutines. A
+    real OS thread keeps ticking even when the loop is dead.
+
+    Steps:
+      1. Sleeps until `deadline_epoch + WATCHDOG_GRACE_SECONDS`,
+         in 1 s steps so a cancelled run can still bail quickly.
+      2. Emits a red `blocker_alert` banner with the trigger reason.
+      3. Best-effort closes the serial port from a side-thread with a
+         bounded join so the close itself can't hang us.
+      4. `os._exit(2)` -- bypasses any stuck asyncio cleanup. Clean
+         exit would be preferable, but the whole point of this
+         watchdog is to escape cases where clean exit doesn't happen.
+    """
+    assert ctx.deadline_epoch is not None, "watchdog started without deadline_epoch set"
+
+    # Re-read `ctx.deadline_epoch` every iteration so that
+    # `extend_autoresearch_watchdog_deadline()` can grant additional
+    # runway to long-running cleanup paths (e.g. an `await client.close()`
+    # that legitimately needs a few seconds) WITHOUT disarming the
+    # safety net. If close() itself wedges, the watchdog still fires
+    # after the new (extended) deadline.
+    while True:
+        now = time.monotonic()
+        fire_at = ctx.deadline_epoch + WATCHDOG_GRACE_SECONDS
+        if now >= fire_at:
+            break
+        if cancel_event.wait(min(fire_at - now, 1.0)):
+            return  # normal shutdown: caller signaled cancel
+
+    total = ctx.timeout_seconds + WATCHDOG_GRACE_SECONDS
+    blocker_alert(
+        f"AUTORESEARCH WATCHDOG: --timeout ({ctx.timeout_seconds:.0f}s) + "
+        f"{WATCHDOG_GRACE_SECONDS:.0f}s grace exceeded -- force-terminating.",
+        details=[
+            f"total wall-clock budget: {total:.0f}s",
+            "the per-RPC deadline path did not unwind in time",
+            "best-effort closing serial port before exit",
+            f"upload_port={ctx.upload_port!r}",
+        ],
+    )
+
+    # Forensic stack dump across every live Python thread (top 4 frames
+    # each) so we can post-mortem WHERE the wedge happened. Walks
+    # `sys._current_frames()` directly rather than using
+    # `faulthandler.dump_traceback()` so we control the depth and have
+    # the per-thread name in the header. Output goes to stderr right
+    # next to the red banner; piped logs keep the dump in order.
+    sys.stderr.write("\n--- WATCHDOG STACK DUMP (top 4 frames per thread) ---\n")
+    threads_by_id = {t.ident: t for t in threading.enumerate()}
+    for tid, frame in sys._current_frames().items():
+        thread_obj = threads_by_id.get(tid)
+        name = thread_obj.name if thread_obj is not None else "?"
+        daemon_marker = (
+            " [daemon]" if thread_obj is not None and thread_obj.daemon else ""
+        )
+        sys.stderr.write(f"\nThread {name!r} (tid={tid}){daemon_marker}:\n")
+        try:
+            import traceback as _traceback
+
+            stack_frames = _traceback.extract_stack(frame, limit=4)
+            for entry in _traceback.format_list(stack_frames):
+                sys.stderr.write(entry)
+        except KeyboardInterrupt as ki:  # noqa: BLE001
+            handle_keyboard_interrupt(ki)
+            raise
+        except Exception as dump_exc:  # never let the dump itself kill us
+            sys.stderr.write(f"  <stack dump failed: {dump_exc}>\n")
+    sys.stderr.write("--- END WATCHDOG STACK DUMP ---\n\n")
+
+    # Best-effort serial close -- run in yet another thread so a wedged
+    # close() can't keep us from exiting. 2 s join cap, then we exit.
+    serial_iface = ctx.serial_iface
+
+    def _close_target() -> None:
+        if serial_iface is None:
+            return
+        # The async adapter wraps a sync fbuild SerialMonitor; reach for
+        # the sync underlying object first since we're off the loop.
+        # We swallow ALL exceptions here -- we're about to os._exit and
+        # the caller cannot interrupt us via Ctrl-C anyway (watchdog
+        # thread does not own the main-thread interrupt handler).
+        try:
+            mon = getattr(serial_iface, "_monitor", None)
+            if mon is not None and hasattr(mon, "__exit__"):
+                mon.__exit__(None, None, None)
+                return
+        except KeyboardInterrupt as ki:  # noqa: BLE001
+            handle_keyboard_interrupt(ki)
+            raise
+        except KeyboardInterrupt as ki:
+            handle_keyboard_interrupt(ki)
+            raise
+        except Exception:
+            pass
+        try:
+            close = getattr(serial_iface, "close", None)
+            if callable(close):
+                close()  # may return a coroutine; we ignore it
+        except KeyboardInterrupt as ki:  # noqa: BLE001
+            handle_keyboard_interrupt(ki)
+            raise
+        except Exception:
+            pass
+
+    closer = threading.Thread(
+        target=_close_target,
+        name="autoresearch-watchdog-closer",
+        daemon=True,
+    )
+    closer.start()
+    closer.join(timeout=2.0)
+
+    sys.stderr.flush()
+    os._exit(2)
+
+
+def start_autoresearch_watchdog(ctx: "RunContext") -> None:
+    """Spawn the watchdog daemon thread. Call once per run, after deploy.
+
+    Uses a real OS thread (not an asyncio task) so a wedged event loop
+    can't disable the safety net. The cancel signal is a
+    `threading.Event` stored on `ctx._watchdog_task`. Clean-exit paths
+    do NOT disarm the watchdog -- if cleanup itself wedges we still
+    want the force-kill. They call
+    `extend_autoresearch_watchdog_deadline(ctx, N)` to grant the
+    cleanup phase additional runway without disarming the bomb.
+    """
+    if ctx._watchdog_task is not None:
+        return  # already running
+    cancel_event = threading.Event()
+    ctx._watchdog_task = cancel_event
+    thread = threading.Thread(
+        target=_autoresearch_watchdog_thread,
+        args=(ctx, cancel_event),
+        name="autoresearch-watchdog",
+        daemon=True,
+    )
+    thread.start()
+
+
+def stop_autoresearch_watchdog(ctx: "RunContext") -> None:
+    """Cancel the host watchdog after the complete AutoResearch run returns.
+
+    Per-phase cleanup deliberately keeps the watchdog armed because a blocked
+    serial close is exactly the failure it protects against. Once every phase
+    has returned, however, the daemon must not outlive its caller.
+    """
+    cancel_event = ctx._watchdog_task
+    if cancel_event is None:
+        return
+    cancel_event.set()
+    ctx._watchdog_task = None
+
+
+def extend_autoresearch_watchdog_deadline(
+    ctx: "RunContext", extra_seconds: float
+) -> None:
+    """Push the watchdog deadline forward by `extra_seconds`.
+
+    Use this around long-running cleanup work that legitimately needs
+    more time than the user's `--timeout` allows (e.g. an `await
+    client.close()` that may take a couple seconds). The watchdog
+    stays armed; if the cleanup itself wedges past the new deadline
+    plus `WATCHDOG_GRACE_SECONDS`, it still force-terminates.
+
+    This is preferred over a `stop_autoresearch_watchdog` because
+    disabling the bomb during cleanup risks an indefinite hang if
+    cleanup itself is the wedge.
+    """
+    if ctx.deadline_epoch is None:
+        return
+    ctx.deadline_epoch += extra_seconds
+
+
 MAX_AUTORESEARCH_LANES = 16
+LPC_BRING_UP_ENVS = {
+    "lpc845brk",
+    "lpc845",
+    "lpcxpresso845max",
+    "lpcxpresso804",
+}
+LPC_WS2812_ENVS = {"lpc845brk", "lpc845", "lpcxpresso845max"}
+# SPI+DMA harness (#3456) — LPC845 only. LPC804 has no DMA peripheral
+# (see agents/docs/peripheral-existence.md); the earlier LPC804 widening
+# in #3505 was reverted after empirical evidence surfaced the phantom.
+LPC_DMA_SPI_ENVS = LPC_WS2812_ENVS
+LPC_IEEE754_BUILD_ENVS = {
+    "lpc845brk": "lpc845brk_ieee754",
+}
 
 
 def _is_native_platform(environment: str | None) -> bool:
@@ -63,6 +510,16 @@ def _is_native_platform(environment: str | None) -> bool:
     if not environment:
         return False
     return environment.lower() in ("native", "stub", "host")
+
+
+def _build_environment_for_mode(ctx: RunContext) -> str | None:
+    """Return the fbuild environment to compile for this run mode."""
+    environment = ctx.final_environment
+    if not environment:
+        return None
+    if ctx.ieee754_test_mode:
+        return LPC_IEEE754_BUILD_ENVS.get(environment.lower(), environment)
+    return environment
 
 
 async def _run_native_autoresearch(args: Args, build_mode: str = "quick") -> int:
@@ -111,61 +568,35 @@ async def _run_native_autoresearch(args: Args, build_mode: str = "quick") -> int
     return 0 if result.success else 1
 
 
-def _try_teensy_bootloader_upload(build_dir: Path, environment: str | None) -> bool:
-    """Try to detect Teensy in HalfKay bootloader mode and upload firmware."""
-    if not environment:
-        return False
-
-    loader_paths = [
-        Path.home()
-        / ".platformio"
-        / "packages"
-        / "tool-teensy"
-        / "teensy_loader_cli.exe",
-        Path.home() / ".platformio" / "packages" / "tool-teensy" / "teensy_loader_cli",
-    ]
-    loader = None
-    for p in loader_paths:
-        if p.exists():
-            loader = p
-            break
-    if not loader:
-        return False
-
-    hex_path = build_dir / ".pio" / "build" / environment / "firmware.hex"
-    if not hex_path.exists():
-        return False
-
-    mcu_map = {
-        "teensy41": "TEENSY41",
-        "teensy40": "TEENSY40",
-        "teensylc": "TEENSYLC",
-        "teensy36": "TEENSY36",
-        "teensy35": "TEENSY35",
-        "teensy31": "TEENSY31",
-    }
-    mcu = mcu_map.get(environment.lower())
-    if not mcu:
-        return False
-
-    try:
-        result = subprocess.run(
-            [str(loader), f"--mcu={mcu}", "-v", str(hex_path)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0 and "Programming" in result.stdout:
-            return True
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-
-    return False
-
-
 # ============================================================
 # Phase A: Parse args and build commands
 # ============================================================
+
+
+def _lpc_rx_defines(args: Args) -> list[str]:
+    """Build defines selecting the LPC845 SCT RX backend for the requested modes.
+
+    The DMA loopback modes also pass FASTLED_AUTORESEARCH_LPC_DMA_LOOPBACK so
+    the low-memory sketch can leave out the unrelated pinToggleRx RPC: with
+    the real RX-DMA capture linked, the 64 KB part has no room for both
+    (~1 KB). An explicit --pin-toggle-rx keeps it.
+    """
+    pin_toggle = bool(getattr(args, "pin_toggle_rx", False))
+    dma_loopback = bool(getattr(args, "ws2812_loopback", False)) or bool(
+        getattr(args, "pwm_dma_cl", False)
+    )
+    defines: list[str] = []
+    if pin_toggle:
+        defines.append("FASTLED_LPC_RX_SCT=1")
+    if dma_loopback:
+        defines.append("FASTLED_LPC_RX_SCT_DMA=1")
+        if not pin_toggle:
+            defines.append("FASTLED_AUTORESEARCH_LPC_DMA_LOOPBACK=1")
+        # The sketch caps a capture at 192 edges; 2 x 512-word rings (4 KB)
+        # left too little heap/stack on the 16 KB part and the RPC layer
+        # faulted at boot.
+        defines.append("FL_LPC_RX_SCT_DMA_RING_WORDS=128")
+    return defines
 
 
 def _parse_args_and_build_commands(args: Args) -> RunContext | int:
@@ -174,7 +605,18 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
     Pure computation — no hardware I/O.
     Returns RunContext on success, int exit code on validation failure.
     """
-    final_environment = args.environment_positional or args.environment
+    if args.lpuart:
+        print(
+            "warning: --lpuart is deprecated; use --uart. "
+            "Treating --lpuart as --uart for this run.",
+            file=sys.stderr,
+        )
+        args.uart = True
+        args.lpuart = False
+
+    final_environment = _canonical_board_environment(
+        args.environment_positional or args.environment
+    )
 
     if args.lcd and not final_environment:
         final_environment = "esp32s3"
@@ -198,8 +640,50 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
     drivers: list[str] = []
     simd_test_mode = args.simd
     coroutine_test_mode = args.coroutine
+    ieee754_test_mode = args.ieee754
+    math_test_mode = args.math
+    fft_test_mode = args.fft
+    mp3_test_mode = args.mp3
+    rpc_smoke_mode = args.rpc_smoke
+    watchdog_soak_mode = args.watchdog_soak
 
-    if args.all:
+    # Parse --perf-wave2d "<W>x<H>" — None disables the mode.
+    # Cf. #3124 for the planned --perf-XX convention rename.
+    perf_wave2d_grid: tuple[int, int] | None = None
+    if args.perf_wave2d is not None:
+        spec = str(args.perf_wave2d).lower().strip()
+        try:
+            if "x" not in spec:
+                raise ValueError("expected 'WxH' form")
+            w_str, h_str = spec.split("x", 1)
+            w_val = int(w_str)
+            h_val = int(h_str)
+            if not (4 <= w_val <= 1024 and 4 <= h_val <= 1024):
+                raise ValueError("W and H must be in [4, 1024]")
+            perf_wave2d_grid = (w_val, h_val)
+        except ValueError as exc:
+            print(
+                f"{Fore.RED}❌ --perf-wave2d: invalid grid spec "
+                f"{args.perf_wave2d!r}: {exc}{Style.RESET_ALL}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    is_teensy4 = _is_teensy4_environment(final_environment)
+
+    # `--all` replaces the selection wholesale, so an explicit --bitbang
+    # alongside it used to be silently dropped. Append rather than fold
+    # BIT_BANG into the --all sets themselves: those lists are curated to the
+    # platform's real transmit engines (see
+    # test_all_drivers_teensy4_only_real_teensy_drivers), and BIT_BANG is the
+    # universal software fallback rather than a platform driver. Folding it in
+    # would also make every --all run fail on RP while #4203 is open.
+    if args.all and is_teensy4:
+        drivers = [
+            "OBJECT_FLED",
+            "FLEX_IO",
+        ]
+    elif args.all:
         drivers = [
             "PARLIO",
             "RMT",
@@ -210,7 +694,6 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
             "LCD_RGB",
             "OBJECT_FLED",
             "FLEX_IO",
-            "LPUART",
         ]
     else:
         if args.parlio:
@@ -218,9 +701,26 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
         if args.rmt:
             drivers.append("RMT")
         if args.spi:
-            drivers.append("SPI")
+            drivers.append(
+                _driver_name_for_environment(
+                    "SPI",
+                    final_environment,
+                    rp_spi_index=args.rp_spi_index,
+                )
+            )
         if args.uart:
-            drivers.append("UART")
+            drivers.append(
+                _driver_name_for_environment(
+                    "UART",
+                    final_environment,
+                    rp_uart_index=args.rp_uart_index,
+                )
+            )
+        if args.bitbang:
+            # Portable GPIO fallback. Name matches
+            # BitBangChannelDriver::getName(), which the firmware resolves
+            # against the manager's registered drivers at runtime.
+            drivers.append("BIT_BANG")
         if args.lcd:
             drivers.append("LCD_CLOCKLESS")
         if args.lcd_spi:
@@ -230,11 +730,51 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
         if args.object_fled:
             drivers.append("OBJECT_FLED")
         if args.flex_io:
-            drivers.append("FLEX_IO")
-        if args.lpuart:
-            drivers.append("LPUART")
+            is_rp = _active_rp2xxx_environment(final_environment) is not None
+            if args.rp_pio_both and is_rp:
+                drivers.extend(("PIO0", "PIO1"))
+            else:
+                drivers.append(
+                    _driver_name_for_environment(
+                        "FLEX_IO", final_environment, _resolved_rp_pio_index(args)
+                    )
+                )
+
+    # An explicit --bitbang must survive --all, which replaces the selection
+    # wholesale. Appended here rather than folded into the --all sets: see the
+    # note above those lists.
+    if args.bitbang and "BIT_BANG" not in drivers:
+        drivers.append("BIT_BANG")
 
     parallel_mode = args.parallel
+    if args.legacy and parallel_mode:
+        print(
+            f"{Fore.RED}\u274c Error: --legacy cannot be combined with --parallel; "
+            f"legacy chipset templates bind one compile-time driver{Style.RESET_ALL}"
+        )
+        return 1
+    if args.legacy and len(drivers) != 1:
+        print(
+            f"{Fore.RED}\u274c Error: --legacy requires exactly one driver because "
+            f"the template controller is compile-time bound{Style.RESET_ALL}"
+        )
+        return 1
+    if args.rp_pio_both and (not args.flex_io or not parallel_mode):
+        print(
+            f"{Fore.RED}❌ --rp-engine-both requires --flex-io --parallel{Style.RESET_ALL}"
+        )
+        return 1
+    if _rp_legacy_pio_index_invalid(args, final_environment):
+        return 1
+    if (
+        args.flex_io
+        and _resolved_rp_pio_index(args) == 2
+        and _active_rp2xxx_environment(final_environment) not in RP2350_ENVIRONMENTS
+    ):
+        print(
+            f"{Fore.RED}❌ --rp-engine-index 2 requires an RP2350 target{Style.RESET_ALL}"
+        )
+        return 1
     if parallel_mode:
         if len(drivers) < 2:
             print(
@@ -248,6 +788,7 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
     net_server_mode = args.net_server
     net_client_mode = args.net_client
     net_loopback_mode = args.net
+    net_peer_mode = args.net_peer
     ota_mode = args.ota
     ble_mode = args.ble
     decode_mode = args.decode is not None
@@ -258,33 +799,73 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
             bool(drivers)
             or simd_test_mode
             or coroutine_test_mode
+            or ieee754_test_mode
+            or math_test_mode
+            or fft_test_mode
+            or mp3_test_mode
+            or rpc_smoke_mode
             or net_server_mode
             or net_client_mode
             or net_loopback_mode
+            or net_peer_mode
             or ota_mode
             or ble_mode
         )
         if any_incompatible_mode:
             print(
-                f"{Fore.RED}\u274c Error: --decode cannot be combined with driver flags, --simd, --coroutine, --net, --ota, or --ble{Style.RESET_ALL}"
+                f"{Fore.RED}\u274c Error: --decode cannot be combined with driver flags, --simd, --coroutine, --mp3, --net, --ota, or --ble{Style.RESET_ALL}"
             )
             return 1
 
     # Validate mutual exclusivity
     if (
-        net_server_mode or net_client_mode or net_loopback_mode or ota_mode or ble_mode
-    ) and (drivers or simd_test_mode or coroutine_test_mode):
+        net_server_mode
+        or net_client_mode
+        or net_loopback_mode
+        or net_peer_mode
+        or ota_mode
+        or ble_mode
+    ) and (
+        drivers
+        or simd_test_mode
+        or coroutine_test_mode
+        or ieee754_test_mode
+        or math_test_mode
+        or fft_test_mode
+        or mp3_test_mode
+        or rpc_smoke_mode
+    ):
         print(
-            f"{Fore.RED}\u274c Error: --net/--net-server/--net-client/--ota/--ble cannot be combined with driver flags, --simd, or --coroutine{Style.RESET_ALL}"
+            f"{Fore.RED}\u274c Error: network, OTA, and BLE modes cannot be combined with driver flags, --simd, --coroutine, or --mp3{Style.RESET_ALL}"
         )
         return 1
-    net_mode_count = sum([net_server_mode, net_client_mode, net_loopback_mode])
+    net_mode_count = sum(
+        [net_server_mode, net_client_mode, net_loopback_mode, net_peer_mode]
+    )
     if net_mode_count > 1:
         print(
-            f"{Fore.RED}\u274c Error: --net, --net-server, and --net-client are mutually exclusive{Style.RESET_ALL}"
+            f"{Fore.RED}\u274c Error: --net, --net-server, --net-client, and --net-peer are mutually exclusive{Style.RESET_ALL}"
         )
         return 1
-    if ota_mode and net_mode_count > 0:
+    if net_peer_mode:
+        primary_environment = (final_environment or "").lower()
+        peer_environment = args.peer_environment.lower()
+        if primary_environment not in {"rp2350w", "rpipico2w"}:
+            print(
+                f"{Fore.RED}\u274c --net-peer requires rp2350w or rpipico2w as the primary environment{Style.RESET_ALL}"
+            )
+            return 1
+        if peer_environment != "esp32c6":
+            print(
+                f"{Fore.RED}\u274c --net-peer currently requires --peer-environment esp32c6{Style.RESET_ALL}"
+            )
+            return 1
+        if not args.upload_port or not args.peer_upload_port:
+            print(
+                f"{Fore.RED}\u274c --net-peer requires both --upload-port and --peer-upload-port{Style.RESET_ALL}"
+            )
+            return 1
+    if ota_mode and net_mode_count > 0 and not net_peer_mode:
         print(
             f"{Fore.RED}\u274c Error: --ota cannot be combined with --net/--net-server/--net-client{Style.RESET_ALL}"
         )
@@ -297,11 +878,21 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
 
     gpio_only_mode = (
         not drivers
+        and not getattr(args, "rp_spi_loopback", False)
+        and not getattr(args, "rp_spi_public_api", False)
         and not simd_test_mode
         and not coroutine_test_mode
+        and not ieee754_test_mode
+        and not math_test_mode
+        and not fft_test_mode
+        and not mp3_test_mode
+        and not rpc_smoke_mode
+        and not watchdog_soak_mode
+        and perf_wave2d_grid is None
         and not net_server_mode
         and not net_client_mode
         and not net_loopback_mode
+        and not net_peer_mode
         and not ota_mode
         and not ble_mode
     )
@@ -337,16 +928,97 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
                 return 1
 
     if args.legacy:
-        if max_lanes is not None and max_lanes > 1:
+        requested_min_lanes = min_lanes if min_lanes is not None else 1
+        requested_max_lanes = max_lanes if max_lanes is not None else 1
+        if args.legacy_mixed_timings and requested_max_lanes < 2:
             print(
-                "\u274c Error: --legacy only supports single-lane (pin 0-8). Remove --lanes or use --lanes 1"
+                "\u274c Error: --legacy-mixed-timings requires --legacy with at least 2 lanes"
             )
             return 1
-        min_lanes = 1
-        max_lanes = 1
+        if args.legacy_rgbw_small_counts:
+            if requested_min_lanes != 1 or requested_max_lanes != 1:
+                print(
+                    "\u274c Error: --legacy-rgbw-small-counts requires exactly 1 lane"
+                )
+                return 1
+            if args.strip_sizes is not None:
+                print(
+                    "\u274c Error: --legacy-rgbw-small-counts supplies strip sizes 1,2,3,4; do not combine with --strip-sizes"
+                )
+                return 1
+        if requested_max_lanes > 1:
+            if args.tx_pin is None:
+                print(
+                    "\u274c Error: --legacy multi-lane requires explicit --tx-pin in the historical 0-8 template range"
+                )
+                return 1
+            max_pin = args.tx_pin + requested_max_lanes - 1
+            if args.tx_pin < 0 or max_pin > 8:
+                print(
+                    "\u274c Error: --legacy multi-lane supports consecutive TX pins 0-8 only; pin 22 is single-lane for the current ObjectFLED loopback"
+                )
+                return 1
+            if _legacy_lane_rx_overlap(args, requested_max_lanes, final_environment):
+                return 1
+        min_lanes = requested_min_lanes
+        max_lanes = requested_max_lanes
+        legacy_chipset_names = {
+            "ws2814": "WS2814",
+            "ws2818": "WS2818",
+        }
+        legacy_chipset_name = legacy_chipset_names.get(args.chipset, "WS2812B")
         print(
-            "\u2139\ufe0f  Legacy API mode: using WS2812B<PIN> template path (single-lane, pin 0-8)"
+            f"\u2139\ufe0f  Legacy API mode: using {legacy_chipset_name}<PIN> template path "
+            "(supported TX pins 0-8; pin 22 single-lane current loopback)"
         )
+        if args.legacy_mixed_timings:
+            print(
+                "\u2139\ufe0f  Legacy mixed timing mode: alternating WS2812B/SK6812 template chipsets across lanes"
+            )
+        if args.legacy_rgbw_small_counts:
+            print(
+                "\u2139\ufe0f  Legacy RGBW small-count mode: running RGBW strip sizes 1, 2, 3, and 4"
+            )
+    elif args.legacy_mixed_timings or args.legacy_rgbw_small_counts:
+        flag = (
+            "--legacy-mixed-timings"
+            if args.legacy_mixed_timings
+            else "--legacy-rgbw-small-counts"
+        )
+        print(f"\u274c Error: {flag} requires --legacy")
+        return 1
+
+    # The legacy path resolves timing from a LegacyClocklessChipset template
+    # and ignores timing_name entirely (AutoResearchRemoteRunSingleTest.cpp),
+    # so a chipset with no legacy template silently runs as WS2812B rather
+    # than failing. Reject the combination instead of reporting a pass for
+    # timing that was never applied.
+    legacy_capable_chipsets = {"ws2812", "ws2814", "ws2818"}
+    if args.legacy and args.chipset not in legacy_capable_chipsets:
+        print(
+            f"\u274c Error: --chipset {args.chipset} has no legacy template, so "
+            "--legacy would silently fall back to WS2812B timing. Use "
+            f"--chipset {args.chipset} without --legacy, or pick one of: "
+            + ", ".join(sorted(legacy_capable_chipsets))
+        )
+        return 1
+
+    explicit_legacy_chipsets = {
+        "ws2814": "WS2814",
+        "ws2818": "WS2818",
+    }
+    if args.chipset in explicit_legacy_chipsets:
+        selected_chipset = explicit_legacy_chipsets[args.chipset]
+        if not args.legacy:
+            print(
+                f"\u274c Error: --chipset {args.chipset} requires --legacy so AutoResearch exercises the public {selected_chipset}<PIN> template"
+            )
+            return 1
+        if args.legacy_mixed_timings or args.legacy_rgbw_small_counts:
+            print(
+                f"\u274c Error: --chipset {args.chipset} cannot be combined with legacy mixed/RGBW override modes"
+            )
+            return 1
 
     if min_lanes is not None and max_lanes is not None:
         if min_lanes < 1 or max_lanes < 1 or min_lanes > max_lanes:
@@ -459,6 +1131,9 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
                 )
                 return 1
 
+    if args.legacy_rgbw_small_counts:
+        config["stripSizes"] = [1, 2, 3, 4]
+
     rpc_commands_list: list[dict[str, Any]] = []
 
     if per_lane_counts is not None:
@@ -481,7 +1156,10 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
 
     chipset_timing_map = {
         "ws2812": "WS2812B-V5",
+        "ws2814": "WS2814",
+        "ws2818": "WS2818",
         "ucs7604": "UCS7604-800KHZ",
+        "ws2811-400": "WS2811-400KHZ",
     }
     timing_name = chipset_timing_map.get(args.chipset, "WS2812B-V5")
 
@@ -514,78 +1192,10 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
             f"({len(drivers_list)} drivers \u00d7 {lane_range['max'] - lane_range['min'] + 1} lane count(s) \u00d7 {len(strip_sizes)} strip size(s))"
         )
     else:
-        # FlexIO on Teensy 4.x only routes through pins {6-13, 32}; the global
-        # default TX pin (1) is not FlexIO2-capable so canHandle() rejects it
-        # and the manager silently falls back to ObjectFLED. Pin the FLEX_IO
-        # tests to a known FlexIO2 pin so the engine actually runs.
-        flex_io_tx_pin = 6
-        # LPUART on Teensy 4.x routes through {1, 8, 14, 17, 20, 24, 29, 35,
-        # 47, 48}. Pin LPUART tests to pin 1 (LPUART6_TX, Teensy 4's default
-        # Serial2 TX) so the engine accepts the request when --tx-pin is not
-        # supplied. Mirrors the FLEX_IO override above.
-        lpuart_tx_pin = 1
-        # OBJECT_FLED on Teensy 4 cannot be exercised through the generic
-        # runSingleTest path (FastLED#3059: the FlexPWM-RX backend produces
-        # bimodal pulse widths the WS2812 decoder rejects, AND the FlexIO RX
-        # alternative hangs the runSingleTest dispatcher entirely — proven
-        # across six device-side workarounds with status heartbeats showing
-        # the test never returns within 10 minutes). The dedicated
-        # `flexioObjectFledTest` RPC is hardware-verified to capture and
-        # decode the same OBJECT_FLED waveform via the FlexIO RX backend.
-        # Route OBJECT_FLED on Teensy 4 to that RPC so the autoresearch
-        # wrapper gets a fast deterministic result instead of timing out.
-        is_teensy4 = final_environment is not None and final_environment.lower() in (
-            "teensy40",
-            "teensy41",
-        )
-
         for driver in drivers_list:
             for lane_count in range(lane_range["min"], lane_range["max"] + 1):
                 for strip_size in strip_sizes:
                     lane_sizes = [strip_size] * lane_count
-
-                    # Skip OBJECT_FLED on Teensy 4 entirely. Both paths to
-                    # exercise OBJECT_FLED loopback are broken inside the
-                    # autoresearch session: runSingleTest hangs the
-                    # dispatcher (FastLED#3059 device-side investigation
-                    # comments), and flexioObjectFledTest fails with
-                    # RxBeginFailed because FastLED#2772 leaves FLEXIO1's
-                    # clock-gate de-asserted once FlexPWM RX has been
-                    # touched earlier in the dispatch sequence (e.g.
-                    # findConnectedPins). Both bugs need bench-side fixes
-                    # that are out of scope for the autoresearch wrapper.
-                    # Substitute a `ping` so the wrapper still gets a
-                    # successful RPC round-trip and reports the OBJECT_FLED
-                    # driver as covered-by-this-session without blocking on
-                    # the broken loopback. Byte-level OBJECT_FLED
-                    # validation has to come from a hardware-verified path
-                    # that doesn't share state with the rest of the
-                    # autoresearch dispatch sequence (run
-                    # `flexioObjectFledTest` directly on a fresh boot).
-                    if is_teensy4 and driver == "OBJECT_FLED":
-                        # Marker fields are picked up by the dispatch loop
-                        # below and produce a synthetic PASS without ever
-                        # sending the RPC. They survive
-                        # `parse_json_rpc_commands` because the parser
-                        # round-trips through `json.loads` and preserves all
-                        # extra keys.
-                        skip_reason = (
-                            "OBJECT_FLED on Teensy 4 wrapper-skipped "
-                            "(FastLED#3059 runSingleTest hang + "
-                            "FastLED#2772 FLEXIO1 clock-gate)"
-                        )
-                        rpc_commands_list.append(
-                            {
-                                "method": "ping",
-                                "params": [],
-                                "__skip_with_pass": True,
-                                "__skip_driver": driver,
-                                "__skip_lane_sizes": lane_sizes,
-                                "__skip_reason": skip_reason,
-                            }
-                        )
-                        continue
-
                     test_config: dict[str, Any] = {
                         "driver": driver,
                         "laneSizes": lane_sizes,
@@ -593,23 +1203,32 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
                         "iterations": 1,
                         "timing": timing_name,
                     }
-                    if driver == "FLEX_IO" and args.tx_pin is None:
-                        test_config["pinTx"] = flex_io_tx_pin
-                    if driver == "LPUART" and args.tx_pin is None:
-                        test_config["pinTx"] = lpuart_tx_pin
                     if args.legacy:
                         test_config["useLegacyApi"] = True
+                        if args.legacy_rgbw_small_counts:
+                            test_config["legacyRgbw"] = True
+                        if args.chipset in explicit_legacy_chipsets:
+                            test_config["legacyChipsets"] = [
+                                explicit_legacy_chipsets[args.chipset]
+                            ] * lane_count
+                        elif args.legacy_mixed_timings:
+                            test_config["legacyChipsets"] = [
+                                "WS2812B" if i % 2 == 0 else "SK6812"
+                                for i in range(lane_count)
+                            ]
                     # Multi-frame capture: back-to-back show()/capture cycles per pattern.
                     # Defaults: SPI -> 2 (catches #2254/#2288 second-frame degradation),
                     # others -> 1. User can override with --frames N.
                     if args.frames is not None:
                         frame_count = args.frames
-                    elif driver == "SPI":
+                    elif _is_spi_family_driver(driver):
                         frame_count = 2
                     else:
                         frame_count = 1
                     if frame_count > 1:
                         test_config["frameCount"] = frame_count
+                    if args.contaminate_tx_mux:
+                        test_config["contaminateTxMux"] = True
                     if args.tight_timing:
                         if (
                             args.tight_timing_iterations < 1
@@ -656,19 +1275,130 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
         if args.fail_keywords:
             fail_keywords.extend(args.fail_keywords)
 
-    # Parse timeout
-    try:
-        timeout_seconds = parse_timeout(args.timeout)
-    except ValueError as e:
-        print(f"\u274c Error: {e}")
-        return 1
+    # Parse timeout (FastLED #3309: 30s default with advisory banner;
+    # --no-timeout to disable; supports 30s / 10m / 1h / 5000ms notation).
+    AUTORESEARCH_DEFAULT_TIMEOUT_S = 30
+    no_timeout = bool(getattr(args, "no_timeout", False))
+    quiet = bool(getattr(args, "quiet", False))
+    if no_timeout:
+        # Effectively unbounded: a year-of-seconds is "no timeout" for any
+        # practical bring-up session and stays well within int range.
+        timeout_seconds = 365 * 24 * 3600
+    elif args.timeout is None:
+        timeout_seconds = AUTORESEARCH_DEFAULT_TIMEOUT_S
+        if not quiet:
+            # Yellow advisory banner so the user sees the default is in effect
+            # and knows how to override. Suppressed under --quiet. Fore/Style
+            # are imported at module level above.
+            print(
+                f"{Fore.YELLOW}"
+                f"[default {AUTORESEARCH_DEFAULT_TIMEOUT_S}s timeout in effect "
+                f"-- pass --timeout <duration> (e.g. 30s / 2m / 1h) or "
+                f"--no-timeout to override]"
+                f"{Style.RESET_ALL}"
+            )
+    else:
+        try:
+            timeout_seconds = parse_timeout(args.timeout)
+        except ValueError as e:
+            print(f"\u274c Error: {e}")
+            return 1
 
-    # Validate project directory
-    build_dir = args.project_dir.resolve()
-    if not (build_dir / "platformio.ini").exists():
-        print(f"\u274c Error: platformio.ini not found in {build_dir}")
-        print("   Make sure you're running this from a PlatformIO project directory")
-        return 1
+    # Driver-specific compile defines for the synthesised build. The LPC
+    # bench harnesses compile out unless their gate macro is set
+    # (examples/AutoResearch/AutoResearchSpiDma.h and sibling) — without
+    # this the bench RPCs are unbound and every call reports "no reply"
+    # against perfectly healthy firmware. The two flags are mutually
+    # exclusive host-side (both claim DMA0 channels + flash budget).
+    bench_defines: list[str] = []
+    if args.legacy and args.rmt:
+        # ESP32-C6/P4/H2/C5 normally bind legacy templates to PARLIO. This
+        # request-scoped define moves the existing public template path to
+        # the existing RMT controller so the requested/reported driver is real.
+        bench_defines.append("FL_ESP32_LEGACY_CLOCKLESS_USE_RMT=1")
+    if getattr(args, "dma_spi", False):
+        bench_defines.append("FASTLED_LPC_SPI_DMA=1")
+        # Cap the SPI+DMA buffers for the 16 KB-RAM bench build. At the
+        # driver default (2048) the u16 encode buffer (4 KB) + the u8
+        # harness buffer (2 KB) push static RAM to 94% and the first RPC
+        # HardFaults at PC=0 when heap/stack collide (observed on
+        # LPC845-BRK silicon 2026-07-02). The bench's largest case is
+        # 512 bytes, so 512 loses no coverage and frees 4.5 KB.
+        bench_defines.append("FASTLED_LPC_SPI_DMA_MAX_BYTES=512")
+        # ISR-refilled streaming (kickDmaStreamAsync ping-pong refill).
+        # Requires the ACLPC core with named weak IRQ vector slots
+        # (framework-arduino-lpc8xx#38, pinned via fbuild ≥ 2.4.0).
+        bench_defines.append("FASTLED_LPC_DMA_ISR=1")
+    if getattr(args, "dma_uart", False):
+        # Async UART bench (#3453 follow-up). FASTLED_LPC_DMA_ISR turns on
+        # the shared DMA0 IRQ hub for ISR chunk chaining — requires the
+        # ACLPC core with named weak IRQ vector slots
+        # (framework-arduino-lpc8xx#38).
+        bench_defines.append("FASTLED_LPC_UART_DMA=1")
+        bench_defines.append("FASTLED_AUTORESEARCH_LPC_UART_DMA=1")
+        bench_defines.append("FASTLED_LPC_DMA_ISR=1")
+    requested_env = (args.environment or args.environment_positional or "").lower()
+    if requested_env in LPC_WS2812_ENVS:
+        bench_defines.extend(_lpc_rx_defines(args))
+    if getattr(args, "uart", False) and requested_env in LPC_WS2812_ENVS:
+        bench_defines.append("FASTLED_LPC_UART_DMA=1")
+        bench_defines.append("FASTLED_AUTORESEARCH_LPC_UART_DMA=1")
+        bench_defines.append("FASTLED_LPC_DMA_ISR=1")
+        bench_defines.append("FL_LPC_UART_DMA_CLOCKLESS_TEST=1")
+        bench_defines.append("FL_LPC_UART_DMA_LOOPBACK_TEST=1")
+        if args.tx_pin is not None:
+            bench_defines.append(f"FL_LPC_UART_DMA_CLOCKLESS_TX_PIN={args.tx_pin}")
+        if args.rx_pin is not None:
+            bench_defines.append(f"FL_LPC_UART_DMA_CLOCKLESS_RX_PIN={args.rx_pin}")
+    if getattr(args, "pwm_dma_cl", False):
+        bench_defines.append("FASTLED_LPC_PWM_DMA=1")
+    if getattr(args, "test_fault_emit", False):
+        bench_defines.append("FASTLED_AUTORESEARCH_FAULT_TEST=1")
+
+    # Resolve project root (always the user's invocation cwd) and build_dir.
+    #
+    # Synthesise ``.build/fbuild/<board>/platformio.ini`` from ``ci/boards.py``
+    # if the board is already known at parse time (#3281); otherwise defer
+    # synthesis to :func:`_resolve_port_and_environment` after chip
+    # auto-detect.
+    #
+    # In the deferred-synthesis case we keep ``build_dir`` pointing at the
+    # invocation cwd so the sketch source can still be located under
+    # ``examples/AutoResearch/``. Synthesis happens later, and ``ctx.build_dir``
+    # is rewritten before fbuild is invoked.
+    project_root = args.project_dir.resolve()
+
+    if final_environment:
+        # Board known up-front \u2014 synthesise now so downstream callers (chip
+        # auto-detect log lines, default_envs probes) see the staged file.
+        from ci.autoresearch.staging import synthesise_autoresearch_project
+
+        try:
+            build_dir = synthesise_autoresearch_project(
+                final_environment,
+                project_root=project_root,
+                verbose=args.verbose,
+                extra_defines=bench_defines,
+            )
+        except KeyboardInterrupt as ki:
+            # Let user-initiated interrupts propagate via the project's
+            # canonical handler; never swallow them under the broad
+            # Exception handler below (CodeRabbit feedback, PR #3290).
+            handle_keyboard_interrupt(ki)
+            raise
+        except Exception as e:
+            print(
+                f"\u274c Error: failed to synthesise platformio.ini for "
+                f"board '{final_environment}': {e}"
+            )
+            return 1
+    else:
+        # Board not yet known \u2014 defer synthesis to _resolve_port_and_environment
+        # once chip auto-detect resolves the environment. Use project_root as
+        # the build_dir so the sketch-resolver fallback below picks up
+        # examples/AutoResearch/. The build_dir is rewritten before fbuild is
+        # invoked.
+        build_dir = project_root
 
     # Sketch selection.
     #
@@ -679,17 +1409,29 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
     # standalone examples/AutoResearchLpc/ harness was retired by FastLED #3030
     # once the soft-FP cascade from #3022 phase 2 freed up the LPC845 flash
     # budget.
+    #
+    # For the synthesised path the staged tree lives under ``build_dir/src/sketch/``
+    # (populated by ``init_fbuild_project`` \u2192 ``copy_example_source``);
+    # for the deferred-synthesis path the in-tree ``examples/AutoResearch/``
+    # source applies.
     sketch_path = build_dir / "examples" / "AutoResearch"
     if not sketch_path.exists():
         staged_sketch_path = build_dir / "src" / "sketch"
         if staged_sketch_path.exists():
             sketch_path = staged_sketch_path
         else:
-            print(
-                "\u274c Error: AutoResearch sketch not found at "
-                f"{sketch_path} or {staged_sketch_path}"
-            )
-            return 1
+            # Fall back to <project_root>/examples/AutoResearch/ when we're in
+            # the synthesised path and the staged sketch isn't laid down yet
+            # (shouldn't happen, but keeps the error message useful).
+            repo_sketch_path = project_root / "examples" / "AutoResearch"
+            if repo_sketch_path.exists():
+                sketch_path = repo_sketch_path
+            else:
+                print(
+                    "\u274c Error: AutoResearch sketch not found at "
+                    f"{sketch_path} or {staged_sketch_path} or {repo_sketch_path}"
+                )
+                return 1
 
     os.environ["PLATFORMIO_SRC_DIR"] = str(sketch_path)
 
@@ -703,9 +1445,17 @@ def _parse_args_and_build_commands(args: Args) -> RunContext | int:
         build_dir=build_dir,
         simd_test_mode=simd_test_mode,
         coroutine_test_mode=coroutine_test_mode,
+        ieee754_test_mode=ieee754_test_mode,
+        math_test_mode=math_test_mode,
+        fft_test_mode=fft_test_mode,
+        mp3_test_mode=mp3_test_mode,
+        rpc_smoke_mode=rpc_smoke_mode,
+        watchdog_soak_mode=watchdog_soak_mode,
+        perf_wave2d_grid=perf_wave2d_grid,
         net_server_mode=net_server_mode,
         net_client_mode=net_client_mode,
         net_loopback_mode=net_loopback_mode,
+        net_peer_mode=net_peer_mode,
         ota_mode=ota_mode,
         ble_mode=ble_mode,
         decode_mode=decode_mode,
@@ -730,9 +1480,22 @@ async def _resolve_port_and_environment(ctx: RunContext) -> int | None:
     is_teensy = (
         ctx.final_environment is not None and "teensy" in ctx.final_environment.lower()
     )
+    rp2xxx_environment = _active_rp2xxx_environment(ctx.final_environment)
+    stock_rp2xxx_transport = bool(rp2xxx_environment) and (
+        args.rpc_smoke or args.watchdog_soak
+    )
 
     upload_port = args.upload_port
-    if not upload_port:
+    # Every board build selects FbuildDriver below. When the environment is
+    # known, passing no port is intentional: fbuild resolves every accepted
+    # identity for that environment from FastLED/boards and reports the
+    # post-deploy application port through FBUILD_DEPLOY_PORT.
+    defer_port_selection_to_fbuild = bool(ctx.final_environment)
+    if (
+        not upload_port
+        and not stock_rp2xxx_transport
+        and not defer_port_selection_to_fbuild
+    ):
         expected_environment = None if is_teensy else ctx.final_environment
         max_wait_s = 60
         poll_interval_s = 1.0
@@ -741,7 +1504,14 @@ async def _resolve_port_and_environment(ctx: RunContext) -> int | None:
             if is_teensy:
                 print(f"\n{Fore.YELLOW}{'=' * 60}")
                 print(f"  Teensy not detected on USB.")
-                print(f"  Press the PROGRAM button on the Teensy to enter bootloader.")
+                print(
+                    "  AutoResearch will not pre-upload stale firmware "
+                    "during port detection."
+                )
+                print(
+                    "  Power-cycle or reconnect the Teensy so the USB serial "
+                    "port appears, then let fbuild own the deploy."
+                )
                 print(f"{'=' * 60}{Style.RESET_ALL}\n")
             print(
                 f"\u23f3 No USB serial port found yet. Waiting up to {max_wait_s}s for device..."
@@ -759,26 +1529,6 @@ async def _resolve_port_and_environment(ctx: RunContext) -> int | None:
                         f"\u2705 USB serial port detected after {elapsed:.1f}s: {result.selected_port}"
                     )
                     break
-                if is_teensy:
-                    teensy_result = _try_teensy_bootloader_upload(
-                        ctx.build_dir, ctx.final_environment
-                    )
-                    if teensy_result:
-                        print(
-                            "\u2705 Firmware uploaded via Teensy bootloader, waiting for serial port..."
-                        )
-                        serial_deadline = time.monotonic() + 15
-                        while time.monotonic() < serial_deadline:
-                            time.sleep(1.0)
-                            result = auto_detect_upload_port(
-                                expected_environment=expected_environment
-                            )
-                            if result.ok:
-                                print(
-                                    f"\u2705 Teensy serial port detected: {result.selected_port}"
-                                )
-                                break
-                        break
                 now = time.monotonic()
                 if now - last_msg_at >= 5.0:
                     remaining = deadline - now
@@ -805,7 +1555,9 @@ async def _resolve_port_and_environment(ctx: RunContext) -> int | None:
             )
             if is_teensy:
                 print(
-                    f"{Fore.YELLOW}Teensy hint: Hold the PROGRAM button while plugging in USB to force bootloader mode.{Style.RESET_ALL}"
+                    f"{Fore.YELLOW}Teensy hint: keep the board in USB serial mode "
+                    f"for AutoResearch acceptance; fbuild must perform the first "
+                    f"firmware deploy for this run.{Style.RESET_ALL}"
                 )
             print(
                 f"{Fore.RED}Note: Bluetooth serial ports (BTHENUM) are not supported.{Style.RESET_ALL}\n"
@@ -814,60 +1566,124 @@ async def _resolve_port_and_environment(ctx: RunContext) -> int | None:
 
         upload_port = result.selected_port
 
-    assert upload_port is not None, "upload_port should be set by auto-detection"
+    if (stock_rp2xxx_transport or defer_port_selection_to_fbuild) and not upload_port:
+        print(
+            f"📦 {ctx.final_environment} port selection deferred to fbuild; "
+            "deploy will use the FastLED/boards registry and return the application port."
+        )
+    else:
+        assert upload_port is not None, "upload_port should be set by auto-detection"
     ctx.upload_port = upload_port
 
     # Auto-detect environment from attached chip
-    detected_chip_type: str | None = None
     detected_environment: str | None = None
 
-    if not ctx.final_environment:
+    if not ctx.final_environment and upload_port is not None:
         print("\U0001f50d Detecting attached chip type...")
         chip_result = detect_attached_chip(upload_port)
         if chip_result.ok and chip_result.environment:
-            detected_chip_type = chip_result.chip_type
             detected_environment = chip_result.environment
             ctx.final_environment = detected_environment
             print(
                 f"\u2705 Detected {chip_result.chip_type} \u2192 using environment '{ctx.final_environment}'"
             )
         if not ctx.final_environment:
-            from ci.util.pio_package_daemon import get_default_environment
-
-            default_env = get_default_environment(str(ctx.build_dir))
-            if default_env:
-                ctx.final_environment = default_env
-                error_msg = "Chip detection failed"
-                print(
-                    f"\u26a0\ufe0f  {error_msg}, "
-                    f"using platformio.ini default: '{ctx.final_environment}'"
-                )
-            else:
-                print(
-                    "\u26a0\ufe0f  Chip detection failed and no default_envs in platformio.ini"
-                )
+            # No env known and chip detect failed: the staged project has
+            # not been synthesised yet, so there is nothing to fall back to
+            # and nothing downstream can recover. Fail fast with a clear
+            # error (CodeRabbit feedback, PR #3290) so callers don't
+            # silently proceed with an unset final_environment.
+            print(
+                "\u274c Chip detection failed and no environment given. "
+                "Pass a positional environment (e.g. `bash autoresearch esp32c6 ...`) "
+                "or attach a recognisable device."
+            )
+            return 1
         print()
 
-    # Platform mismatch warning
-    from ci.util.pio_package_daemon import get_default_environment
+    ctx.final_environment = _canonical_board_environment(ctx.final_environment)
+    # Board auto-detection can resolve to RP after parse-time validation ran.
+    if _rp_legacy_pio_index_invalid(args, ctx.final_environment):
+        return 1
+    if _legacy_lane_rx_overlap(
+        args,
+        _legacy_command_max_lanes(ctx.json_rpc_commands),
+        ctx.final_environment,
+    ):
+        return 1
+    _normalize_deferred_driver_names(ctx)
 
-    default_env = get_default_environment(str(ctx.build_dir))
-    if detected_environment and default_env and detected_environment != default_env:
-        print(f"{Fore.YELLOW}{'=' * 60}")
-        print(f"{Fore.YELLOW}\u26a0\ufe0f  PLATFORM MISMATCH WARNING")
-        print(f"{Fore.YELLOW}{'=' * 60}")
-        print(
-            f"{Fore.YELLOW}Detected chip: {detected_chip_type} ({detected_environment})"
-        )
-        print(f"{Fore.YELLOW}platformio.ini default_envs: {default_env}")
-        print(
-            f"{Fore.YELLOW}Using detected environment '{detected_environment}' for this session."
-        )
-        print(
-            f"{Fore.YELLOW}To make this permanent, update platformio.ini: default_envs = {detected_environment}"
-        )
-        print(f"{Fore.YELLOW}{'=' * 60}{Style.RESET_ALL}")
-        print()
+    # Deferred synthesis (#3281). When the board wasn't known at parse time,
+    # the build_dir is still pointing at the project root. Now that chip
+    # auto-detect has resolved the environment we can synthesise
+    # .build/fbuild/<board>/platformio.ini and redirect build_dir so fbuild
+    # reads the synthesised file.
+    if ctx.final_environment and ctx.build_dir == args.project_dir.resolve():
+        from ci.autoresearch.staging import synthesise_autoresearch_project
+
+        # Same driver-gate defines as the parse-time synthesis path — the
+        # LPC bench harnesses compile out without their gate macro.
+        deferred_defines: list[str] = []
+        if args.legacy and args.rmt:
+            deferred_defines.append("FL_ESP32_LEGACY_CLOCKLESS_USE_RMT=1")
+        if getattr(args, "dma_spi", False):
+            deferred_defines.append("FASTLED_LPC_SPI_DMA=1")
+            # Same 16 KB-RAM cap rationale as the parse-time path above.
+            deferred_defines.append("FASTLED_LPC_SPI_DMA_MAX_BYTES=512")
+            deferred_defines.append("FASTLED_LPC_DMA_ISR=1")
+        if getattr(args, "dma_uart", False):
+            deferred_defines.append("FASTLED_LPC_UART_DMA=1")
+            deferred_defines.append("FASTLED_AUTORESEARCH_LPC_UART_DMA=1")
+            deferred_defines.append("FASTLED_LPC_DMA_ISR=1")
+        if (ctx.final_environment or "").lower() in LPC_WS2812_ENVS:
+            deferred_defines.extend(_lpc_rx_defines(args))
+        if (
+            getattr(args, "uart", False)
+            and (ctx.final_environment or "").lower() in LPC_WS2812_ENVS
+        ):
+            deferred_defines.append("FASTLED_LPC_UART_DMA=1")
+            deferred_defines.append("FASTLED_AUTORESEARCH_LPC_UART_DMA=1")
+            deferred_defines.append("FASTLED_LPC_DMA_ISR=1")
+            deferred_defines.append("FL_LPC_UART_DMA_CLOCKLESS_TEST=1")
+            deferred_defines.append("FL_LPC_UART_DMA_LOOPBACK_TEST=1")
+            if args.tx_pin is not None:
+                deferred_defines.append(
+                    f"FL_LPC_UART_DMA_CLOCKLESS_TX_PIN={args.tx_pin}"
+                )
+            if args.rx_pin is not None:
+                deferred_defines.append(
+                    f"FL_LPC_UART_DMA_CLOCKLESS_RX_PIN={args.rx_pin}"
+                )
+        if getattr(args, "pwm_dma_cl", False):
+            deferred_defines.append("FASTLED_LPC_PWM_DMA=1")
+        if getattr(args, "test_fault_emit", False):
+            deferred_defines.append("FASTLED_AUTORESEARCH_FAULT_TEST=1")
+
+        try:
+            ctx.build_dir = synthesise_autoresearch_project(
+                ctx.final_environment,
+                project_root=args.project_dir.resolve(),
+                verbose=args.verbose,
+                extra_defines=deferred_defines,
+            )
+            # The staged sketch lives under <build_dir>/src/sketch \u2014 point
+            # PLATFORMIO_SRC_DIR at it so fbuild and any downstream sketch
+            # resolver pick up the freshly-copied source.
+            staged_sketch = ctx.build_dir / "src" / "sketch"
+            if staged_sketch.exists():
+                os.environ["PLATFORMIO_SRC_DIR"] = str(staged_sketch)
+        except KeyboardInterrupt as ki:
+            # Let user-initiated interrupts propagate via the project's
+            # canonical handler; never swallow them under the broad
+            # Exception handler below (CodeRabbit feedback, PR #3290).
+            handle_keyboard_interrupt(ki)
+            raise
+        except Exception as e:
+            print(
+                f"\u274c Error: failed to synthesise platformio.ini for "
+                f"board '{ctx.final_environment}': {e}"
+            )
+            return 1
 
     # Select build driver
     ctx.build_driver = select_build_driver(
@@ -891,12 +1707,24 @@ async def _run_build_deploy(ctx: RunContext, qctx: QuietContext) -> int | None:
     args = ctx.args
     build_dir = ctx.build_dir
     final_environment = ctx.final_environment
+    build_environment = _build_environment_for_mode(ctx)
     upload_port = ctx.upload_port
     build_driver = ctx.build_driver
     assert build_driver is not None
 
+    # Preflight: an explicitly-named port that is not attached can only fail,
+    # and it fails at deploy — after ~7 minutes of install, lint and build.
+    # Checked before Phase 0 so the operator gets the real reason in seconds.
+    # Only an explicit --upload-port is gated: without one, fbuild can still
+    # reach an RP-series board through the BOOTSEL volume with no CDC record.
+    if args.upload_port:
+        absent = absent_port_error(args.upload_port)
+        if absent:
+            print(f"\n❌ {absent}")
+            return 1
+
     # Phase 0: Package Installation
-    if not build_driver.install_packages(build_dir, final_environment):
+    if not build_driver.install_packages(build_dir, build_environment):
         print("\n\u274c Package installation failed")
         return 1
     print()
@@ -911,97 +1739,156 @@ async def _run_build_deploy(ctx: RunContext, qctx: QuietContext) -> int | None:
         print()
 
     # Phase 2+3: Build + Deploy
+    # Host power management is a common cause of a board vanishing mid-session
+    # and coming back as code 43 / health=phantom, which reads like a wedged
+    # board. Surface it before deploy so the operator sees it next to the
+    # failure rather than after a recovery hunt. Warning only — never fatal.
+    warn_selective_suspend(upload_port)
+
     print(f"\U0001f4e6 Using {build_driver.name}")
 
-    bring_up_envs = {"lpc845brk", "lpcxpresso845max", "lpcxpresso804"}
-    if final_environment in bring_up_envs:
-        # fbuild's nxplpc orchestrator does not yet ship a deployer
-        # (`daemon/.../deploy.rs` only dispatches avr/teensy). Bring-up boards
-        # run `fbuild build` followed by a pyocd-based flash + sw-reset here.
-        if not _build_and_flash_nxplpc(
-            build_dir,
-            environment=final_environment,
-            upload_port=upload_port,
-            verbose=args.verbose,
-        ):
-            qctx.emit("BUILD+FLASH FAIL (nxplpc)")
-            qctx.emit_log_path()
-            return 1
-    elif not build_driver.deploy(
+    # USB-JTAG boards (ESP32-C3/C6/P4/S3 native USB) re-enumerate on the reset
+    # after flashing, often under a new /dev name. Remember the USB serial so
+    # the session can follow the board if fbuild does not report the new port.
+    pre_deploy_serial = (
+        get_port_serial_number(upload_port)
+        if upload_port and not upload_port.startswith("ser=")
+        else None
+    )
+
+    deploy_result = build_driver.deploy(
         build_dir,
-        environment=final_environment,
+        environment=build_environment,
         upload_port=upload_port,
         verbose=args.verbose,
         clean=args.clean,
         quiet=args.quiet,
         log_file=qctx.log_file,
+    )
+    deploy_success = (
+        deploy_result.success
+        if isinstance(deploy_result, DeployResult)
+        else bool(deploy_result)
+    )
+    if isinstance(deploy_result, DeployResult) and deploy_result.port:
+        ctx.upload_port = deploy_result.port
+        upload_port = deploy_result.port
+        print(f"✅ fbuild returned application port: {deploy_result.port}")
+    elif (
+        deploy_success
+        and upload_port
+        and pre_deploy_serial
+        and not port_exists(upload_port)
     ):
+        # Only when the original node is gone: no wait in the common case,
+        # and never "follow" back onto the stale path.
+        followed = find_port_by_serial(pre_deploy_serial, exclude=upload_port)
+        if followed and followed != upload_port:
+            print(
+                f"↪ {upload_port} re-enumerated as {followed} after flashing "
+                f"(USB serial {pre_deploy_serial}); following it."
+            )
+            ctx.upload_port = followed
+            upload_port = followed
+    if not deploy_success:
         qctx.emit("BUILD+FLASH FAIL")
         qctx.emit_log_path()
         return 1
 
-    # Wait for serial port to become available after upload
-    if upload_port and build_driver.name == "platformio":
+    if upload_port is None:
         print(
-            "\n\u23f3 Waiting for device to reboot and serial port to become available..."
+            "❌ No application serial port was returned after fbuild deployment "
+            f"for environment '{build_environment}'"
         )
-        port_ready = False
-        max_wait_time = 15.0
-        start_time = time.time()
+        return 1
 
-        while time.time() - start_time < max_wait_time:
-            if is_interrupted():
-                raise KeyboardInterrupt()
-            kill_port_users(upload_port)
-            try:
-                import serial
+    if ctx.net_peer_mode:
+        # A peer run must remain entirely on fbuild's deploy path.  In
+        # particular, do not open a direct serial flasher or fall back to a
+        # host-managed WiFi workflow: both boards are selected by explicit
+        # ports and the subsequent validation is device-to-device.
+        if build_driver.name != "fbuild":
+            print("❌ --net-peer requires the fbuild deployment backend")
+            return 1
+        peer_environment = args.peer_environment.lower()
+        peer_upload_port = args.peer_upload_port
+        assert peer_upload_port is not None
+        from ci.autoresearch.staging import synthesise_autoresearch_project
 
-                with serial.Serial(upload_port, 115200, timeout=0.1) as _ser:
-                    port_ready = True
-                    elapsed = time.time() - start_time
-                    print(f"\u2705 Serial port available after {elapsed:.1f}s")
-                    break
-            except KeyboardInterrupt as ki:
-                handle_keyboard_interrupt(ki)
-                raise
-            except Exception:
-                for _ in range(5):
-                    if is_interrupted():
-                        raise KeyboardInterrupt()
-                    time.sleep(0.1)
-
-        if not port_ready:
-            print(
-                f"{Fore.YELLOW}\u26a0\ufe0f  Port not available after {max_wait_time}s, proceeding anyway...{Style.RESET_ALL}"
+        try:
+            peer_build_dir = synthesise_autoresearch_project(
+                peer_environment,
+                project_root=args.project_dir.resolve(),
+                verbose=args.verbose,
+                ota_fixture=bool(args.ota),
             )
+        except KeyboardInterrupt as ki:
+            handle_keyboard_interrupt(ki)
+            raise
+        except Exception as e:
+            print(f"❌ Failed to stage --net-peer companion project: {e}")
+            return 1
 
-        kill_port_users(upload_port)
-        time.sleep(0.5)
-    elif upload_port and build_driver.name == "fbuild":
-        import serial
+        print(
+            f"📦 Deploying --net-peer companion {peer_environment} "
+            f"to explicit port {peer_upload_port}"
+        )
+        peer_result = build_driver.deploy(
+            peer_build_dir,
+            environment=peer_environment,
+            upload_port=peer_upload_port,
+            verbose=args.verbose,
+            clean=args.clean,
+            quiet=args.quiet,
+            log_file=qctx.log_file,
+        )
+        peer_success = (
+            peer_result.success
+            if isinstance(peer_result, DeployResult)
+            else bool(peer_result)
+        )
+        if isinstance(peer_result, DeployResult) and peer_result.port:
+            args.peer_upload_port = peer_result.port
+            print(f"✅ fbuild returned companion application port: {peer_result.port}")
+        if not peer_success:
+            qctx.emit("BUILD+FLASH FAIL (--net-peer companion)")
+            qctx.emit_log_path()
+            return 1
 
+    # Wait for serial port to become available after upload
+    if upload_port:
         port_ready = False
         for _ in range(10):
             if is_interrupted():
                 raise KeyboardInterrupt()
-            try:
-                with serial.Serial(upload_port, 115200, timeout=0.1) as _ser:
-                    port_ready = True
-                    break
-            except KeyboardInterrupt as ki:
-                handle_keyboard_interrupt(ki)
-                raise
-            except (serial.SerialException, OSError):
-                time.sleep(0.3)
-            except Exception as e:
-                print(
-                    f"\u26a0\ufe0f  Unexpected error checking port: {type(e).__name__}: {e}"
-                )
-                time.sleep(0.3)
+            # OS-level port-availability poll (never a raw pyserial open \u2014
+            # see the PYS001 ban).
+            if port_exists(upload_port):
+                port_ready = True
+                break
+            time.sleep(0.3)
         if not port_ready:
             print(
                 f"\u26a0\ufe0f  Port {upload_port} not available after 3s, proceeding anyway..."
             )
+
+    # POST-FLASH, PRE-CONNECT EPOCH. From here on, every downstream RPC
+    # call computes its per-call timeout via `ctx.remaining_seconds()`
+    # so that the user-supplied `--timeout N` is a HARD WALL on the
+    # post-flash budget rather than a per-call value that could be
+    # silently inflated by hardcoded callsites (the previous bug --
+    # `--timeout 60` then 120 s hardcoded at the runSingleTest call
+    # site stretched real wall-clock to 15+ min). The watchdog kicks
+    # in `WATCHDOG_GRACE_SECONDS` after that hard wall to force-kill
+    # if normal teardown wedges. See goal session 2026-06-22.
+    ctx.start_timeout_epoch()
+    start_autoresearch_watchdog(ctx)
+    if ctx.deadline_epoch is not None:
+        print(
+            f"\u23f1  Post-flash deadline armed: "
+            f"--timeout={ctx.timeout_seconds:.0f}s "
+            f"(+ {WATCHDOG_GRACE_SECONDS:.0f}s watchdog grace)"
+        )
 
     return None
 
@@ -1020,14 +1907,20 @@ async def _run_schema_and_pin_setup(ctx: RunContext) -> int | None:
     """
     args = ctx.args
     upload_port = ctx.upload_port
-    assert upload_port is not None
+    if upload_port is None:
+        print("❌ No application serial port was returned after fbuild deployment")
+        return 1
     use_fbuild = ctx.use_fbuild
     final_environment = ctx.final_environment
 
     # Validate RPC commands against device schema
     constrained_platforms = ["esp32c6", "esp32c2", "esp32p4", "teensy41", "teensy40"]
     skip_schema = (
-        args.skip_schema or args.quiet or final_environment in constrained_platforms
+        args.skip_schema
+        or args.quiet
+        or args.rpc_smoke
+        or args.watchdog_soak
+        or final_environment in constrained_platforms
     )
 
     if skip_schema:
@@ -1086,8 +1979,16 @@ async def _run_schema_and_pin_setup(ctx: RunContext) -> int | None:
     # Create serial interface
     from ci.util.serial_interface import create_serial_interface
 
+    final_environment = (ctx.final_environment or "").lower()
+    default_tx_pin, default_rx_pin = default_pins_for_environment(final_environment)
+    uses_flex_io_default_tx = _uses_teensy_flex_io_default_tx(
+        args, final_environment, ctx.drivers
+    )
+    if uses_flex_io_default_tx:
+        default_tx_pin = FLEX_IO_TEENSY_DEFAULT_TX_PIN
+    use_pyserial = (not use_fbuild) or final_environment in LPC_BRING_UP_ENVS
     ctx.serial_iface = create_serial_interface(
-        port=upload_port, use_pyserial=not use_fbuild
+        port=upload_port, use_pyserial=use_pyserial
     )
 
     # Create crash trace decoder
@@ -1103,8 +2004,7 @@ async def _run_schema_and_pin_setup(ctx: RunContext) -> int | None:
     # so pin discovery would hang. Skip it for those boards — the bring-up
     # short-circuit later in `_run_full_autoresearch_pipeline` will run
     # `_run_bring_up_tests` directly against the configured upload port.
-    bring_up_envs = {"lpc845brk", "lpcxpresso845max", "lpcxpresso804"}
-    if ctx.final_environment in bring_up_envs:
+    if final_environment in LPC_BRING_UP_ENVS:
         print(
             f"\n\U0001f4cc LPC bring-up mode ({ctx.final_environment}): "
             "skipping pin discovery and GPIO pre-test"
@@ -1113,26 +2013,54 @@ async def _run_schema_and_pin_setup(ctx: RunContext) -> int | None:
         print("\n\U0001f4cc SIMD mode: skipping pin discovery and GPIO pre-test")
     elif ctx.coroutine_test_mode:
         print("\n\U0001f4cc Coroutine mode: skipping pin discovery and GPIO pre-test")
-    elif ctx.net_server_mode or ctx.net_client_mode or ctx.net_loopback_mode:
+    elif ctx.ieee754_test_mode:
+        print(
+            "\n\U0001f4cc IEEE754 codec mode: skipping pin discovery and GPIO pre-test"
+        )
+    elif ctx.math_test_mode:
+        print("\n\U0001f4cc Math mode: skipping pin discovery and GPIO pre-test")
+    elif ctx.fft_test_mode:
+        print("\n\U0001f4cc FFT bench mode: skipping pin discovery and GPIO pre-test")
+    elif ctx.mp3_test_mode:
+        print("\n\U0001f4cc MP3 codec mode: skipping pin discovery and GPIO pre-test")
+    elif ctx.rpc_smoke_mode or ctx.watchdog_soak_mode:
+        print("\n\U0001f4cc RPC smoke mode: skipping pin discovery and GPIO pre-test")
+    elif ctx.perf_wave2d_grid is not None:
+        print("\n\U0001f4cc Wave2D mode: skipping pin discovery and GPIO pre-test")
+    elif (
+        ctx.net_server_mode
+        or ctx.net_client_mode
+        or ctx.net_loopback_mode
+        or ctx.net_peer_mode
+    ):
         print("\n\U0001f4cc Network mode: skipping pin discovery and GPIO pre-test")
     elif ctx.ota_mode:
         print("\n\U0001f4cc OTA mode: skipping pin discovery and GPIO pre-test")
     elif ctx.ble_mode:
         print("\n\U0001f4cc BLE mode: skipping pin discovery and GPIO pre-test")
     elif args.tx_pin is not None or args.rx_pin is not None:
-        ctx.effective_tx_pin = args.tx_pin if args.tx_pin is not None else PIN_TX
-        ctx.effective_rx_pin = args.rx_pin if args.rx_pin is not None else PIN_RX
+        ctx.effective_tx_pin = (
+            args.tx_pin if args.tx_pin is not None else default_tx_pin
+        )
+        ctx.effective_rx_pin = (
+            args.rx_pin if args.rx_pin is not None else default_rx_pin
+        )
         print(
             f"\n\U0001f4cc Using CLI-specified pins: TX={ctx.effective_tx_pin}, RX={ctx.effective_rx_pin}"
         )
-        set_pins_cmd = {
-            "method": "setPins",
-            "params": [{"txPin": ctx.effective_tx_pin, "rxPin": ctx.effective_rx_pin}],
-        }
-        ctx.json_rpc_commands.insert(0, set_pins_cmd)
+        if uses_flex_io_default_tx:
+            print(
+                "\U0001f4cc Teensy FLEX_IO defaulted omitted TX to "
+                f"{ctx.effective_tx_pin}."
+            )
     elif args.auto_discover_pins:
         print("\n\U0001f50d Auto-discovery enabled - searching for connected pins...")
-        pin_discovery = await run_pin_discovery(
+        # FastLED #3446: walk the full classic-ESP32 GPIO range via
+        # overlapping 8-pin windows so shorts on any ADC2 / IO_MUX-only
+        # pin (e.g. the user-reported (33, 34) pair) are reachable. The
+        # segmented helper isolates segment-level hangs so an unsafe
+        # window only takes out itself, not the whole sweep.
+        pin_discovery = await run_pin_discovery_segmented(
             upload_port, serial_interface=serial_iface
         )
         ctx.discovery_client = pin_discovery.client
@@ -1149,23 +2077,36 @@ async def _run_schema_and_pin_setup(ctx: RunContext) -> int | None:
                 f"\U0001f4cc Using discovered pins: TX={ctx.effective_tx_pin}, RX={ctx.effective_rx_pin}"
             )
         else:
-            ctx.effective_tx_pin = PIN_TX
-            ctx.effective_rx_pin = PIN_RX
+            ctx.effective_tx_pin = default_tx_pin
+            ctx.effective_rx_pin = default_rx_pin
+            default_reason = "default pins"
+            if uses_flex_io_default_tx:
+                default_reason = "Teensy FLEX_IO default pins"
             print(
-                f"\U0001f4cc Using default pins: TX={ctx.effective_tx_pin}, RX={ctx.effective_rx_pin}"
+                f"\U0001f4cc Using {default_reason}: "
+                f"TX={ctx.effective_tx_pin}, RX={ctx.effective_rx_pin}"
             )
             if ctx.discovery_client:
                 await ctx.discovery_client.close()
                 ctx.discovery_client = None
     else:
-        ctx.effective_tx_pin = PIN_TX
-        ctx.effective_rx_pin = PIN_RX
+        ctx.effective_tx_pin = default_tx_pin
+        ctx.effective_rx_pin = default_rx_pin
+        default_reason = "default pins"
+        if uses_flex_io_default_tx:
+            default_reason = "Teensy FLEX_IO default pins"
         print(
-            f"\n\U0001f4cc Using default pins: TX={ctx.effective_tx_pin}, RX={ctx.effective_rx_pin}"
+            f"\n\U0001f4cc Using {default_reason}: "
+            f"TX={ctx.effective_tx_pin}, RX={ctx.effective_rx_pin}"
         )
 
+    if not (
+        ctx.rpc_smoke_mode or ctx.watchdog_soak_mode or ctx.perf_wave2d_grid is not None
+    ):
+        _ensure_leading_set_pins_command(ctx)
+
     # GPIO connectivity pre-test
-    if ctx.final_environment in bring_up_envs:
+    if final_environment in LPC_BRING_UP_ENVS:
         # LPC bring-up: no jumper wire / pin loop, the bring-up RPC test
         # itself is the only check we run.
         pass
@@ -1173,7 +2114,24 @@ async def _run_schema_and_pin_setup(ctx: RunContext) -> int | None:
         pass
     elif ctx.coroutine_test_mode:
         pass
-    elif ctx.net_server_mode or ctx.net_client_mode or ctx.net_loopback_mode:
+    elif ctx.ieee754_test_mode:
+        pass
+    elif ctx.math_test_mode:
+        pass
+    elif ctx.fft_test_mode:
+        pass
+    elif ctx.mp3_test_mode:
+        pass
+    elif ctx.rpc_smoke_mode or ctx.watchdog_soak_mode:
+        pass
+    elif ctx.perf_wave2d_grid is not None:
+        pass
+    elif (
+        ctx.net_server_mode
+        or ctx.net_client_mode
+        or ctx.net_loopback_mode
+        or ctx.net_peer_mode
+    ):
         pass
     elif ctx.ota_mode:
         pass
@@ -1183,8 +2141,8 @@ async def _run_schema_and_pin_setup(ctx: RunContext) -> int | None:
         print("\n\u2705 Skipping GPIO pre-test (pins verified during discovery)")
     elif not await run_gpio_pretest(
         upload_port,
-        ctx.effective_tx_pin or PIN_TX,
-        ctx.effective_rx_pin or PIN_RX,
+        ctx.effective_tx_pin if ctx.effective_tx_pin is not None else default_tx_pin,
+        ctx.effective_rx_pin if ctx.effective_rx_pin is not None else default_rx_pin,
         serial_interface=serial_iface,
     ):
         print()
@@ -1198,8 +2156,12 @@ async def _run_schema_and_pin_setup(ctx: RunContext) -> int | None:
         print("     JSON-RPC commands. Check serial output above for boot errors")
         print("     or crashes. Try power-cycling the device.")
         print()
-        tx = ctx.effective_tx_pin if ctx.effective_tx_pin is not None else PIN_TX
-        rx = ctx.effective_rx_pin if ctx.effective_rx_pin is not None else PIN_RX
+        tx = (
+            ctx.effective_tx_pin if ctx.effective_tx_pin is not None else default_tx_pin
+        )
+        rx = (
+            ctx.effective_rx_pin if ctx.effective_rx_pin is not None else default_rx_pin
+        )
         print("  2. WRONG PIN PAIR: The jumper wire may be connected to different")
         print(f"     pins than expected (tested TX={tx}, RX={rx}).")
         print("     Try: bash autoresearch --auto-discover-pins")
@@ -1224,6 +2186,413 @@ async def _run_schema_and_pin_setup(ctx: RunContext) -> int | None:
 # ============================================================
 
 
+def _is_valid_rp_concurrency_result(result: Any) -> bool:
+    """Return whether an RP concurrency response proves the full gate."""
+    if not isinstance(result, dict):
+        return False
+    actual = result.get("actual")
+    expected = result.get("expected")
+    return (
+        result.get("success") is True
+        and result.get("supported") is True
+        and result.get("core1Ready") is True
+        and result.get("core1Done") is True
+        and result.get("recursiveMutexReady") is True
+        and isinstance(actual, int)
+        and not isinstance(actual, bool)
+        and isinstance(expected, int)
+        and not isinstance(expected, bool)
+        and expected > 0
+        and actual == expected
+    )
+
+
+def _is_valid_rp_pio_contention_result(result: Any) -> bool:
+    """Return whether the PIO-contention response proves FastLED#1471's claim.
+
+    The load-bearing part is `noTheft`: with every state machine claimed by
+    another owner, FastLED must hand out nothing. `control.claimedOne` guards
+    against a false pass where the driver simply is not built.
+    """
+    if not isinstance(result, dict):
+        return False
+    control = result.get("control")
+    contention = result.get("contention")
+    if not isinstance(control, dict) or not isinstance(contention, dict):
+        return False
+    starved = contention.get("starvedSms")
+    free_after = contention.get("freeAfterStarve")
+    return (
+        result.get("success") is True
+        and result.get("noLeak") is True
+        and control.get("proxyValid") is True
+        and control.get("claimedOne") is True
+        and control.get("released") is True
+        and isinstance(starved, int)
+        and not isinstance(starved, bool)
+        and starved > 0
+        and isinstance(free_after, int)
+        and not isinstance(free_after, bool)
+        and free_after == 0
+        and contention.get("claimsIntact") is True
+        and contention.get("noTheft") is True
+        and contention.get("survivedShow") is True
+    )
+
+
+def _is_valid_rp_pio_parallel_result(result: Any) -> bool:
+    """Return whether PIO0+PIO1 met #3899's resource criterion.
+
+    The acceptance criterion names three failure modes -- resource collision,
+    stale state machine, DMA ownership leak -- and runParallelTest checks for
+    none of them. These four flags are the direct evidence for each.
+    """
+    if not isinstance(result, dict):
+        return False
+    return (
+        result.get("success") is True
+        and result.get("collisionFree") is True
+        and result.get("showsCompleted") is True
+        and result.get("noResidueBetweenFrames") is True
+        and result.get("noLeak") is True
+    )
+
+
+async def _run_rpc_smoke_tests(ctx: RunContext) -> int:
+    """Validate the pin-free JSON-RPC transport and core system surface."""
+    upload_port = ctx.upload_port
+    if not upload_port:
+        print("❌ RPC smoke requires the post-deploy application port")
+        return 1
+
+    from ci.util.serial_interface import create_serial_interface
+
+    client = RpcClient(
+        upload_port,
+        timeout=min(10.0, max(1.0, ctx.remaining_seconds(minimum=1.0))),
+        serial_interface=ctx.serial_iface
+        or create_serial_interface(upload_port, use_pyserial=not ctx.use_fbuild),
+        crash_decoder=ctx.crash_decoder,
+    )
+
+    async def call(name: str, args: Any = None) -> Any:
+        response = await client.send(
+            name,
+            args=args,
+            timeout=max(1.0, ctx.remaining_seconds(minimum=1.0)),
+        )
+        if not response.success:
+            raise RpcError(f"{name} returned unsuccessful response: {response.data!r}")
+        if name in {"rpc.discover", "help"}:
+            method_count = len(_rpc_manifest_method_names(response.data))
+            print(f"REMOTE: {name} -> {method_count} methods")
+        else:
+            print(f"REMOTE: {name} -> {response.data!r}")
+        return response.data
+
+    try:
+        await client.connect()
+        await client.drain_boot_output(verbose=False)
+
+        rp_environment = _active_rp2xxx_environment(ctx.final_environment)
+        required_methods = {
+            "help",
+            "ping",
+            "debugTest",
+            "status",
+            "drivers",
+            "testNoSerial",
+        }
+        if rp_environment is not None:
+            required_methods.add("testRpConcurrency")
+            required_methods.add("testRpPioContention")
+            required_methods.add("testRpPioParallelResources")
+
+        discovered = await call("rpc.discover")
+        discovered_methods = _rpc_manifest_method_names(discovered)
+        missing_discovered = sorted(required_methods - discovered_methods)
+        if missing_discovered:
+            raise RpcError(
+                "rpc.discover omitted required methods: "
+                + ", ".join(missing_discovered)
+            )
+
+        help_manifest = await call("help")
+        help_functions = (
+            help_manifest.get("functions")
+            if isinstance(help_manifest, dict)
+            else help_manifest
+        )
+        help_methods = _rpc_manifest_method_names(help_functions)
+        missing_help = sorted(({"rpc.discover"} | required_methods) - help_methods)
+        if missing_help:
+            raise RpcError("help omitted required methods: " + ", ".join(missing_help))
+
+        first_ping = await call("ping")
+        await asyncio.sleep(0.01)
+        second_ping = await call("ping")
+        first_uptime = (
+            first_ping.get("uptimeMs") if isinstance(first_ping, dict) else None
+        )
+        second_uptime = (
+            second_ping.get("uptimeMs") if isinstance(second_ping, dict) else None
+        )
+        if (
+            not isinstance(first_uptime, (int, float))
+            or not isinstance(second_uptime, (int, float))
+            or second_uptime <= first_uptime
+        ):
+            raise RpcError("ping uptime did not advance monotonically")
+
+        active_environment = rp_environment or "rp2040"
+        chip_number = 2350 if active_environment in RP2350_ENVIRONMENTS else 2040
+        payload = {
+            "text": f"{active_environment}-rpc-smoke",
+            "number": chip_number,
+            "nested": {"ok": True, "values": [1, 2, 3]},
+        }
+        echoed = await call("debugTest", payload)
+        if not isinstance(echoed, dict) or echoed.get("received") != payload:
+            raise RpcError(f"debugTest payload mismatch: {echoed!r}")
+
+        status = await call("status")
+        expected_platform = {
+            "rp2350": "RP2350",
+            "rpipico2": "RP2350",
+            "rp2350w": "Raspberry Pi Pico 2 W (RP2350)",
+            "rpipico2w": "Raspberry Pi Pico 2 W (RP2350)",
+        }.get(active_environment)
+        if (
+            not isinstance(status, dict)
+            or status.get("ready") is not True
+            or status.get("rpcReady") is not True
+            or not isinstance(status.get("ledRxAvailable"), bool)
+            or (
+                expected_platform is not None
+                and status.get("platform") != expected_platform
+            )
+        ):
+            raise RpcError(
+                "status did not prove the pin-free RPC/platform state: "
+                f"expected platform={expected_platform!r}, got {status!r}"
+            )
+
+        drivers = await call("drivers")
+        if not isinstance(drivers, list):
+            raise RpcError(f"drivers returned a non-array result: {drivers!r}")
+
+        no_serial = await call("testNoSerial")
+        if (
+            not isinstance(no_serial, dict)
+            or no_serial.get("success") is not True
+            or no_serial.get("serial_safe") is not False
+            or not isinstance(no_serial.get("message"), str)
+        ):
+            raise RpcError(f"testNoSerial failed: {no_serial!r}")
+
+        if rp_environment is not None:
+            concurrency = await call("testRpConcurrency")
+            if not _is_valid_rp_concurrency_result(concurrency):
+                raise RpcError(
+                    f"RP mutex/semaphore dual-core validation failed: {concurrency!r}"
+                )
+
+            contention = await call("testRpPioContention")
+            if not _is_valid_rp_pio_contention_result(contention):
+                raise RpcError(
+                    f"RP PIO contention validation failed (#1471): {contention!r}"
+                )
+
+            parallel = await call("testRpPioParallelResources")
+            if not _is_valid_rp_pio_parallel_result(parallel):
+                raise RpcError(
+                    f"RP PIO0+PIO1 resource validation failed (#3899): {parallel!r}"
+                )
+
+        missing_method_returned = False
+        try:
+            await client.send(
+                "__autoresearch_missing_method__",
+                {},
+                timeout=min(2.0, max(1.0, ctx.remaining_seconds(minimum=1.0))),
+            )
+            missing_method_returned = True
+        except RpcError as exc:
+            if exc.code != -32601:
+                raise RpcError(
+                    "missing method returned the wrong JSON-RPC error code: "
+                    f"{exc.code!r} ({exc})"
+                ) from exc
+            print(
+                "REMOTE: missing-method structured error -> "
+                f"code={exc.code}, message={exc.message!r}, data={exc.data!r}"
+            )
+        if missing_method_returned:
+            raise RpcError("missing method unexpectedly returned a result")
+
+        validated = "discovery, help, ping, payload, status, drivers, testNoSerial"
+        if rp_environment is not None:
+            validated += ", RP concurrency, RP PIO contention, RP PIO0+PIO1 resources"
+        print(f"RESULT: RPC smoke PASS ({validated}, error handling)")
+        return 0
+    except (RpcCrashError, RpcTimeoutError, RpcError, OSError) as exc:
+        print(f"RESULT: RPC smoke FAIL: {exc}")
+        return 1
+    finally:
+        try:
+            await client.close()
+        except KeyboardInterrupt as ki:
+            handle_keyboard_interrupt(ki)
+            raise
+        except Exception:
+            pass
+
+
+def _rpc_manifest_method_names(manifest: Any) -> set[str]:
+    """Extract method names from rpc.discover or AutoResearch help payloads."""
+    if isinstance(manifest, dict):
+        for key in ("methods", "schema", "functions"):
+            if key in manifest:
+                return _rpc_manifest_method_names(manifest[key])
+        return set()
+    if not isinstance(manifest, list):
+        return set()
+
+    names: set[str] = set()
+    for entry in manifest:
+        if isinstance(entry, str):
+            names.add(entry)
+        elif isinstance(entry, dict):
+            name = entry.get("name")
+            if isinstance(name, str):
+                names.add(name)
+        elif isinstance(entry, list) and entry and isinstance(entry[0], str):
+            names.add(entry[0])
+    return names
+
+
+async def _run_watchdog_soak(ctx: RunContext) -> int:
+    """Trigger deliberateHang, reacquire CDC, then rerun the RPC smoke set."""
+    old_port = ctx.upload_port
+    if not old_port:
+        print("RESULT: watchdog soak FAIL: no application port")
+        return 1
+    original_serial_number = get_port_serial_number(old_port)
+    from ci.util.serial_interface import create_serial_interface
+
+    # Do not reuse a pre-deploy adapter after fbuild has re-enumerated CDC.
+    # Construct a fresh handle for the deliberate-hang acknowledgement.
+    iface = create_serial_interface(old_port, use_pyserial=not ctx.use_fbuild)
+    client = RpcClient(old_port, timeout=8.0, serial_interface=iface)
+    try:
+        await client.connect()
+        await client.drain_boot_output(verbose=False)
+        await asyncio.sleep(0.5)
+        before = await client.send("ping", args={}, timeout=8.0)
+        if not before.success or not isinstance(before.data, dict):
+            print(f"RESULT: watchdog soak FAIL: pre-reset ping {before.data!r}")
+            return 1
+        before_uptime = before.data.get("uptimeMs")
+        print(f"WATCHDOG: pre-reset ping uptimeMs={before_uptime}")
+        acknowledgement = await client.send(
+            "deliberateHang", args={}, timeout=8.0, return_on_ack=True
+        )
+        if not acknowledgement.success:
+            print(
+                f"RESULT: watchdog soak FAIL: deliberateHang acknowledgement "
+                f"{acknowledgement.data!r}"
+            )
+            return 1
+        print(f"WATCHDOG: deliberateHang acknowledgement={acknowledgement.data!r}")
+    except RpcTimeoutError as exc:
+        print(f"RESULT: watchdog soak FAIL: no deliberateHang acknowledgement: {exc}")
+        return 1
+    finally:
+        try:
+            await client.close()
+        except KeyboardInterrupt as ki:
+            handle_keyboard_interrupt(ki)
+        except Exception:
+            pass
+
+    # The old handle must disappear before accepting a re-enumerated endpoint.
+    deadline = time.monotonic() + min(20.0, ctx.remaining_seconds(minimum=1.0))
+    while time.monotonic() < deadline and port_exists(old_port):
+        await asyncio.sleep(0.1)
+    print(f"WATCHDOG: application port disconnected={not port_exists(old_port)}")
+    expected_environment = _active_rp2xxx_environment(ctx.final_environment)
+    if expected_environment is None:
+        print("RESULT: watchdog soak FAIL: active environment is not RP2xxx")
+        return 1
+    new_port: str | None = None
+    while time.monotonic() < deadline:
+        detected = await asyncio.to_thread(
+            auto_detect_upload_port,
+            expected_environment,
+            expected_serial_number=original_serial_number,
+        )
+        candidate = detected.selected_port
+        if candidate and (not port_exists(old_port) or candidate != old_port):
+            new_port = candidate
+            break
+        if candidate and port_exists(candidate):
+            # Windows commonly reuses COM11; its disappearance above is the
+            # reset evidence, so the same name is valid after re-enumeration.
+            new_port = candidate
+            break
+        await asyncio.sleep(0.2)
+    if not new_port:
+        print("RESULT: watchdog soak FAIL: application CDC did not re-enumerate")
+        return 1
+
+    new_iface = create_serial_interface(new_port, use_pyserial=not ctx.use_fbuild)
+    recovery = RpcClient(new_port, timeout=8.0, serial_interface=new_iface)
+    try:
+        await recovery.connect()
+        await recovery.drain_boot_output(verbose=False)
+        after = await recovery.send("ping", {}, timeout=8.0)
+        if not after.success or not isinstance(after.data, dict):
+            print(f"RESULT: watchdog soak FAIL: post-reset ping {after.data!r}")
+            return 1
+        after_uptime = after.data.get("uptimeMs")
+        watchdog_reset = after.data.get("lastResetWasWatchdog") is True
+        uptime_reset = (
+            isinstance(before_uptime, int)
+            and not isinstance(before_uptime, bool)
+            and isinstance(after_uptime, int)
+            and not isinstance(after_uptime, bool)
+            and after_uptime < before_uptime
+        )
+        print(
+            f"WATCHDOG: post-reset ping uptimeMs={after_uptime} "
+            f"port={new_port} resetCause={after.data.get('lastResetCause')!r} "
+            f"watchdog_reset={watchdog_reset} uptime_reset={uptime_reset}"
+        )
+        if not watchdog_reset or not uptime_reset:
+            print(
+                "RESULT: watchdog soak FAIL: re-enumerated device did not prove "
+                "the deliberate hang caused a watchdog reset"
+            )
+            return 1
+    finally:
+        try:
+            await recovery.close()
+        except KeyboardInterrupt as ki:
+            handle_keyboard_interrupt(ki)
+        except Exception:
+            pass
+    ctx.upload_port = new_port
+    # The recovery client owns and closes this interface; smoke creates a
+    # fresh one for the post-reset RPC sequence.
+    ctx.serial_iface = None
+    smoke_rc = await _run_rpc_smoke_tests(ctx)
+    if smoke_rc == 0:
+        print(
+            "RESULT: watchdog soak PASS (ack, disconnect, CDC recovery, ping, RPC smoke)"
+        )
+    return smoke_rc
+
+
 async def _run_tests_or_special_mode(ctx: RunContext, qctx: QuietContext) -> int:
     """Execute GPIO-only, special modes, or main RPC test loop.
 
@@ -1239,18 +2608,111 @@ async def _run_tests_or_special_mode(ctx: RunContext, qctx: QuietContext) -> int
     # GPIO + LED-protocol matrix that ESP32/Teensy targets use. Must come
     # BEFORE the gpio_only_mode early-return so the harness actually runs the
     # echo check instead of bailing with a "no tests requested" success.
-    bring_up_envs = {"lpc845brk", "lpcxpresso845max", "lpcxpresso804"}
-    if ctx.final_environment in bring_up_envs:
+    final_environment = (ctx.final_environment or "").lower()
+    if ctx.watchdog_soak_mode:
+        return await _run_watchdog_soak(ctx)
+    if ctx.rpc_smoke_mode:
+        return await _run_rpc_smoke_tests(ctx)
+
+    if getattr(ctx.args, "rp_spi_loopback", False):
+        return await _run_rp_spi_loopback_tests(ctx)
+
+    if getattr(ctx.args, "rp_spi_public_api", False):
+        return await _run_rp_spi_public_api_tests(ctx)
+
+    if final_environment in LPC_BRING_UP_ENVS:
+        if ctx.ieee754_test_mode:
+            return await _run_ieee754_tests(ctx)
         # FastLED #3021 Phase 1: --pin-toggle-rx runs the SCT-RX
         # loopback bench instead of the default echo bring-up.
         if getattr(ctx.args, "pin_toggle_rx", False):
             return await _run_lpc_pin_toggle_rx_tests(ctx)
         # FastLED #3021 Phase 2: --ws2812-loopback runs the WS2812
-        # byte-match loopback bench. Requires the sketch to be
-        # rebuilt with -DFASTLED_LPC_RX_SCT_WS2812=1 (gated due to
-        # flash budget — see issue #3002).
+        # byte-match loopback bench. LPC845 low-memory builds bind the
+        # required RPC automatically from the platform predicate.
         if getattr(ctx.args, "ws2812_loopback", False):
+            if final_environment not in LPC_WS2812_ENVS:
+                print(
+                    "--ws2812-loopback is only supported on LPC845 boards "
+                    "(lpc845brk, lpc845, lpcxpresso845max)."
+                )
+                return 1
             return await _run_lpc_ws2812_loopback_tests(ctx)
+        # FastLED #3468: --pwm-dma-cl runs the channels-API SCT+DMA
+        # clockless engine self-loopback. Sibling of --ws2812-loopback
+        # but exercises `ChannelEngineLpcSctDma` (channels-API path)
+        # rather than the legacy `ClocklessController` template.
+        if getattr(ctx.args, "pwm_dma_cl", False):
+            if final_environment not in LPC_WS2812_ENVS:
+                print(
+                    "--pwm-dma-cl is only supported on LPC845 boards "
+                    "(lpc845brk, lpc845, lpcxpresso845max)."
+                )
+                return 1
+            if getattr(ctx.args, "ws2812_loopback", False):
+                print(
+                    "--pwm-dma-cl and --ws2812-loopback are mutually "
+                    "exclusive: both target the SCT peripheral."
+                )
+                return 1
+            if getattr(ctx.args, "dma_spi", False):
+                print(
+                    "--pwm-dma-cl and --dma-spi are mutually exclusive: "
+                    "both claim DMA0 channels and the LowMemory flash "
+                    "budget doesn't fit both."
+                )
+                return 1
+            return await _run_lpc_pwm_dma_cl_tests(ctx)
+        # FastLED #3456: --dma-spi runs the SPI+DMA async driver bench.
+        # Phase 1 of the #3453 bring-up. LPC845 only (LPC804 has no DMA
+        # peripheral — see agents/docs/peripheral-existence.md).
+        if getattr(ctx.args, "dma_spi", False):
+            if final_environment not in LPC_DMA_SPI_ENVS:
+                print(
+                    "--dma-spi is only supported on LPC845 boards "
+                    "(lpc845brk, lpc845, lpcxpresso845max). LPC804 has "
+                    "no DMA peripheral."
+                )
+                return 1
+            return await _run_lpc_dma_spi_tests(ctx)
+        # FastLED #3611: on LPC845, --uart runs the end-to-end UART DMA
+        # clockless loopback through the normal FastLED LED API.
+        if getattr(ctx.args, "uart", False) and final_environment in LPC_WS2812_ENVS:
+            if getattr(ctx.args, "dma_spi", False) or getattr(
+                ctx.args, "pwm_dma_cl", False
+            ):
+                print(
+                    "--uart is mutually exclusive with --dma-spi / "
+                    "--pwm-dma-cl on LPC845 (LowMemory flash budget fits "
+                    "one bench)."
+                )
+                return 1
+            return await _run_lpc_uart_clockless_tests(ctx)
+        # #3453 follow-up: --dma-uart runs the async UART TX bench.
+        if getattr(ctx.args, "dma_uart", False):
+            if final_environment not in LPC_DMA_SPI_ENVS:
+                print(
+                    "--dma-uart is only supported on LPC845 boards "
+                    "(lpc845brk, lpc845, lpcxpresso845max)."
+                )
+                return 1
+            if getattr(ctx.args, "dma_spi", False) or getattr(
+                ctx.args, "pwm_dma_cl", False
+            ):
+                print(
+                    "--dma-uart is mutually exclusive with --dma-spi / "
+                    "--pwm-dma-cl (LowMemory flash budget fits one bench)."
+                )
+                return 1
+            return await _run_lpc_uart_dma_tests(ctx)
+        if getattr(ctx.args, "test_fault_emit", False):
+            if final_environment not in LPC_WS2812_ENVS:
+                print(
+                    "--test-fault-emit is only supported on LPC845 boards "
+                    "(lpc845brk, lpc845, lpcxpresso845max)."
+                )
+                return 1
+            return await _run_lpc_fault_emit_tests(ctx)
         return await _run_bring_up_tests(ctx)
 
     # GPIO-only mode
@@ -1268,6 +2730,34 @@ async def _run_tests_or_special_mode(ctx: RunContext, qctx: QuietContext) -> int
     net_server_mode = ctx.net_server_mode
     net_client_mode = ctx.net_client_mode
     net_loopback_mode = ctx.net_loopback_mode
+
+    if ctx.net_peer_mode:
+        if ctx.ota_mode:
+            from ci.autoresearch.ota import run_ota_peer_autoresearch
+
+            peer_upload_port = ctx.args.peer_upload_port
+            assert peer_upload_port is not None
+            if ctx.final_environment is None or ctx.build_driver is None:
+                raise RuntimeError("Peer OTA firmware path is unavailable")
+            return await run_ota_peer_autoresearch(
+                upload_port=upload_port,
+                peer_upload_port=peer_upload_port,
+                serial_iface=serial_iface,
+                firmware_path=ctx.build_driver.firmware_path(
+                    ctx.build_dir, ctx.final_environment
+                ),
+                timeout=ctx.remaining_seconds(),
+            )
+        from ci.autoresearch.net import run_net_peer_autoresearch
+
+        peer_upload_port = ctx.args.peer_upload_port
+        assert peer_upload_port is not None
+        return await run_net_peer_autoresearch(
+            upload_port=upload_port,
+            peer_upload_port=peer_upload_port,
+            serial_iface=serial_iface,
+            timeout=ctx.remaining_seconds(),
+        )
 
     if (net_server_mode or net_client_mode) and ctx.final_environment:
         if not environment_has_wifi(ctx.final_environment):
@@ -1335,11 +2825,538 @@ async def _run_tests_or_special_mode(ctx: RunContext, qctx: QuietContext) -> int
     if ctx.coroutine_test_mode:
         return await _run_coroutine_tests(ctx)
 
+    # IEEE 754 codec test mode
+    if ctx.ieee754_test_mode:
+        return await _run_ieee754_tests(ctx)
+
+    if ctx.math_test_mode:
+        return await _run_math_tests(ctx)
+
+    if ctx.fft_test_mode:
+        return await _run_fft_tests(ctx)
+
+    if ctx.mp3_test_mode:
+        return await _run_mp3_tests(ctx)
+
+    # Wave2D perf benchmark mode (#3113 Task 1 / #3122 A1)
+    if ctx.perf_wave2d_grid is not None:
+        return await _run_perf_wave2d_tests(ctx)
+
     # (LPC bring-up mode short-circuits earlier — see the gpio_only_mode
     # block above; reached only by ESP32/Teensy-class targets.)
 
     # Main RPC test execution
     return await _run_rpc_tests(ctx, qctx)
+
+
+async def _run_perf_wave2d_tests(ctx: RunContext) -> int:
+    """Run the Wave2D perf benchmark via RPC chain.
+
+    Implements meta #3113 Task 1 host side. Wires the device-side
+    wave2dPerf + perfProbe* RPCs (#3116, #3118, refactored to live
+    behind fl::wave_perf::* in #3120) into a single host-driven
+    measurement pass.
+
+    Sequence per platform:
+      1. perfProbeMemcpy — verify SRAM throughput vs vendor floor.
+      2. perfProbeNop    — verify cycle-time consistency.
+      3. perfProbeRepeat — verify wave2dPerf is reproducible
+                           (std_dev_pct < 5%).
+      4. wave2dPerf x 4  — { FivePoint, NinePointIsotropic } x
+                           { compute, loads_only }.
+         The loads_only/compute gap separates memory from compute cost.
+
+    If any probe in 1-3 fails, results are stamped UNTRUSTED in the
+    output. (Cf. issue #3124 for the planned --perf-XX flag-rename.)
+    """
+    assert ctx.perf_wave2d_grid is not None
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+    serial_iface = ctx.serial_iface
+    grid_w, grid_h = ctx.perf_wave2d_grid
+
+    print()
+    print("=" * 60)
+    print(f"WAVE2D PERF — {grid_w}x{grid_h}")
+    print("=" * 60)
+    print()
+
+    client: RpcClient | None = None
+    untrusted_reasons: list[str] = []
+    results: dict[str, Any] = {
+        "grid": [grid_w, grid_h],
+        "probes": {},
+        "bench": {},
+        "untrusted": False,
+        "untrusted_reasons": untrusted_reasons,
+    }
+    try:
+        print("   Connecting to device...", end="", flush=True)
+        client = RpcClient(upload_port, timeout=30.0, serial_interface=serial_iface)
+        await client.connect(boot_wait=1.0)
+        print(f" {Fore.GREEN}ok{Style.RESET_ALL}")
+
+        # --- Probe 1: memcpy throughput ----------------------------------
+        print("   perfProbeMemcpy (4096 bytes x 1000 iters)...", end="", flush=True)
+        memcpy_resp = await client.send_and_match(
+            "perfProbeMemcpy",
+            args=[{"bytes": 4096, "iterations": 1000}],
+            match_key="success",
+            retries=2,
+        )
+        memcpy_data = memcpy_resp.data
+        memcpy_mb_per_s = float(memcpy_data.get("mb_per_s", 0.0))
+        results["probes"]["memcpy"] = memcpy_data
+        print(f" {Fore.GREEN}{memcpy_mb_per_s:.1f} MB/s{Style.RESET_ALL}")
+
+        # --- Probe 2: nop cycle calibration ------------------------------
+        print("   perfProbeNop (100k iters)...", end="", flush=True)
+        nop_resp = await client.send_and_match(
+            "perfProbeNop",
+            args=[{"iterations": 100000}],
+            match_key="success",
+            retries=2,
+        )
+        nop_data = nop_resp.data
+        us_per_iter = float(nop_data.get("us_per_iter", 0.0))
+        results["probes"]["nop"] = nop_data
+        print(f" {Fore.GREEN}{us_per_iter:.4f} us/iter{Style.RESET_ALL}")
+
+        # --- Probe 3: wave2dPerf repeat-stability ------------------------
+        print(
+            f"   perfProbeRepeat ({grid_w}x{grid_h}, 50 iters x 8 repeats)...",
+            end="",
+            flush=True,
+        )
+        repeat_resp = await client.send_and_match(
+            "perfProbeRepeat",
+            args=[
+                {
+                    "W": grid_w,
+                    "H": grid_h,
+                    "iterations": 50,
+                    "repeats": 8,
+                    "stencil": "FivePoint",
+                }
+            ],
+            match_key="success",
+            retries=2,
+        )
+        repeat_data = repeat_resp.data
+        std_dev_pct = float(repeat_data.get("std_dev_pct", 100.0))
+        results["probes"]["repeat"] = repeat_data
+        if std_dev_pct >= 5.0:
+            untrusted_reasons.append(
+                f"perfProbeRepeat std_dev_pct={std_dev_pct:.2f} >= 5.0"
+            )
+            print(
+                f" {Fore.YELLOW}{std_dev_pct:.2f}% (UNTRUSTED >= 5%){Style.RESET_ALL}"
+            )
+        else:
+            print(f" {Fore.GREEN}{std_dev_pct:.2f}% (stable){Style.RESET_ALL}")
+
+        # --- Main benchmark: wave2dPerf across 2 stencils x 2 modes ------
+        print()
+        print("   wave2dPerf:")
+        for stencil in ("FivePoint", "NinePointIsotropic"):
+            for loads_only in (False, True):
+                label = (
+                    f"     {stencil} {'(loads_only)' if loads_only else '(compute)'}"
+                )
+                print(f"{label} ...", end="", flush=True)
+                bench_resp = await client.send_and_match(
+                    "wave2dPerf",
+                    args=[
+                        {
+                            "W": grid_w,
+                            "H": grid_h,
+                            "iterations": 100,
+                            "stencil": stencil,
+                            "loads_only": loads_only,
+                        }
+                    ],
+                    match_key="success",
+                    retries=2,
+                )
+                bench_data = bench_resp.data
+                us_per_cell = float(bench_data.get("us_per_cell_per_update", 0.0))
+                fps = float(bench_data.get("fps_at_one_update_per_frame", 0.0))
+                key = f"{stencil.lower()}_{'loads_only' if loads_only else 'compute'}"
+                results["bench"][key] = bench_data
+                print(
+                    f" {Fore.GREEN}{us_per_cell:.4f} us/cell, "
+                    f"{fps:.0f} fps{Style.RESET_ALL}"
+                )
+
+        if untrusted_reasons:
+            results["untrusted"] = True
+            print()
+            print(f"{Fore.YELLOW}*** RESULTS STAMPED UNTRUSTED ***{Style.RESET_ALL}")
+            for reason in untrusted_reasons:
+                print(f"   - {reason}")
+
+        print()
+        print("--- JSON ---")
+        print(json.dumps(results, indent=2))
+        print()
+        return 0
+
+    except RpcTimeoutError:
+        print()
+        print(f"{Fore.RED}WAVE2D PERF TIMEOUT{Style.RESET_ALL}")
+        return 1
+    except KeyboardInterrupt as ki:
+        handle_keyboard_interrupt(ki)
+        raise
+    except Exception as e:
+        print()
+        print(f"{Fore.RED}WAVE2D PERF ERROR: {e}{Style.RESET_ALL}")
+        return 1
+    finally:
+        if client is not None:
+            await client.close()
+
+
+async def _run_fft_tests(ctx: RunContext) -> int:
+    """CQ_OCTAVE per-frame time and heap on device (#4540)."""
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+    serial_iface = ctx.serial_iface
+
+    print()
+    print("=" * 60)
+    print("FFT BENCH MODE: CQ_OCTAVE per-frame cost")
+    print("=" * 60)
+    print()
+
+    configs = [(512, 16), (512, 64), (512, 128)]
+    client: RpcClient | None = None
+    failed = False
+    try:
+        print("   Connecting to device...", end="", flush=True)
+        client = RpcClient(upload_port, timeout=60.0, serial_interface=serial_iface)
+        await client.connect(boot_wait=1.0, drain_boot=True)
+        print(f" {Fore.GREEN}ok{Style.RESET_ALL}")
+        print()
+        print(
+            f"   {'samples/bands':<14} {'first us':>10} {'warm us':>10}"
+            f" {'heap used':>10} {'warm growth':>12} {'checksum':>12}"
+        )
+        for samples, bands in configs:
+            response = await client.send_and_match(
+                "fftCqOctaveBench",
+                args=[{"samples": samples, "bands": bands, "frames": 50}],
+                match_key="success",
+                retries=2,
+            )
+            data = response.data
+            if not data.get("success", False):
+                print(f"   {samples}/{bands}: {Fore.RED}FAILED{Style.RESET_ALL} {data}")
+                failed = True
+                continue
+            used = int(data["heap_before"]) - int(data["heap_after_first"])
+            growth = int(data["heap_after_first"]) - int(data["heap_after_warm"])
+            print(
+                f"   {f'{samples}/{bands}':<14} {int(data['first_frame_us']):>10}"
+                f" {float(data['warm_frame_us']):>10.1f} {used:>10} {growth:>12}"
+                f" {float(data['checksum']):>12.1f}"
+            )
+            print(f"FFT_BENCH_JSON {json.dumps(data, sort_keys=True)}")
+    finally:
+        if client is not None:
+            await client.close()
+    print()
+    if failed:
+        print(f"{Fore.RED}FFT BENCH FAILED{Style.RESET_ALL}")
+        return 1
+    print(f"{Fore.GREEN}FFT BENCH COMPLETE{Style.RESET_ALL}")
+    return 0
+
+
+async def _run_math_tests(ctx: RunContext) -> int:
+    """fl::exp accuracy and speed against the toolchain libm, on device (#4288)."""
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+    serial_iface = ctx.serial_iface
+
+    print()
+    print("=" * 60)
+    print("MATH BENCH MODE: fl::exp vs libm")
+    print("=" * 60)
+    print()
+
+    client: RpcClient | None = None
+    try:
+        print("   Connecting to device...", end="", flush=True)
+        client = RpcClient(upload_port, timeout=60.0, serial_interface=serial_iface)
+        await client.connect(boot_wait=1.0, drain_boot=True)
+        print(f" {Fore.GREEN}ok{Style.RESET_ALL}")
+
+        print("   Sending mathExpBenchmark RPC...", end="", flush=True)
+        response = await client.send_and_match(
+            "mathExpBenchmark", match_key="success", retries=2
+        )
+        print(f" {Fore.GREEN}ok{Style.RESET_ALL}")
+        print()
+
+        data = response.data
+        print(json.dumps(data, indent=2))
+        print()
+
+        iters = max(int(data.get("iterations", 0)), 1)
+        rows = [
+            ("fl::expf", "fl_expf_us"),
+            ("libm expf", "libm_expf_us"),
+            ("fl::exp (double)", "fl_exp_us"),
+            ("libm exp (double)", "libm_exp_us"),
+        ]
+        print("   ns per call:")
+        for label, key in rows:
+            us = float(data.get(key, 0))
+            print(f"     {label:<18} {1000.0 * us / iters:8.1f}")
+        print(
+            f"   worst error: {float(data.get('worst_ulp_float', 0)):.2f} ulp (float),"
+            f" {float(data.get('worst_ulp_double', 0)):.2f} ulp (double)"
+            f" over {int(data.get('accuracy_points', 0))} points"
+        )
+        print()
+
+        if data.get("success", False):
+            print(
+                f"{Fore.GREEN}MATH BENCH PASSED (fl::exp within 2 ulp of libm){Style.RESET_ALL}"
+            )
+            return 0
+        print(
+            f"{Fore.RED}MATH BENCH FAILED (fl::exp error exceeds 2 ulp){Style.RESET_ALL}"
+        )
+        return 1
+
+    except RpcTimeoutError:
+        print()
+        print(f"{Fore.RED}MATH BENCH TIMEOUT{Style.RESET_ALL}")
+        return 1
+    except KeyboardInterrupt as ki:
+        handle_keyboard_interrupt(ki)
+        raise
+    except Exception as e:
+        print()
+        print(f"{Fore.RED}MATH BENCH ERROR: {e}{Style.RESET_ALL}")
+        return 1
+    finally:
+        if client is not None:
+            await client.close()
+
+
+async def _run_ieee754_tests(ctx: RunContext) -> int:
+    """Run integer IEEE 754 decimal codec verification via RPC."""
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+    serial_iface = ctx.serial_iface
+
+    print()
+    print("=" * 60)
+    print("IEEE754 CODEC TEST MODE")
+    print("=" * 60)
+    print()
+
+    client: RpcClient | None = None
+    try:
+        print("   Connecting to device...", end="", flush=True)
+        client = RpcClient(upload_port, timeout=30.0, serial_interface=serial_iface)
+        await client.connect(boot_wait=1.0, drain_boot=True)
+        print(f" {Fore.GREEN}ok{Style.RESET_ALL}")
+
+        print("   Sending ieee754CodecTest RPC...", end="", flush=True)
+        response = await client.send_and_match(
+            "ieee754CodecTest", match_key="success", retries=3
+        )
+        print(f" {Fore.GREEN}ok{Style.RESET_ALL}")
+        print()
+
+        data = response.data
+        tests_run = int(data.get("tests_run", 0))
+        tests_failed = int(data.get("tests_failed", 0))
+        first_failure = str(data.get("first_failure", ""))
+        expected_bits = int(data.get("expected_bits", 0))
+        actual_bits = int(data.get("actual_bits", 0))
+
+        print(json.dumps(data, indent=2))
+        print()
+
+        if data.get("success", False) and tests_failed == 0 and tests_run > 0:
+            print(
+                f"{Fore.GREEN}IEEE754 CODEC TEST PASSED ({tests_run} checks){Style.RESET_ALL}"
+            )
+            return 0
+
+        print(
+            f"{Fore.RED}IEEE754 CODEC TEST FAILED"
+            f" ({tests_failed}/{tests_run} failures){Style.RESET_ALL}"
+        )
+        if first_failure:
+            print(
+                f"   first_failure={first_failure} "
+                f"expected=0x{expected_bits:08x} actual=0x{actual_bits:08x}"
+            )
+        return 1
+
+    except RpcTimeoutError:
+        print()
+        print(f"{Fore.RED}IEEE754 CODEC TEST TIMEOUT{Style.RESET_ALL}")
+        print("   No response from device within 30 seconds")
+        return 1
+    except KeyboardInterrupt as ki:
+        handle_keyboard_interrupt(ki)
+        raise
+    except Exception as e:
+        print()
+        print(f"{Fore.RED}IEEE754 CODEC TEST ERROR: {e}{Style.RESET_ALL}")
+        return 1
+    finally:
+        if client is not None:
+            await client.close()
+
+
+async def _run_mp3_tests(ctx: RunContext) -> int:
+    """Verify the fixed-point MP3 decoder on hardware, bit for bit."""
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+    serial_iface = ctx.serial_iface
+
+    print()
+    print("=" * 60)
+    print("MP3 CODEC TEST MODE")
+    print("=" * 60)
+    print()
+
+    # 60s is ample -- the decode itself measures ~311 ms on an ESP32-C6 -- but a
+    # user who asked for a shorter --timeout meant it, so take the smaller of
+    # the two rather than letting three retries run past their own deadline.
+    rpc_timeout = 60.0
+    if ctx.timeout_seconds:
+        rpc_timeout = min(rpc_timeout, float(ctx.timeout_seconds))
+
+    client: RpcClient | None = None
+    try:
+        print("   Connecting to device...", end="", flush=True)
+        client = RpcClient(
+            upload_port, timeout=rpc_timeout, serial_interface=serial_iface
+        )
+        await client.connect(boot_wait=1.0, drain_boot=True)
+        print(f" {Fore.GREEN}ok{Style.RESET_ALL}")
+
+        print("   Sending mp3CodecTest RPC...", end="", flush=True)
+        response = await client.send_and_match(
+            "mp3CodecTest", match_key="success", retries=3
+        )
+        print(f" {Fore.GREEN}ok{Style.RESET_ALL}")
+        print()
+
+        data = response.data
+        streams_run = int(data.get("streams_run", 0))
+        streams_failed = int(data.get("streams_failed", 0))
+        first_failure = str(data.get("first_failure", ""))
+        expected = int(data.get("expected_fnv1a", 0)) & 0xFFFFFFFF
+        actual = int(data.get("actual_fnv1a", 0)) & 0xFFFFFFFF
+        expected_samples = int(data.get("expected_samples", 0))
+        actual_samples = int(data.get("actual_samples", 0))
+        shared_ok = bool(data.get("shared_decoder_matched", False))
+
+        print(json.dumps(data, indent=2))
+        print()
+
+        if (
+            data.get("success", False)
+            and streams_failed == 0
+            and streams_run > 0
+            and shared_ok
+        ):
+            micros = int(data.get("decode_micros", 0))
+            samples = int(data.get("samples_decoded", 0))
+            frames = int(data.get("frames_decoded", 0))
+            combined = int(data.get("combined_fnv1a", 0)) & 0xFFFFFFFF
+            # Say what was actually decoded. A pass that reports only zeros is
+            # indistinguishable from a pass that decoded nothing at all.
+            if samples == 0 or frames == 0:
+                print(
+                    f"{Fore.RED}MP3 CODEC TEST INCONCLUSIVE: device reported "
+                    f"success but decoded {frames} frames / {samples} samples"
+                    f"{Style.RESET_ALL}"
+                )
+                return 1
+            audio = int(data.get("audio_micros", 0))
+            verify = int(data.get("verify_micros", 0))
+            # decode_micros and the frame/sample counts share a scope (the
+            # first pass); the shared-decoder pass is reported separately.
+            # Printing the real-time ratio rather than raw microseconds is the
+            # point: 310 ms means nothing until you know it covers 235 ms of
+            # audio, and on a 160 MHz part the margin is not comfortable.
+            ratio = (audio / micros) if micros else 0.0
+            print(
+                f"{Fore.GREEN}MP3 CODEC TEST PASSED "
+                f"({streams_run} streams, {frames} frames, {samples} samples, "
+                f"combined_fnv1a=0x{combined:08x}, bit-exact)"
+                f"{Style.RESET_ALL}"
+            )
+            print(
+                f"   decode {micros} us for {audio} us of audio"
+                f" -> {ratio:.2f}x real time"
+                f"{'' if ratio >= 1.0 else '  <-- SLOWER THAN REAL TIME'}"
+            )
+            print(f"   shared-decoder verification pass: {verify} us")
+            if ratio < 1.0:
+                # Printing this and returning success made the one result that
+                # matters advisory: a decoder that cannot keep up with playback
+                # has failed on this part, whatever its checksum says.
+                print(
+                    f"{Fore.RED}   the decoder cannot keep up with playback on "
+                    f"this part{Style.RESET_ALL}"
+                )
+                print(
+                    f"{Fore.RED}MP3 CODEC TEST FAILED"
+                    f" (decode is {ratio:.2f}x real time){Style.RESET_ALL}"
+                )
+                return 1
+            return 0
+
+        print(
+            f"{Fore.RED}MP3 CODEC TEST FAILED"
+            f" ({streams_failed}/{streams_run} streams){Style.RESET_ALL}"
+        )
+        if not shared_ok:
+            # The two members of the scratch union were live at once, or the
+            # struct is packed differently here than on the host.
+            print(
+                "   shared-decoder pass differed: a stream decoded differently "
+                "when another layer had used the same scratch arena "
+                "(FastLED#4116)"
+            )
+        if first_failure:
+            print(
+                f"   first_failure={first_failure} "
+                f"expected_fnv1a=0x{expected:08x} actual_fnv1a=0x{actual:08x}"
+            )
+            print(
+                f"   expected_samples={expected_samples} "
+                f"actual_samples={actual_samples}"
+            )
+        return 1
+
+    except RpcTimeoutError:
+        print()
+        print(f"{Fore.RED}MP3 CODEC TEST TIMEOUT{Style.RESET_ALL}")
+        print(f"   No response from device within {rpc_timeout:g} seconds")
+        return 1
+    except KeyboardInterrupt as ki:
+        handle_keyboard_interrupt(ki)
+        raise
+    except Exception as e:
+        print()
+        print(f"{Fore.RED}MP3 CODEC TEST ERROR: {e}{Style.RESET_ALL}")
+        return 1
+    finally:
+        if client is not None:
+            await client.close()
 
 
 async def _run_simd_tests(ctx: RunContext) -> int:
@@ -1425,27 +3442,24 @@ async def _run_simd_tests(ctx: RunContext) -> int:
             await client.close()
 
 
-def _build_and_flash_nxplpc(
+def _build_and_deploy_nxplpc(
     build_dir: Path,
     *,
     environment: str | None,
     upload_port: str | None,
     verbose: bool,
 ) -> bool:
-    """Build via `fbuild build`, then flash + sw-reset via pyocd.
+    """Build + deploy the LPC8xx bring-up firmware exclusively via fbuild.
 
-    fbuild's nxplpc orchestrator does not yet implement a deployer
-    (daemon/handlers/operations/deploy.rs only wires avr/teensy). Until that
-    lands as an upstream fbuild PR, we run the build phase via fbuild and the
-    flash/reset phase via pyocd here. The pyocd path is identical to the
-    manual bring-up workflow used during initial LPC845 hardware validation.
+    autoresearch DOES NOT invoke flash tools (pyocd/lpc21isp/etc.) directly.
+    Deployment is fbuild's job — see agents/docs/build-system.md. The nxplpc
+    deployer (LpcDeployer, lpc21isp UART ISP path) shipped in
+    FastLED/fbuild#595 and was refined in FastLED/fbuild#923 / #928.
+    If a pinned fbuild predates that, this function fails loudly with a
+    pointer to the fbuild issues tracker. DO NOT re-introduce a
+    pyocd/lpc21isp fallback here; fix it in fbuild.
     """
-    import shutil
-
     env = dict(os.environ)
-    # The pinned ArduinoCore-LPC8xx commit only stripped the GitHub-archive
-    # wrapping dir in fbuild >= 2.2.27. The bundled venv fbuild was bumped to
-    # match; assume the user's PATH-resolved binary is current.
 
     print("\n📦 Building firmware via fbuild...")
     build_cmd = [
@@ -1456,7 +3470,7 @@ def _build_and_flash_nxplpc(
     ]
     if verbose:
         build_cmd.append("--verbose")
-    result = subprocess.run(build_cmd, env=env, cwd=str(build_dir))
+    result = RunningProcess.run(build_cmd, env=env, cwd=str(build_dir))
     if result.returncode != 0:
         print(
             f"{Fore.RED}❌ fbuild build failed (exit {result.returncode}){Style.RESET_ALL}"
@@ -1475,51 +3489,37 @@ def _build_and_flash_nxplpc(
         print(f"{Fore.RED}❌ firmware.bin not found at {firmware_bin}{Style.RESET_ALL}")
         return False
 
-    pyocd = shutil.which("pyocd")
-    if pyocd is None:
-        # Fall back to uv-run pyocd (installed on demand). The bring-up
-        # workflow already used this pattern.
-        pyocd_cmd_prefix = ["uv", "run", "--with", "pyocd", "pyocd"]
-    else:
-        pyocd_cmd_prefix = [pyocd]
-
-    print("\n📡 Flashing firmware via pyocd...")
-    target = "lpc845" if "lpc845" in (environment or "") else "lpc804"
-    load_cmd = pyocd_cmd_prefix + [
-        "load",
-        "--target",
-        target,
-        "--no-reset",
-        str(firmware_bin),
+    print("\n📡 Deploying firmware via fbuild...")
+    deploy_cmd = [
+        "fbuild",
+        "deploy",
+        "--environment",
+        environment or "lpc845brk",
     ]
-    result = subprocess.run(load_cmd, env=env)
+    if upload_port:
+        deploy_cmd += ["--port", upload_port]
+    if verbose:
+        deploy_cmd.append("--verbose")
+    result = RunningProcess.run(deploy_cmd, env=env, cwd=str(build_dir))
     if result.returncode != 0:
         print(
-            f"{Fore.RED}❌ pyocd load failed (exit {result.returncode}){Style.RESET_ALL}"
+            f"{Fore.RED}❌ fbuild deploy failed (exit {result.returncode}){Style.RESET_ALL}"
+        )
+        print(
+            f"{Fore.YELLOW}   Deployment is fbuild's responsibility. "
+            f"Do not add a pyocd/lpc21isp fallback here.{Style.RESET_ALL}"
+        )
+        print(
+            f"{Fore.YELLOW}   nxplpc deployer landed in fbuild#595 "
+            f"(refined in #923, #928). If your pinned fbuild predates "
+            f"those, bump it. Report new gaps at{Style.RESET_ALL}"
+        )
+        print(
+            f"{Fore.YELLOW}   https://github.com/FastLED/fbuild/issues{Style.RESET_ALL}"
         )
         return False
 
-    print("\n🔄 Resetting target via pyocd (sw reset, VCOM-safe)...")
-    reset_cmd = pyocd_cmd_prefix + [
-        "commander",
-        "--target",
-        target,
-        "-O",
-        "reset_type=sw",
-        "-c",
-        "reset",
-        "-c",
-        "go",
-        "-c",
-        "quit",
-    ]
-    result = subprocess.run(reset_cmd, env=env)
-    if result.returncode != 0:
-        print(
-            f"{Fore.YELLOW}⚠️  pyocd reset returned {result.returncode}; continuing{Style.RESET_ALL}"
-        )
-
-    print(f"{Fore.GREEN}✓ Build + flash + reset complete{Style.RESET_ALL}\n")
+    print(f"{Fore.GREEN}✓ Build + deploy complete{Style.RESET_ALL}\n")
     return True
 
 
@@ -1549,19 +3549,26 @@ async def _run_bring_up_tests(ctx: RunContext) -> int:
     print("=" * 60)
     print()
 
-    import serial as _serial  # local — avoid top-level import in this hot path
+    # Device serial via fbuild's Rust monitor (never raw pyserial — see
+    # agents/docs/hardware-autoresearch.md "Device serial"). This is a raw
+    # line-inspection check (echo round-trip + the FL_WARN handler marker),
+    # so it drives the SerialInterface write/read_lines directly rather than
+    # the RPC-oriented RpcBench. reset_device() asserts DTR/RTS = "host
+    # ready", which the LPC845-BRK's LPC11U35 USB-VCOM bridge requires as a
+    # flow gate (hardcoding it False previously dropped every LPC845 byte —
+    # the "zero bytes" false alarm under FastLED #3300 / #3325).
+    from ci.util.serial_interface import create_serial_interface
 
     sentinel = 4242
-    ser = None
+    iface = None
     try:
-        print("   Opening serial port...", end="", flush=True)
-        ser = _serial.Serial(upload_port, 115200, timeout=2)
-        ser.dtr = False  # type: ignore[assignment]
-        ser.rts = False  # type: ignore[assignment]
-        await asyncio.sleep(0.5)
-        ser.reset_input_buffer()
-        await asyncio.sleep(2.0)  # let boot banner drain
-        ser.reset_input_buffer()
+        print("   Connecting serial (fbuild Rust monitor)...", end="", flush=True)
+        iface = create_serial_interface(upload_port)
+        await iface.connect()
+        await iface.reset_device(None)
+        # Drain the boot banner.
+        async for _line in iface.read_lines(timeout=2.0):
+            pass
         print(f" {Fore.GREEN}ok{Style.RESET_ALL}")
 
         req = (
@@ -1570,43 +3577,34 @@ async def _run_bring_up_tests(ctx: RunContext) -> int:
             + '],"id":1}\n'
         )
         print(f"   TX: {req.strip()}", flush=True)
-        ser.write(req.encode())
-        ser.flush()
+        await iface.write(req)
 
-        # Collect for up to 5 seconds or until we see a complete REMOTE: line
+        # Collect for up to 5 seconds or until we see the echo reply.
         deadline = time.monotonic() + 5.0
-        accumulated = b""
+        accumulated = ""
         while time.monotonic() < deadline:
-            await asyncio.sleep(0.2)
-            if ser.in_waiting:
-                accumulated += ser.read(ser.in_waiting)
-                if (
-                    b'"result":' in accumulated
-                    and b"\r\n" in accumulated
-                    and b"REMOTE:" in accumulated
-                ):
-                    break
+            async for line in iface.read_lines(timeout=1.0):
+                accumulated += line + "\n"
+            if '"result":' in accumulated and "REMOTE:" in accumulated:
+                break
 
         print(f"   RX: {accumulated!r}", flush=True)
         print()
 
         # Look for the echo result
-        result_token = f'"result":{sentinel}'.encode()
-        echo_ok = result_token in accumulated
+        echo_ok = f'"result":{sentinel}' in accumulated
         # Look for the FL_DBG line from fl::Remote (only present when
         # FASTLED_FORCE_DBG or LARGE_MEMORY — bonus signal, not required)
-        dbg_token = b"Stored request ID for echo"
-        log_ok = dbg_token in accumulated
+        log_ok = "Stored request ID for echo" in accumulated
         # Look for the FL_WARN_LIT marker the bring-up sketch emits from
         # inside the `echo` handler. Setup-time FL_WARN_LITs are emitted
         # too, but the boot-banner drain above clears them — this token
         # fires per-request and survives the drain. Works on Low-memory
         # targets (FastLED #3002) because FL_WARN_LIT routes through
         # fl::println(const char*) without the sstream/log_emit machinery.
-        warn_token = b"FL_WARN: echo invoked"
-        warn_ok = warn_token in accumulated
+        warn_ok = "FL_WARN: echo invoked" in accumulated
         # Look for the REMOTE: prefix proving Serial.println via the sink
-        remote_ok = b"REMOTE: " in accumulated
+        remote_ok = "REMOTE: " in accumulated
 
         passed = echo_ok and remote_ok and warn_ok
         if passed:
@@ -1649,8 +3647,139 @@ async def _run_bring_up_tests(ctx: RunContext) -> int:
         print(f"{Fore.RED}BRING-UP TEST ERROR: {e}{Style.RESET_ALL}")
         return 1
     finally:
-        if ser is not None:
-            ser.close()
+        if iface is not None:
+            await iface.close()
+
+
+async def _run_lpc_fault_emit_tests(ctx: RunContext) -> int:
+    """Run FastLED #3302 intentional-fault diagnostic validation."""
+
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+    build_dir = ctx.build_dir
+    final_environment = (ctx.final_environment or "lpc845").lower()
+    build_environment = _build_environment_for_mode(ctx) or final_environment
+
+    print()
+    print("=" * 60)
+    print("LPC845 FAULT-EMIT MODE — intentional OOM + stack fault (#3302)")
+    print("=" * 60)
+    print("   Firmware flag: -DFASTLED_AUTORESEARCH_FAULT_TEST=1")
+    print("   Expected: each trigger emits FAULT diagnostics before reset")
+    print()
+
+    async def trigger_and_capture(method: str) -> tuple[bool, str]:
+        from ci.util.serial_interface import create_serial_interface
+
+        iface = create_serial_interface(upload_port)
+        lines: list[str] = []
+        try:
+            print(f"   Connecting serial for {method}...", end="", flush=True)
+            await iface.connect()
+            await iface.reset_device(None)
+            async for _line in iface.read_lines(timeout=2.0):
+                pass
+            print(f" {Fore.GREEN}ok{Style.RESET_ALL}")
+
+            request = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "method": method, "params": [], "id": 1},
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            print(f"   TX: {request.strip()}", flush=True)
+            await iface.write(request)
+
+            deadline = time.monotonic() + 8.0
+            saw_fault = False
+            saw_normal_result = False
+            while time.monotonic() < deadline:
+                async for line in iface.read_lines(timeout=0.5):
+                    lines.append(line)
+                    if "FAULT:" in line:
+                        saw_fault = True
+                    if "REMOTE:" in line and '"result"' in line:
+                        saw_normal_result = True
+                if saw_fault or saw_normal_result:
+                    break
+
+            output = "\n".join(lines)
+            print(f"   RX: {output!r}", flush=True)
+            if saw_normal_result:
+                print(
+                    f"   {Fore.RED}FAIL{Style.RESET_ALL} - {method} returned "
+                    "normally instead of faulting"
+                )
+                return False, output
+            if saw_fault:
+                print(f"   {Fore.GREEN}PASS{Style.RESET_ALL} - {method} emitted FAULT")
+                return True, output
+            print(f"   {Fore.RED}FAIL{Style.RESET_ALL} - {method} did not emit FAULT")
+            return False, output
+        finally:
+            try:
+                await iface.close()
+            except KeyboardInterrupt as ki:
+                handle_keyboard_interrupt(ki)
+                raise
+            except Exception as e:
+                print(
+                    f"   {Fore.YELLOW}WARN{Style.RESET_ALL} - serial close "
+                    f"after {method} fault raised: {e}"
+                )
+
+    results: list[tuple[str, bool, str]] = []
+    for index, method in enumerate(("trigger_oom", "trigger_stackblow")):
+        if index > 0:
+            print()
+            print("   Re-flashing fresh fault-test firmware before next trigger...")
+            if not _build_and_deploy_nxplpc(
+                build_dir,
+                environment=build_environment,
+                upload_port=upload_port,
+                verbose=ctx.args.verbose,
+            ):
+                return 1
+        ok, output = await trigger_and_capture(method)
+        results.append((method, ok, output))
+        if not ok:
+            print()
+            print(f"{Fore.RED}FAULT-EMIT TEST FAILED{Style.RESET_ALL}")
+            return 1
+
+    print()
+    print("=" * 60)
+    print(f"{Fore.GREEN}PASS - #3302 fault emit validation confirmed.{Style.RESET_ALL}")
+    for method, _ok, output in results:
+        first_fault = next(
+            (line for line in output.splitlines() if "FAULT:" in line),
+            "<missing>",
+        )
+        print(f"   {method}: {first_fault}")
+    print("=" * 60)
+    return 0
+
+
+async def _release_harness_port(ctx: RunContext) -> None:
+    """Close the harness's serial interface before a child bench opens the port.
+
+    FastLED#4207: a second client on a port this process already holds
+    connects without error and then answers nothing, so the child would
+    report a liveness/schema failure against healthy firmware. The benches
+    that call this are terminal for their mode (the dispatcher returns their
+    result directly), so the harness no longer needs the port.
+    """
+    if ctx.serial_iface is None:
+        return
+    try:
+        await ctx.serial_iface.close()
+    except KeyboardInterrupt as ki:
+        handle_keyboard_interrupt(ki)
+        raise
+    except Exception as exc:  # noqa: BLE001 - teardown must not mask the test
+        print(f"   (warning: releasing harness serial interface: {exc})")
+    ctx.serial_iface = None
 
 
 async def _run_lpc_pin_toggle_rx_tests(ctx: RunContext) -> int:
@@ -1658,9 +3787,8 @@ async def _run_lpc_pin_toggle_rx_tests(ctx: RunContext) -> int:
 
     Delegates to `ci/autoresearch/test_lpc_pin_toggle_rx.py` so the
     bench logic stays in one place (the script is also runnable
-    stand-alone for ad-hoc bring-up). Uses `subprocess` to keep the
-    pyserial dependency contained to the script — the autoresearch
-    runner itself stays import-free of `serial`.
+    stand-alone for ad-hoc bring-up). The script talks to the device
+    through fbuild's Rust serial monitor (RpcBench), never raw pyserial.
     """
     upload_port = ctx.upload_port
     assert upload_port is not None
@@ -1675,11 +3803,13 @@ async def _run_lpc_pin_toggle_rx_tests(ctx: RunContext) -> int:
     print("=" * 60)
     print()
 
+    await _release_harness_port(ctx)
     cmd = [
         "uv",
         "run",
         "python",
-        "ci/autoresearch/test_lpc_pin_toggle_rx.py",
+        "-m",
+        "ci.autoresearch.test_lpc_pin_toggle_rx",
         "--port",
         upload_port,
         "--tx-pin",
@@ -1687,22 +3817,25 @@ async def _run_lpc_pin_toggle_rx_tests(ctx: RunContext) -> int:
         "--rx-pin",
         str(rx_pin),
     ]
-    result = subprocess.run(cmd)
+    result = RunningProcess.run(cmd)
     return 0 if result.returncode == 0 else 1
 
 
 async def _run_lpc_ws2812_loopback_tests(ctx: RunContext) -> int:
     """Run the FastLED #3021 Phase-2 SCT-RX WS2812 byte-match bench.
 
-    Delegates to `ci/autoresearch/test_lpc_ws2812_loopback.py`. The
-    sketch must be built with `-DFASTLED_LPC_RX_SCT_WS2812=1` for the
-    `ws2812SctTest` RPC to be bound — without that flag the RPC is
-    absent from the sketch's `fl::Remote` registry and the orchestrator
-    will report `no response` for every test case. This is by design:
-    the WS2812 driver pulls in `<FastLED.h>` which overflows the
-    LPC845 64 KB flash budget until #3002 (fl::json soft-FP cleanup)
-    lands.
+    Delegates to `ci/autoresearch/test_lpc_ws2812_loopback.py`. LPC845
+    low-memory builds bind `ws2812SctTest` automatically from the platform
+    predicate; no manual WS2812 build flag is required.
     """
+    final_environment = (ctx.final_environment or "").lower()
+    if final_environment not in LPC_WS2812_ENVS:
+        print(
+            "--ws2812-loopback is only supported on LPC845 boards "
+            "(lpc845brk, lpc845, lpcxpresso845max)."
+        )
+        return 1
+
     upload_port = ctx.upload_port
     assert upload_port is not None
 
@@ -1713,15 +3846,17 @@ async def _run_lpc_ws2812_loopback_tests(ctx: RunContext) -> int:
     print("=" * 60)
     print("LPC SCT-RX MODE — WS2812 byte-match loopback (#3021 Phase 2)")
     print(f"   Wiring required: jumper P0_{tx_pin} ↔ P0_{rx_pin} on LPC845-BRK")
-    print("   Sketch must be built with -DFASTLED_LPC_RX_SCT_WS2812=1")
+    print("   ws2812SctTest RPC is platform-enabled on LPC845 builds")
     print("=" * 60)
     print()
 
+    await _release_harness_port(ctx)
     cmd = [
         "uv",
         "run",
         "python",
-        "ci/autoresearch/test_lpc_ws2812_loopback.py",
+        "-m",
+        "ci.autoresearch.test_lpc_ws2812_loopback",
         "--port",
         upload_port,
         "--tx-pin",
@@ -1729,8 +3864,357 @@ async def _run_lpc_ws2812_loopback_tests(ctx: RunContext) -> int:
         "--rx-pin",
         str(rx_pin),
     ]
-    result = subprocess.run(cmd)
+    result = RunningProcess.run(cmd)
     return 0 if result.returncode == 0 else 1
+
+
+async def _run_lpc_pwm_dma_cl_tests(ctx: RunContext) -> int:
+    """Run the FastLED #3468 SCT+DMA channels-API clockless bench.
+
+    Sibling of `_run_lpc_ws2812_loopback_tests`, but exercises the new
+    `ChannelEngineLpcSctDma` engine (channels-API path) instead of the
+    legacy `ClocklessController` template. LPC845 low-memory builds
+    bind the `pwmDmaClFrameOnce` / `pwmDmaClFrameBurst` /
+    `pwmDmaClCaptureSelf` handlers automatically when
+    `FASTLED_LPC_PWM_DMA` is set at compile time — this phase driver
+    injects that macro via `build_flags` before delegating to the
+    test runner.
+    """
+    final_environment = (ctx.final_environment or "").lower()
+    if final_environment not in LPC_WS2812_ENVS:
+        print(
+            "--pwm-dma-cl is only supported on LPC845 boards "
+            "(lpc845brk, lpc845, lpcxpresso845max)."
+        )
+        return 1
+
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+
+    tx_pin = ctx.args.tx_pin if ctx.args.tx_pin is not None else 10
+    rx_pin = ctx.args.rx_pin if ctx.args.rx_pin is not None else 11
+
+    print()
+    print("=" * 60)
+    print("LPC SCT+DMA channels-API MODE — self-loopback (#3468)")
+    print(f"   Wiring required: jumper P0_{tx_pin} ↔ P0_{rx_pin} on LPC845-BRK")
+    print("   Engine: ChannelEngineLpcSctDma via BusTraits<Bus::BIT_BANG>")
+    print("   Build flag: -DFASTLED_LPC_PWM_DMA=1 (see")
+    print("   examples/AutoResearch/AutoResearchPwmDmaClockless.h)")
+    print("=" * 60)
+    print()
+
+    await _release_harness_port(ctx)
+    cmd = [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "ci.autoresearch.test_lpc_pwm_dma_cl",
+        "--port",
+        upload_port,
+        "--tx-pin",
+        str(tx_pin),
+        "--rx-pin",
+        str(rx_pin),
+    ]
+    result = RunningProcess.run(cmd)
+    return 0 if result.returncode == 0 else 1
+
+
+async def _run_lpc_dma_spi_tests(ctx: RunContext) -> int:
+    """Run the FastLED #3456 SPI+DMA async driver bench.
+
+    Sibling of `_run_lpc_pwm_dma_cl_tests`, but exercises the LPC845
+    `ARMHardwareSPIOutputDMA<>` driver from `spi_arm_lpc_dma.h`.
+    Phase 1 of the #3453 bench bring-up series. LPC845 low-memory
+    builds bind the `dmaSpiTransferOnce` / `dmaSpiTransferOverlap` /
+    `dmaSpiMeasureSck` handlers automatically when `FASTLED_LPC_SPI_DMA`
+    is set at compile time — this phase driver expects that flag to
+    already be present in `build_flags`.
+
+    Compile-time build flag: `-DFASTLED_LPC_SPI_DMA=1` (optionally
+    combined with `-DFASTLED_LPC_SPI_DMA_CHANNEL=13` for SPI1). See
+    `examples/AutoResearch/AutoResearchSpiDma.h`.
+    """
+    final_environment = (ctx.final_environment or "").lower()
+    if final_environment not in LPC_DMA_SPI_ENVS:
+        print(
+            "--dma-spi is only supported on LPC845 boards "
+            "(lpc845brk, lpc845, lpcxpresso845max). LPC804 has no DMA "
+            "peripheral (see agents/docs/peripheral-existence.md)."
+        )
+        return 1
+
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+
+    # LPC845 F_CPU = 24 MHz. The Python runner uses this to center the
+    # SCK measurement band.
+    core_hz = 24_000_000
+
+    print()
+    print("=" * 60)
+    print("LPC845 SPI+DMA async driver bench — #3456 (Phase 1 of #3453)")
+    print(f"   Target: {final_environment} (core_hz={core_hz})")
+    print(
+        "   Driver: ARMHardwareSPIOutputDMA<> (src/platforms/arm/lpc/spi_arm_lpc_dma.h)"
+    )
+    print("   Build flag: -DFASTLED_LPC_SPI_DMA=1 (see")
+    print("   examples/AutoResearch/AutoResearchSpiDma.h)")
+    print("   Optional: -DFASTLED_LPC_SPI_DMA_CHANNEL=13 (SPI1; SPI0=11 default)")
+    print("   Wiring: no jumper required for transferOnce/Overlap timing;")
+    print("   SCK measurement is wall-clock derived, not SCT-captured.")
+    print("=" * 60)
+    print()
+
+    await _release_harness_port(ctx)
+    cmd = [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "ci.autoresearch.test_lpc_dma_spi",
+        "--port",
+        upload_port,
+        "--core-hz",
+        str(core_hz),
+    ]
+    result = RunningProcess.run(cmd)
+    return 0 if result.returncode == 0 else 1
+
+
+async def _run_rp_spi_loopback_tests(ctx: RunContext) -> int:
+    """Run byte-exact loopback through the RP fixed-SPI channel engine."""
+    final_environment = (ctx.final_environment or "").lower()
+    active_environment = _active_rp2xxx_environment(final_environment)
+    if active_environment is None:
+        print("--rp-spi-loopback requires an RP2040 or RP2350 environment.")
+        return 1
+    chip_name = "RP2350" if active_environment in RP2350_ENVIRONMENTS else "RP2040"
+
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+    spi_index = ctx.args.rp_spi_index
+    default_tx_pin = 3 if spi_index == 0 else 11
+    default_rx_pin = 0 if spi_index == 0 else 8
+    sck_pin = 2 if spi_index == 0 else 10
+    tx_pin = ctx.args.tx_pin if ctx.args.tx_pin is not None else default_tx_pin
+    rx_pin = ctx.args.rx_pin if ctx.args.rx_pin is not None else default_rx_pin
+    print()
+    print("=" * 60)
+    print(f"{chip_name} fixed-SPI DMA byte-loopback")
+    print(
+        f"   Wiring: GPIO{tx_pin} (SPI{spi_index} MOSI) -> GPIO{rx_pin} (SPI{spi_index} MISO)"
+    )
+    print(
+        f"   SCK: GPIO{sck_pin} (SPI{spi_index}); no SCK loopback connection is required"
+    )
+    print(f"   Engine: ChannelEngineRpSpi via BusTraits<Bus::SPI, {spi_index}>")
+    print("   Rates: 1 MHz, 8 MHz, 24 MHz; byte-exact MISO capture + wire-idle")
+    print("=" * 60)
+    print()
+    await _release_harness_port(ctx)
+
+    cmd = [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "ci.autoresearch.test_rp_spi_loopback",
+        "--port",
+        upload_port,
+        "--mosi-pin",
+        str(tx_pin),
+        "--miso-pin",
+        str(rx_pin),
+        "--spi-index",
+        str(spi_index),
+    ]
+    result = RunningProcess.run(
+        cmd,
+        check=False,
+        timeout=ctx.remaining_seconds(),
+    )
+    return 0 if result.returncode == 0 else 1
+
+
+async def _run_rp_spi_public_api_tests(ctx: RunContext) -> int:
+    """Verify APA102/SK9822 framing through the RP SPI1 public API path."""
+    active_environment = _active_rp2xxx_environment(ctx.final_environment)
+    if active_environment is None:
+        print("--rp-spi-public-api requires an RP2040 or RP2350 environment.")
+        return 1
+    chip_name = "RP2350" if active_environment in RP2350_ENVIRONMENTS else "RP2040"
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+    print(
+        f"{chip_name} SPI1 public API loopback: GPIO11 MOSI -> GPIO8 MISO, GPIO10 SCK"
+    )
+
+    # FastLED#4207, same as the loopback phase above: the child opens its own
+    # RpcBench on this port, and a second client on a port we already hold
+    # connects fine and then answers nothing. Confirmed on an RP2350W --
+    # without this the child reported
+    # "FAIL — rpSpiPublicApiLoopback dispatch result: None" while the harness's
+    # own schema fetch in the same run succeeded. This phase is terminal, so
+    # release the interface before handing the port over.
+    if ctx.serial_iface is not None:
+        try:
+            await ctx.serial_iface.close()
+        except KeyboardInterrupt as ki:
+            handle_keyboard_interrupt(ki)
+            raise
+        except Exception as exc:  # noqa: BLE001 - teardown must not mask the test
+            print(f"   (warning: releasing harness serial interface: {exc})")
+        ctx.serial_iface = None
+
+    result = RunningProcess.run(
+        [
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "ci.autoresearch.test_rp_spi_public_api",
+            "--port",
+            upload_port,
+            "--chipset",
+            ctx.args.rp_spi_chipset,
+        ],
+        check=False,
+        timeout=ctx.remaining_seconds(),
+    )
+    return 0 if result.returncode == 0 else 1
+
+
+async def _run_lpc_uart_clockless_tests(ctx: RunContext) -> int:
+    """Run the FastLED #3611 UART DMA clockless loopback bench."""
+    final_environment = (ctx.final_environment or "").lower()
+    if final_environment not in LPC_WS2812_ENVS:
+        print(
+            "--uart clockless loopback is only supported on LPC845 boards "
+            "(lpc845brk, lpc845, lpcxpresso845max)."
+        )
+        return 1
+
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+
+    tx_pin = ctx.args.tx_pin if ctx.args.tx_pin is not None else 10
+    rx_pin = ctx.args.rx_pin if ctx.args.rx_pin is not None else 11
+
+    print()
+    print("=" * 60)
+    print("LPC845 UART DMA clockless MODE - RX-DMA loopback (#3611)")
+    print(f"   Wiring required: jumper P0_{tx_pin} -> P0_{rx_pin} on LPC845-BRK")
+    print("   API: FastLED.addLeds<WS2812, PIN, GRB>() + FastLED.show()")
+    print("   Driver: ChannelEngineLpcUartDma via Bus::UART / Bus::AUTO")
+    print("   Verifier: USART TX-DMA on the data pin, USART RX-DMA on --rx-pin")
+    print("   Build flags: -DFASTLED_LPC_UART_DMA=1 -DFASTLED_LPC_DMA_ISR=1")
+    print("=" * 60)
+    print()
+
+    cmd = [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "ci.autoresearch.test_lpc_uart_clockless",
+        "--port",
+        upload_port,
+        "--tx-pin",
+        str(tx_pin),
+        "--rx-pin",
+        str(rx_pin),
+    ]
+    result = RunningProcess.run(cmd)
+    return 0 if result.returncode == 0 else 1
+
+
+async def _run_lpc_uart_dma_tests(ctx: RunContext) -> int:
+    """Run the #3453 follow-up async UART TX bench.
+
+    Exercises `ARMHardwareUARTOutputDMA<>` (USART1 TX + DMA0 channel 3,
+    ISR chunk chaining via the lpc_dma_isr.h hub) on real silicon while
+    USART0 keeps serving the RPC console. LPC845 low-memory builds bind
+    the `uartDmaStreamOnce` / `uartDmaStreamOverlap` handlers when
+    `FASTLED_LPC_UART_DMA` is set at compile time (injected by the
+    `--dma-uart` flag together with `FASTLED_LPC_DMA_ISR=1`).
+
+    Requires the ACLPC core with named weak IRQ vector slots
+    (framework-arduino-lpc8xx#38) — on older cores the ISR chain stalls
+    after the first 1024-byte descriptor and the bench reports a
+    register-snapshot timeout instead of wedging.
+    """
+    final_environment = (ctx.final_environment or "").lower()
+    if final_environment not in LPC_DMA_SPI_ENVS:
+        print(
+            "--dma-uart is only supported on LPC845 boards "
+            "(lpc845brk, lpc845, lpcxpresso845max)."
+        )
+        return 1
+
+    upload_port = ctx.upload_port
+    assert upload_port is not None
+
+    baud = 1_000_000  # matches FASTLED_LPC_UART_DMA_HARNESS_BAUD default
+
+    print()
+    print("=" * 60)
+    print("LPC845 async UART TX bench — #3453 follow-up (ISR chunk chain)")
+    print(f"   Target: {final_environment} (USART1 @ {baud} baud, DMA0 ch3)")
+    print("   Driver: ARMHardwareUARTOutputDMA<>")
+    print("   Build flags: -DFASTLED_LPC_UART_DMA=1 -DFASTLED_LPC_DMA_ISR=1")
+    print("   Console: USART0 stays live throughout (that's the point).")
+    print("=" * 60)
+    print()
+
+    cmd = [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "ci.autoresearch.test_lpc_uart_dma",
+        "--port",
+        upload_port,
+        "--baud-wire",
+        str(baud),
+    ]
+    result = RunningProcess.run(cmd)
+    return 0 if result.returncode == 0 else 1
+
+
+# Exit status for `--coroutine` when the device reports no real coroutine
+# backend. Distinct from 0 (every test passed) and from 1 (a test failed),
+# because "the capability is absent" is neither. Returning 0 here is what let
+# RP2xxx record a passing coroutine criterion in #3832 while running zero
+# tests -- a criterion that cannot fail is not evidence, and a regression in a
+# real backend would look identical to this. No CI workflow invokes
+# `--coroutine`; it is a bench acceptance criterion, which is exactly where a
+# vacuous pass does its damage.
+kCoroutineUnsupportedExit = 2
+
+
+def coroutine_exit_code(response: RpcResponse | dict[str, Any]) -> int:
+    """Map a ``testCoroutineAll`` RPC response to a process exit status.
+
+    Three outcomes, three codes, because collapsing the first two is the
+    defect this exists to prevent:
+
+    * ``kCoroutineUnsupportedExit`` -- the device has no real coroutine
+      backend, so it ran no test and nothing here can regress.
+    * ``1`` -- tests ran and at least one failed.
+    * ``0`` -- tests ran and all passed.
+
+    ``supported`` and ``success`` both default to the optimistic value so an
+    older firmware that omits them is read the way it was written, not
+    reported as broken.
+    """
+    if response.get("supported", True) is False:
+        return kCoroutineUnsupportedExit
+    if response.get("success", False):
+        return 0
+    return 1
 
 
 async def _run_coroutine_tests(ctx: RunContext) -> int:
@@ -1759,6 +4243,24 @@ async def _run_coroutine_tests(ctx: RunContext) -> int:
         print(f" {Fore.GREEN}ok{Style.RESET_ALL}")
         print()
 
+        exit_code = coroutine_exit_code(response)
+
+        if exit_code == kCoroutineUnsupportedExit:
+            backend = response.get("backend", "unknown")
+            reason = response.get("reason", "no real coroutine backend")
+            print(
+                f"{Fore.YELLOW}RESULT: COROUTINE UNSUPPORTED"
+                f" (backend={backend}): {reason}{Style.RESET_ALL}"
+            )
+            print(
+                f"{Fore.YELLOW}Not a pass: the device ran no coroutine test at"
+                f" all, so nothing here can regress visibly. Exiting"
+                f" {kCoroutineUnsupportedExit}"
+                f" (unsupported), distinct from 1 (tests failed)."
+                f"{Style.RESET_ALL}"
+            )
+            return kCoroutineUnsupportedExit
+
         total = response.get("total", 0)
         passed_count = response.get("passed", 0)
         failed_count = response.get("failed", 0)
@@ -1785,15 +4287,14 @@ async def _run_coroutine_tests(ctx: RunContext) -> int:
                         print(f"          {test_result['error']}")
 
         print()
-        if response.get("success", False):
+        if exit_code == 0:
             print(f"{Fore.GREEN}COROUTINE TEST PASSED ({total} tests){Style.RESET_ALL}")
-            return 0
         else:
             print(
                 f"{Fore.RED}COROUTINE TEST FAILED"
                 f" ({failed_count}/{total} failures){Style.RESET_ALL}"
             )
-            return 1
+        return exit_code
 
     except RpcTimeoutError:
         print()
@@ -1810,6 +4311,464 @@ async def _run_coroutine_tests(ctx: RunContext) -> int:
     finally:
         if client is not None:
             await client.close()
+
+
+_TEST_RPC_METHODS = frozenset({"runSingleTest", "runParallelTest"})
+
+
+def _is_plain_int(value: Any) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _expected_test_drivers(method: str, cmd: dict[str, Any]) -> list[str]:
+    params = cmd.get("params")
+    if not isinstance(params, dict):
+        return []
+
+    if method == "runSingleTest":
+        driver = params.get("driver")
+        return [driver] if isinstance(driver, str) and driver else []
+
+    if method == "runParallelTest":
+        drivers = params.get("drivers")
+        if not isinstance(drivers, list):
+            return []
+        expected: list[str] = []
+        for entry in drivers:
+            if isinstance(entry, dict):
+                driver = entry.get("driver")
+                if isinstance(driver, str) and driver:
+                    expected.append(driver)
+        return expected
+
+    return []
+
+
+def _actual_test_drivers(method: str, data: dict[str, Any]) -> list[str]:
+    if method == "runSingleTest":
+        driver = data.get("driver")
+        return [driver] if isinstance(driver, str) and driver else []
+
+    if method == "runParallelTest":
+        drivers = data.get("drivers")
+        if not isinstance(drivers, list):
+            return []
+        actual: list[str] = []
+        for entry in drivers:
+            if isinstance(entry, dict):
+                driver = entry.get("driver")
+                if isinstance(driver, str) and driver:
+                    actual.append(driver)
+        return actual
+
+    return []
+
+
+def _set_pins_rpc_command(tx_pin: int, rx_pin: int) -> dict[str, Any]:
+    return {"method": "setPins", "params": [{"txPin": tx_pin, "rxPin": rx_pin}]}
+
+
+def _expected_setup_pins(
+    method: str, cmd: dict[str, Any]
+) -> tuple[int | None, int | None]:
+    params = cmd.get("params")
+    if method == "setPins":
+        if (
+            isinstance(params, list)
+            and len(params) == 1
+            and isinstance(params[0], dict)
+        ):
+            tx_pin = params[0].get("txPin")
+            rx_pin = params[0].get("rxPin")
+            return (
+                tx_pin if _is_plain_int(tx_pin) else None,
+                rx_pin if _is_plain_int(rx_pin) else None,
+            )
+        if isinstance(params, list) and len(params) == 2:
+            tx_pin, rx_pin = params
+            return (
+                tx_pin if _is_plain_int(tx_pin) else None,
+                rx_pin if _is_plain_int(rx_pin) else None,
+            )
+        return None, None
+
+    if not isinstance(params, list) or len(params) != 1:
+        return None, None
+
+    pin = params[0]
+    if not _is_plain_int(pin):
+        return None, None
+
+    if method == "setTxPin":
+        return pin, None
+    if method == "setRxPin":
+        return None, pin
+    return None, None
+
+
+def _validate_setup_rpc_response(
+    method: str, cmd: dict[str, Any], data: dict[str, Any]
+) -> list[str]:
+    """Return validation errors for setup RPCs that must not drift silently."""
+    errors: list[str] = []
+    expected_tx_pin, expected_rx_pin = _expected_setup_pins(method, cmd)
+
+    for field, expected in (
+        ("txPin", expected_tx_pin),
+        ("rxPin", expected_rx_pin),
+    ):
+        if expected is None:
+            continue
+        value = data.get(field)
+        if not _is_plain_int(value):
+            errors.append(f"missing integer {field}")
+        elif value != expected:
+            errors.append(f"{field}={value} does not match expected {expected}")
+
+    return errors
+
+
+def _ensure_leading_set_pins_command(ctx: RunContext) -> None:
+    if ctx.effective_tx_pin is None or ctx.effective_rx_pin is None:
+        return
+
+    set_pins_cmd = _set_pins_rpc_command(ctx.effective_tx_pin, ctx.effective_rx_pin)
+    if ctx.json_rpc_commands and ctx.json_rpc_commands[0].get("method") == "setPins":
+        ctx.json_rpc_commands[0] = set_pins_cmd
+        return
+    ctx.json_rpc_commands.insert(0, set_pins_cmd)
+
+
+def _expected_test_pins(
+    method: str,
+    cmd: dict[str, Any],
+    default_tx_pin: int | None,
+    default_rx_pin: int | None,
+) -> tuple[int | None, int | None]:
+    params = cmd.get("params")
+    if not isinstance(params, dict):
+        return default_tx_pin, default_rx_pin
+
+    if method == "runParallelTest":
+        drivers = params.get("drivers")
+        if isinstance(drivers, list) and drivers and isinstance(drivers[0], dict):
+            tx_pin = drivers[0].get("pinTx")
+            if _is_plain_int(tx_pin):
+                return tx_pin, default_rx_pin
+        return default_tx_pin, default_rx_pin
+
+    tx_pin = params.get("pinTx")
+    rx_pin = params.get("pinRx")
+    return (
+        tx_pin if _is_plain_int(tx_pin) else default_tx_pin,
+        rx_pin if _is_plain_int(rx_pin) else default_rx_pin,
+    )
+
+
+def _validate_test_rpc_response(
+    method: str,
+    cmd: dict[str, Any],
+    data: dict[str, Any],
+    expected_tx_pin: int | None,
+    expected_rx_pin: int | None,
+) -> list[str]:
+    """Return validation errors that prevent a test RPC from proving PASS."""
+    errors: list[str] = []
+
+    if not isinstance(data.get("success"), bool):
+        errors.append("missing boolean success")
+    if not isinstance(data.get("passed"), bool):
+        errors.append("missing boolean passed")
+
+    rp_uart_fields = (
+        "rpUartStartAttempted",
+        "rpUartStartSucceeded",
+        "rpUartEncodedSize",
+        "rpUartActualBaud",
+        "rpUartLastError",
+    )
+    command_params = cmd.get("params")
+    expected_driver = (
+        command_params.get("driver") if isinstance(command_params, dict) else None
+    )
+    requires_rp_uart_diagnostics = method == "runSingleTest" and expected_driver in {
+        "UART0",
+        "UART1",
+    }
+    if requires_rp_uart_diagnostics or any(field in data for field in rp_uart_fields):
+        for field in ("rpUartStartAttempted", "rpUartStartSucceeded"):
+            if not isinstance(data.get(field), bool):
+                errors.append(f"{field} must be boolean")
+        for field in ("rpUartEncodedSize", "rpUartActualBaud"):
+            value = data.get(field)
+            if not _is_plain_int(value) or value < 0:
+                errors.append(f"{field} must be a nonnegative integer")
+        if not isinstance(data.get("rpUartLastError"), str):
+            errors.append("rpUartLastError must be a string")
+
+    total_tests = data.get("totalTests")
+    passed_tests = data.get("passedTests")
+    if not _is_plain_int(total_tests):
+        errors.append("missing integer totalTests")
+    elif total_tests <= 0:
+        errors.append("totalTests must be > 0")
+
+    if not _is_plain_int(passed_tests):
+        errors.append("missing integer passedTests")
+    elif _is_plain_int(total_tests):
+        if passed_tests < 0:
+            errors.append("passedTests must be >= 0")
+        if passed_tests > total_tests:
+            errors.append("passedTests must be <= totalTests")
+        if data.get("passed") is True and passed_tests != total_tests:
+            errors.append("passed=true requires passedTests == totalTests")
+
+    expected_drivers = _expected_test_drivers(method, cmd)
+    actual_drivers = _actual_test_drivers(method, data)
+    if not actual_drivers:
+        field = "driver" if method == "runSingleTest" else "drivers"
+        errors.append(f"missing selected {field}")
+    else:
+        for driver in expected_drivers:
+            if driver not in actual_drivers:
+                errors.append(f"missing expected driver {driver}")
+
+    params = cmd.get("params")
+    is_ws2814_legacy = (
+        method == "runSingleTest"
+        and isinstance(params, dict)
+        and params.get("useLegacyApi") is True
+        and isinstance(params.get("legacyChipsets"), list)
+        and bool(params["legacyChipsets"])
+        and params["legacyChipsets"][0] == "WS2814"
+    )
+    patterns = data.get("patterns")
+    if is_ws2814_legacy:
+        if not isinstance(patterns, list) or not patterns:
+            errors.append("WS2814 response requires a non-empty patterns list")
+        else:
+            for index, entry in enumerate(patterns):
+                if not isinstance(entry, dict):
+                    errors.append(f"patterns[{index}] must be an object for WS2814")
+                    continue
+                # `entry` comes off an untyped JSON payload; narrowing it with a
+                # bare `dict` leaves ty with dict[Never, Never], which rejects
+                # every string key. Re-state the payload shape explicitly.
+                pattern = cast("dict[str, Any]", entry)
+                total_leds = pattern.get("totalLeds")
+                total_bytes = pattern.get("totalBytes")
+                if not _is_plain_int(total_leds):
+                    errors.append(
+                        f"patterns[{index}] missing integer totalLeds for WS2814"
+                    )
+                    continue
+                expected_total_bytes = total_leds * 4
+                if not _is_plain_int(total_bytes):
+                    errors.append(
+                        f"patterns[{index}] missing integer totalBytes for WS2814"
+                    )
+                elif total_bytes != expected_total_bytes:
+                    errors.append(
+                        f"patterns[{index}].totalBytes={total_bytes} does not match "
+                        f"WS2814 expected {expected_total_bytes}"
+                    )
+
+    expected_tx_pin, expected_rx_pin = _expected_test_pins(
+        method, cmd, expected_tx_pin, expected_rx_pin
+    )
+    is_concurrent_resource_test = (
+        method == "runParallelTest"
+        and data.get("concurrent_resource_test") is True
+        and set(expected_drivers) == {"PIO0", "PIO1"}
+    )
+    if is_concurrent_resource_test and data.get("show_success") is not True:
+        errors.append("concurrent resource test requires show_success=true")
+    if is_concurrent_resource_test:
+        response_drivers = data.get("drivers")
+        if not isinstance(response_drivers, list):
+            errors.append("concurrent resource test requires driver entries")
+        else:
+            pins_by_driver: dict[str, int] = {}
+            for entry in response_drivers:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("driver")
+                pin_tx = entry.get("pinTx")
+                if isinstance(name, str) and _is_plain_int(pin_tx):
+                    pins_by_driver[name] = pin_tx
+            if set(pins_by_driver) != {"PIO0", "PIO1"}:
+                errors.append("concurrent resource test requires PIO0 and PIO1 TX pins")
+            elif pins_by_driver["PIO0"] == pins_by_driver["PIO1"]:
+                errors.append("concurrent resource test requires distinct PIO TX pins")
+    if expected_tx_pin is not None or expected_rx_pin is not None:
+        capture_backend = data.get("captureBackend")
+        if not isinstance(capture_backend, str) or not capture_backend:
+            errors.append("missing string captureBackend")
+        if data.get("passed") is True and not is_concurrent_resource_test:
+            capture_evidence_bytes = data.get("captureEvidenceBytes")
+            capture_evidence_raw_edges = data.get("captureEvidenceRawEdges")
+            has_capture_bytes = (
+                _is_plain_int(capture_evidence_bytes) and capture_evidence_bytes > 0
+            )
+            has_capture_edges = (
+                _is_plain_int(capture_evidence_raw_edges)
+                and capture_evidence_raw_edges > 0
+            )
+            if not has_capture_bytes and not has_capture_edges:
+                errors.append("passed test response requires nonzero capture evidence")
+
+    for field, expected in (
+        ("requestedTxPin", expected_tx_pin),
+        ("requestedRxPin", expected_rx_pin),
+        ("actualTxPin", expected_tx_pin),
+        ("actualRxPin", expected_rx_pin),
+    ):
+        if expected is None:
+            continue
+        value = data.get(field)
+        if not _is_plain_int(value):
+            errors.append(f"missing integer {field}")
+        elif expected is not None and value != expected:
+            errors.append(f"{field}={value} does not match expected {expected}")
+
+    return errors
+
+
+def _classify_test_failure(data: dict[str, Any]) -> tuple[str, str]:
+    """Classify a failed test response using structured RPC evidence."""
+    # Checked before any capture evidence, because a driver that never
+    # transmitted makes that evidence meaningless. The RP UART backend
+    # refuses a chipset whose bit period needs a baud above its maximum and
+    # reports why in `rpUartLastError`; classifying that as `zero_capture`
+    # ("RX produced no raw edges or decodable bytes") states the consequence
+    # and buries the cause, so a declined capability reads as a wiring or
+    # capture fault. FastLED#3899 requires an unreachable path to be listed
+    # with the exact constraint, which is what the driver already supplied.
+    if data.get("rpUartStartAttempted") is False:
+        reason = data.get("rpUartLastError")
+        if isinstance(reason, str) and reason:
+            return ("driver_declined", reason)
+        return (
+            "driver_declined",
+            "the driver did not attempt transmission and gave no reason",
+        )
+
+    patterns = data.get("patterns")
+    if isinstance(patterns, list) and patterns:
+        saw_pattern = False
+        saw_capture_bytes = False
+        saw_raw_edges = False
+        saw_mismatched_bytes = False
+        saw_capture_failure = False
+
+        for pattern in patterns:
+            if not isinstance(pattern, dict):
+                continue
+            saw_pattern = True
+            captured = pattern.get("capturedBytes")
+            raw_edges = pattern.get("rawEdgesAfterWait")
+            mismatched = pattern.get("mismatchedBytes")
+            if _is_plain_int(captured) and captured > 0:
+                saw_capture_bytes = True
+            if _is_plain_int(raw_edges) and raw_edges > 0:
+                saw_raw_edges = True
+            if _is_plain_int(mismatched) and mismatched > 0:
+                saw_mismatched_bytes = True
+            if pattern.get("captureFailed") is True:
+                saw_capture_failure = True
+
+        if saw_pattern:
+            if not saw_capture_bytes and not saw_raw_edges:
+                return (
+                    "zero_capture",
+                    "RX produced no raw edges or decodable bytes",
+                )
+            if saw_mismatched_bytes or saw_capture_failure:
+                return (
+                    "decode_mismatch",
+                    "RX captured signal/data but decoded output did not match",
+                )
+
+    evidence_bytes = data.get("captureEvidenceBytes")
+    evidence_edges = data.get("captureEvidenceRawEdges")
+    has_capture_bytes = _is_plain_int(evidence_bytes) and evidence_bytes > 0
+    has_capture_edges = _is_plain_int(evidence_edges) and evidence_edges > 0
+    if data.get("passed") is False:
+        if not has_capture_bytes and not has_capture_edges:
+            return ("zero_capture", "test failed with no positive capture evidence")
+        return ("decode_mismatch", "test failed despite positive capture evidence")
+
+    return ("test_failed", "test response reported failure")
+
+
+def _display_rp_uart_diagnostics(data: dict[str, Any]) -> None:
+    """Print the typed RP UART start evidence carried by runSingleTest."""
+    if "rpUartStartAttempted" not in data:
+        return
+    print(
+        "   RP UART: "
+        f"attempted={data['rpUartStartAttempted']} "
+        f"started={data.get('rpUartStartSucceeded')} "
+        f"encodedBytes={data.get('rpUartEncodedSize')} "
+        f"actualBaud={data.get('rpUartActualBaud')} "
+        f"lastError={data.get('rpUartLastError', '')!r}"
+    )
+
+
+async def _prune_to_device_drivers(
+    ctx: RunContext, client: RpcClient, qctx: QuietContext
+) -> bool:
+    """`--all` preflight: drop drivers the firmware does not register.
+
+    Returns False after reporting the failure (timeout, crash, or nothing
+    left to run) the same way the test loop does, so the caller aborts.
+    """
+    try:
+        listed = (
+            await client.send(
+                "drivers", args=[], timeout=ctx.remaining_seconds(minimum=1.0)
+            )
+        ).data
+    except RpcCrashError:
+        print(f"{Fore.RED}\u274c Device crashed during drivers(){Style.RESET_ALL}")
+        print("   Failure class: crash")
+        qctx.emit("FAILURE class=crash method=drivers")
+        return False
+    except RpcTimeoutError:
+        print(f"{Fore.RED}\u274c RPC timeout during drivers(){Style.RESET_ALL}")
+        print("   Failure class: timeout")
+        qctx.emit("FAILURE class=timeout method=drivers")
+        return False
+    if not isinstance(listed, list):
+        print(
+            f"{Fore.RED}\u274c drivers() returned a non-array result: "
+            f"{listed!r}{Style.RESET_ALL}"
+        )
+        print("   Failure class: malformed_response")
+        qctx.emit("FAILURE class=malformed_response method=drivers")
+        return False
+    available = {
+        entry["name"]
+        for entry in listed
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+    }
+    skipped = _prune_unavailable_drivers(ctx, available)
+    if skipped:
+        print(
+            f"\u23ed\ufe0f  --all: skipping drivers this firmware does not "
+            f"register: {', '.join(skipped)}"
+        )
+    if not any(
+        command.get("method") in _TEST_RPC_METHODS for command in ctx.json_rpc_commands
+    ):
+        print(
+            f"{Fore.RED}\u274c --all: no runnable test left after skipping "
+            f"unregistered drivers (device reports: "
+            f"{', '.join(sorted(available)) or 'none'}){Style.RESET_ALL}"
+        )
+        qctx.emit("FAILURE class=no_runnable_driver method=drivers")
+        return False
+    return True
 
 
 async def _run_rpc_tests(ctx: RunContext, qctx: QuietContext) -> int:
@@ -1852,54 +4811,43 @@ async def _run_rpc_tests(ctx: RunContext, qctx: QuietContext) -> int:
             await client.connect(boot_wait=1.0, drain_boot=True)
         print(f"{Fore.GREEN}\u2713 Connected{Style.RESET_ALL}")
 
+        if ctx.args.all and not await _prune_to_device_drivers(ctx, client, qctx):
+            test_failed = True
+            stop_word_found = "ERROR"
+        json_rpc_commands = ctx.json_rpc_commands
+
         print(f"\n\U0001f527 Executing {len(json_rpc_commands)} RPC command(s)...")
         print("\u2500" * 60)
 
-        for i, cmd in enumerate(json_rpc_commands, 1):
+        # A failed --all preflight already recorded its failure; run nothing.
+        for i, cmd in enumerate([] if test_failed else json_rpc_commands, 1):
             method = cmd.get("method", "unknown")
             params = cmd.get("params", [])
+            setup_method = method in {
+                "setPins",
+                "setTxPin",
+                "setRxPin",
+                "setLaneSizes",
+                "setSolidColor",
+            }
+            test_method = method in _TEST_RPC_METHODS
 
             print(f"\n[{i}/{len(json_rpc_commands)}] Calling {method}()...")
 
-            # Wrapper-side known-issue skip: synthesise a passing test_data
-            # without touching the device. This is used by the OBJECT_FLED-on-
-            # Teensy-4 substitution above (FastLED#3059 + #2772). The skipped
-            # marker survives the json_rpc_commands transformation because it
-            # gets set alongside `method`/`params` on the raw dict.
-            if cmd.get("__skip_with_pass"):
-                print(
-                    f"{Fore.YELLOW}⚠️  {cmd.get('__skip_reason', 'skipped')}"
-                    f"{Style.RESET_ALL}"
-                )
-                test_data: dict[str, Any] = {
-                    "success": True,
-                    "passed": True,
-                    "skipped": True,
-                    "driver": cmd.get("__skip_driver", "unknown"),
-                    "laneCount": 1,
-                    "laneSizes": cmd.get("__skip_lane_sizes", [0]),
-                    "duration_ms": 0,
-                    "pattern": "skipped",
-                    "totalTests": 0,
-                    "passedTests": 0,
-                    "skipReason": cmd.get("__skip_reason", "skipped"),
-                }
-                _driver = test_data["driver"]
-                _lanes = test_data["laneCount"]
-                _leds = sum(test_data["laneSizes"])
-                _dur = test_data["duration_ms"]
-                stop_word_found = "OK"
-                print(f"{Fore.GREEN}✅ Test passed (wrapper-skipped){Style.RESET_ALL}")
-                qctx.emit(
-                    f"TEST {_driver} lanes={_lanes} leds={_leds} PASS {_dur}ms (wrapper-skipped)"
-                )
-                continue
-
             try:
+                # Per-RPC budget = TIME REMAINING UNTIL ctx.deadline_epoch.
+                # `--timeout N` is a TOTAL wall-clock budget from the post-
+                # flash epoch (not a per-call value), so each call shrinks
+                # the remaining window. Previously this site hardcoded
+                # 120.0 (ignoring --timeout entirely) and PR #3219 first
+                # changed it to `ctx.timeout_seconds` (still per-call, not
+                # decrementing) -- both let runs blow well past the user's
+                # stated budget. The watchdog thread enforces a hard
+                # ceiling at `deadline_epoch + WATCHDOG_GRACE_SECONDS`.
                 response = await client.send(
                     method,
                     args=params if params else [],
-                    timeout=120.0,
+                    timeout=ctx.remaining_seconds(minimum=1.0),
                 )
 
                 test_data = response.data
@@ -1909,6 +4857,10 @@ async def _run_rpc_tests(ctx: RunContext, qctx: QuietContext) -> int:
                         f"{Fore.YELLOW}\u26a0\ufe0f  Unexpected response type: {type(test_data)}{Style.RESET_ALL}"
                     )
                     print(f"   Response: {test_data}")
+                    if test_method:
+                        test_failed = True
+                        stop_word_found = "ERROR"
+                        break
                     continue
 
                 _driver = test_data.get("driver", method)
@@ -1916,7 +4868,52 @@ async def _run_rpc_tests(ctx: RunContext, qctx: QuietContext) -> int:
                 _leds = sum(test_data.get("laneSizes", [0]))
                 _dur = test_data.get("duration_ms", "?")
 
-                if test_data.get("success") and test_data.get("passed"):
+                if test_data.get("success") is False or "error" in test_data:
+                    stop_word_found = "ERROR"
+                    test_failed = True
+                    print(f"{Fore.RED}\u274c RPC command failed{Style.RESET_ALL}")
+                    if "error" in test_data:
+                        print(f"   Error: {test_data['error']}")
+                    if "message" in test_data:
+                        print(f"   Message: {test_data['message']}")
+                    if setup_method:
+                        break
+
+                elif setup_method and (
+                    validation_errors := _validate_setup_rpc_response(
+                        method,
+                        cmd,
+                        test_data,
+                    )
+                ):
+                    stop_word_found = "ERROR"
+                    test_failed = True
+                    print(f"{Fore.RED}\u274c Setup response mismatch{Style.RESET_ALL}")
+                    print("   Failure class: pin_state_mismatch")
+                    for error in validation_errors:
+                        print(f"   - {error}")
+                    qctx.emit(f"FAILURE class=pin_state_mismatch method={method}")
+                    break
+
+                elif test_method and (
+                    validation_errors := _validate_test_rpc_response(
+                        method,
+                        cmd,
+                        test_data,
+                        ctx.effective_tx_pin,
+                        ctx.effective_rx_pin,
+                    )
+                ):
+                    stop_word_found = "ERROR"
+                    test_failed = True
+                    print(f"{Fore.RED}\u274c Malformed test response{Style.RESET_ALL}")
+                    print("   Failure class: malformed_response")
+                    for error in validation_errors:
+                        print(f"   - {error}")
+                    qctx.emit(f"FAILURE class=malformed_response method={method}")
+                    break
+
+                elif test_data.get("success") and test_data.get("passed"):
                     stop_word_found = "OK"
                     print(f"{Fore.GREEN}\u2705 Test passed{Style.RESET_ALL}")
                     qctx.emit(
@@ -1940,6 +4937,8 @@ async def _run_rpc_tests(ctx: RunContext, qctx: QuietContext) -> int:
                         print(f"   Duration: {duration_str}")
 
                     display_tight_timing(test_data)
+                    display_objectfled_diagnostics(test_data)
+                    _display_rp_uart_diagnostics(test_data)
 
                     if "drivers" in test_data and isinstance(
                         test_data["drivers"], list
@@ -1957,15 +4956,23 @@ async def _run_rpc_tests(ctx: RunContext, qctx: QuietContext) -> int:
                     if "patterns" in test_data:
                         display_pattern_details(test_data)
 
-                elif test_data.get("success") and not test_data.get("passed"):
+                elif (
+                    test_data.get("success")
+                    and "passed" in test_data
+                    and not test_data.get("passed")
+                ):
                     stop_word_found = "ERROR"
                     test_failed = True
+                    failure_class, failure_detail = _classify_test_failure(test_data)
                     print(f"{Fore.RED}\u274c Test failed{Style.RESET_ALL}")
+                    print(f"   Failure class: {failure_class}")
+                    print(f"   Detail: {failure_detail}")
                     _err_detail = ""
                     if "firstFailure" in test_data:
                         _err_detail = f" {test_data['firstFailure'].get('pattern', '')}"
                     qctx.emit(
-                        f"TEST {_driver} lanes={_lanes} leds={_leds} FAIL {_dur}ms{_err_detail}"
+                        f"TEST {_driver} lanes={_lanes} leds={_leds} FAIL {_dur}ms "
+                        f"class={failure_class}{_err_detail}"
                     )
 
                     if "firstFailure" in test_data:
@@ -1975,30 +4982,48 @@ async def _run_rpc_tests(ctx: RunContext, qctx: QuietContext) -> int:
                         print(f"   Expected: {failure.get('expected', 'unknown')}")
                         print(f"   Actual: {failure.get('actual', 'unknown')}")
 
+                    if "rpPioActive" in test_data:
+                        print(
+                            "   RP PIO: "
+                            f"active={test_data['rpPioActive']} "
+                            f"lastError={test_data.get('rpPioLastError', '')!r} "
+                            f"started={test_data.get('rpPioStartSucceeded')} "
+                            f"words={test_data.get('rpPioWordCount')}"
+                        )
+                        patterns = test_data.get("patterns")
+                        if isinstance(patterns, list) and patterns:
+                            first_pattern = patterns[0]
+                            if (
+                                isinstance(first_pattern, dict)
+                                and "rpPioGpioTransitions" in first_pattern
+                            ):
+                                print(
+                                    "   RP PIO GPIO transitions: "
+                                    f"{first_pattern['rpPioGpioTransitions']}"
+                                )
+
                     display_tight_timing(test_data)
+                    display_objectfled_diagnostics(test_data)
+                    _display_rp_uart_diagnostics(test_data)
 
                     if "patterns" in test_data:
                         display_pattern_details(test_data)
 
-                elif test_data.get("success") is False:
-                    stop_word_found = "ERROR"
-                    test_failed = True
-                    print(f"{Fore.RED}\u274c RPC command failed{Style.RESET_ALL}")
-                    if "error" in test_data:
-                        print(f"   Error: {test_data['error']}")
-
                 else:
-                    stop_word_found = "OK"
                     print(f"{Fore.GREEN}\u2713 Command completed{Style.RESET_ALL}")
                     if test_data:
                         print(f"   Response: {test_data}")
+                    if not setup_method:
+                        stop_word_found = "OK"
 
             except RpcCrashError as crash_err:
                 print(
                     f"{Fore.RED}\u274c Device crashed during {method}(){Style.RESET_ALL}"
                 )
+                print("   Failure class: crash")
                 if not crash_err.decoded_lines:
                     print("   (no decoded stack trace available)")
+                qctx.emit(f"FAILURE class=crash method={method}")
                 test_failed = True
                 stop_word_found = "ERROR"
                 break
@@ -2006,6 +5031,8 @@ async def _run_rpc_tests(ctx: RunContext, qctx: QuietContext) -> int:
             except RpcTimeoutError:
                 print(f"{Fore.RED}\u274c RPC timeout{Style.RESET_ALL}")
                 print(f"   No response within {120}s")
+                print("   Failure class: timeout")
+                qctx.emit(f"FAILURE class=timeout method={method}")
                 test_failed = True
                 stop_word_found = "ERROR"
                 break
@@ -2028,6 +5055,13 @@ async def _run_rpc_tests(ctx: RunContext, qctx: QuietContext) -> int:
         print(f"\n{Fore.RED}\u274c RPC client error: {e}{Style.RESET_ALL}")
         return 1
     finally:
+        # Grant the cleanup phase 10s of additional runway BUT keep the
+        # watchdog armed. If `await client.close()` itself wedges (which
+        # is the exact failure mode that motivated the watchdog), the
+        # force-kill still fires after deadline_epoch+10+grace. Per
+        # user spec 2026-06-22: never disarm the bomb, just give it
+        # more fuse when we're entering a known-slow phase.
+        extend_autoresearch_watchdog_deadline(ctx, 10.0)
         if client is not None:
             await client.close()
             print(f"\n\u2705 RPC connection closed")

@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
-"""Four-phase device workflow: Package Install → Lint → Compile → Upload+Monitor.
+"""Three-phase device workflow: Lint → Deploy → Monitor.
 
 ⚠️ NOTE FOR AI AGENTS: For live device testing, prefer 'bash autoresearch' which provides
 a complete hardware autoresearch framework. This script is for advanced/custom workflows.
 
-This script orchestrates a complete device development workflow in four distinct phases:
-
-Phase 0: Package Installation (GLOBAL SINGLETON LOCK via daemon)
-    - Ensures PlatformIO packages are installed using `pio pkg install -e <environment>`
-    - Uses singleton daemon to serialize package installations globally
-    - Lock scope: System-wide (~/.platformio/packages/ shared by all projects)
-    - Daemon survives agent termination and completes installation atomically
-    - Fast path: ~3.8s autoresearch when packages already installed
-    - Prevents corruption from concurrent package downloads
+This script orchestrates a complete device development workflow in three distinct phases.
+fbuild fetches toolchains and frameworks itself during `fbuild deploy`, so there is no
+separate package-installation step.
 
 Phase 1: Linting (C++ linting only - catches ISR errors)
     - Runs C++ linting to catch ISR errors before compilation
@@ -20,14 +14,9 @@ Phase 1: Linting (C++ linting only - catches ISR errors)
     - Enforces namespace, include, and code style rules
     - Can be skipped with --skip-lint flag for faster iteration
 
-Phase 2: Compile (NO LOCK - parallelizable)
-    - Builds the staged project for the target environment with fbuild
-    - No lock needed: Each project has isolated build directory
-    - Packages already installed, so no downloads triggered
-    - Multiple agents can compile different projects simultaneously
-
-Phase 3: Upload
-    - Uploads firmware to the attached device using fbuild
+Phases 2-3: Build + Upload
+    - Deploys the staged project for the target environment with fbuild
+    - Lets fbuild's board registry select the port when none is explicit
     - fbuild only rebuilds when source files or build inputs changed
     - Blocks if daemon indicates resource is busy
 
@@ -74,7 +63,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -83,7 +71,7 @@ from typing import Any
 
 from colorama import Fore, Style, init
 from fbuild.api import SerialMonitor
-from running_process import EndOfStream
+from running_process import RunningProcess
 
 from ci.compiler.build_utils import get_utf8_env
 from ci.util.crash_trace_decoder import CrashTraceDecoder
@@ -93,8 +81,7 @@ from ci.util.global_interrupt_handler import (
 )
 from ci.util.json_rpc_handler import JsonRpcHandler
 from ci.util.output_formatter import TimestampFormatter
-from ci.util.pio_runner import create_pio_process
-from ci.util.port_utils import auto_detect_upload_port, kill_port_users
+from ci.util.port_utils import kill_port_users
 from ci.util.sketch_resolver import parse_timeout, resolve_sketch_path
 
 
@@ -103,7 +90,7 @@ init(autoreset=True)
 
 
 # ============================================================
-# PlatformIO Workflow Functions
+# Workflow Functions
 # ============================================================
 
 
@@ -119,36 +106,24 @@ def run_cpp_lint() -> bool:
     print("=" * 60)
     print("LINTING C++ CODE")
     print("=" * 60)
-    print("Running C++ linters (unified runner - matches 'bash lint')")
+    print("Running C++ linters (unified runner - matches 'bash lint --cpp')")
     print()
 
     project_root = Path(__file__).parent.parent
 
     try:
-        # Phase 1: Run unified C++ checker (all content-based linters in one pass)
-        # This is the same as 'bash lint' line 200
-        print("🔍 Running unified C++ checker (all content-based linters in one pass)")
-        result = subprocess.run(
-            ["uv", "run", "python", "ci/lint_cpp/run_all_checkers.py"],
+        # Delegate to the same C++ lint entrypoint as `bash lint --cpp` so
+        # the Rust `fastled-lint` binary is used by default (FastLED #3288)
+        # and we stay on whatever flag defaults `ci/lint.py` ships next.
+        # The legacy direct `cpp_lint.py` relative-includes call has been
+        # retired — RelativeIncludeChecker now ships in the Rust crate.
+        result = RunningProcess.run(
+            ["uv", "run", "--no-sync", "python", "ci/lint.py", "--cpp"],
             cwd=project_root,
             env=get_utf8_env(),
         )
         if result.returncode != 0:
-            print("❌ Unified C++ linter failed")
-            return False
-
-        print()
-
-        # Phase 3: Run relative includes check for src/ only
-        # This is the same as 'bash lint' line 219
-        print("🔗 Running relative includes check (cpp_lint.py for src/ only)")
-        result = subprocess.run(
-            ["uv", "run", "python", "cpp_lint.py", "src/"],
-            cwd=project_root,
-            env=get_utf8_env(),
-        )
-        if result.returncode != 0:
-            print("❌ cpp_lint.py failed: Found relative includes in src/")
+            print("❌ C++ linter failed")
             return False
 
         print()
@@ -164,87 +139,87 @@ def run_cpp_lint() -> bool:
         return False
 
 
+def _deploy_for_monitor(
+    build_dir: Path,
+    environment: str,
+    upload_port: str | None,
+    verbose: bool,
+) -> str | None:
+    """Deploy with fbuild and return the application port to monitor."""
+    if upload_port:
+        kill_port_users(upload_port)
+
+    from ci.util.fbuild_runner import run_fbuild_deploy
+
+    result = run_fbuild_deploy(
+        build_dir,
+        environment,
+        upload_port=upload_port,
+        verbose=verbose,
+    )
+    if not result.success:
+        return None
+
+    monitor_port = result.port or upload_port
+    if not monitor_port:
+        print(
+            "❌ fbuild deployed successfully but did not report the application "
+            "port required for monitoring"
+        )
+        return None
+    return monitor_port
+
+
+def _sketch_source_label(build_dir: Path) -> str:
+    """Describe which sketch fbuild will build (from the sketch env var)."""
+    src_dir = os.environ.get("PLATFORMIO_SRC_DIR")
+    if not src_dir:
+        return "(using the project's default sketch)"
+    try:
+        return str(Path(src_dir).relative_to(build_dir))
+    except ValueError:
+        return src_dir
+
+
 def run_compile(
     build_dir: Path,
     environment: str | None = None,
     verbose: bool = False,
     clean: bool = False,
 ) -> bool:
-    """Compile the PlatformIO project.
-
-    On Windows Git Bash: Runs via cmd.exe with clean environment (no Git Bash indicators)
-    On other platforms: Runs directly with UTF-8 environment
+    """Compile the staged project with `fbuild build`.
 
     Args:
         build_dir: Project directory containing platformio.ini
-        environment: PlatformIO environment to build (None = default)
+        environment: fbuild environment to build (None = default)
         verbose: Enable verbose output
         clean: Clean build artifacts before compiling
 
     Returns:
         True if compilation succeeded, False otherwise
     """
-    if clean:
-        clean_cmd = ["pio", "run", "--target", "clean", "--project-dir", str(build_dir)]
-        if environment:
-            clean_cmd.extend(["--environment", environment])
-        print("🧹 Cleaning build artifacts...")
-        subprocess.run(clean_cmd, capture_output=True)
-
-    cmd = ["pio", "run", "--project-dir", str(build_dir)]
-    if environment:
-        cmd.extend(["--environment", environment])
-    if verbose:
-        cmd.append("--verbose")
+    from ci.util.fbuild_runner import run_fbuild_compile
 
     print("=" * 60)
     print("COMPILING")
     print("=" * 60)
-
-    # Log which sketch is being compiled (from PLATFORMIO_SRC_DIR env var)
-    src_dir = os.environ.get("PLATFORMIO_SRC_DIR")
-    if src_dir:
-        # Convert to relative path for cleaner output
-        try:
-            rel_path = Path(src_dir).relative_to(build_dir)
-            print(f"📁 Source: {rel_path}")
-        except ValueError:
-            # Not relative to build_dir, show absolute path
-            print(f"📁 Source: {src_dir}")
-    else:
-        print("📁 Source: (using platformio.ini default)")
+    print(f"📁 Source: {_sketch_source_label(build_dir)}")
     print()
 
-    formatter = TimestampFormatter()
-    # Use create_pio_process() for Git Bash compatibility
-    proc = create_pio_process(
-        cmd,
-        cwd=build_dir,
-        output_formatter=formatter,
-        auto_run=True,
-    )
-
     try:
-        # 15 minute timeout per CLAUDE.md standards
-        while line := proc.get_next_line(timeout=900):
-            if isinstance(line, EndOfStream):
-                break
-            print(line)
+        result = run_fbuild_compile(
+            build_dir, environment, verbose=verbose, clean=clean, timeout=900
+        )
     except KeyboardInterrupt as ki:
         print("\nKeyboardInterrupt: Stopping compilation")
-        proc.terminate()
         handle_keyboard_interrupt(ki)
         raise
 
-    proc.wait()
-    success = proc.returncode == 0
-
-    if success:
+    if result.success:
         print("\n✅ Compilation succeeded\n")
     else:
-        print(f"\n❌ Compilation failed (exit code {proc.returncode})\n")
-
-    return success
+        print("\n❌ Compilation failed\n")
+    return result.success
 
 
 def run_upload(
@@ -253,74 +228,45 @@ def run_upload(
     upload_port: str | None = None,
     verbose: bool = False,
 ) -> bool:
-    """Upload firmware to device.
+    """Upload firmware to device with `fbuild deploy`.
 
-    This function uses `pio run -t upload` which will upload the firmware.
-    PlatformIO's incremental build system only rebuilds if source files changed
-    since the last compilation, making this fast when nothing changed.
-
-    On Windows Git Bash: Runs via cmd.exe with clean environment (no Git Bash indicators)
-    On other platforms: Runs directly with UTF-8 environment
+    fbuild's firmware ledger skips the rebuild and the flash when the
+    source hash and build flags are unchanged, so this is fast when
+    nothing changed.
 
     Args:
         build_dir: Project directory containing platformio.ini
-        environment: PlatformIO environment to upload (None = default)
-        upload_port: Serial port to use (None = auto-detect)
+        environment: fbuild environment to upload (None = default)
+        upload_port: Serial port to use (None = fbuild board registry)
         verbose: Enable verbose output
 
     Returns:
         True if upload succeeded, False otherwise.
     """
-    cmd = [
-        "pio",
-        "run",
-        "--project-dir",
-        str(build_dir),
-        "-t",
-        "upload",
-    ]
-    if environment:
-        cmd.extend(["--environment", environment])
-    if upload_port:
-        cmd.extend(["--upload-port", upload_port])
-    if verbose:
-        cmd.append("--verbose")
+    from ci.util.fbuild_runner import run_fbuild_deploy
 
     print("=" * 60)
     print("UPLOADING")
     print("=" * 60)
 
-    formatter = TimestampFormatter()
-    # Use create_pio_process() for Git Bash compatibility
-    proc = create_pio_process(
-        cmd,
-        cwd=build_dir,
-        output_formatter=formatter,
-        auto_run=True,
-    )
-
     try:
-        # 15 minute timeout per CLAUDE.md standards
-        while line := proc.get_next_line(timeout=900):
-            if isinstance(line, EndOfStream):
-                break
-            print(line)
-
+        result = run_fbuild_deploy(
+            build_dir,
+            environment,
+            upload_port=upload_port,
+            verbose=verbose,
+            timeout=900,
+        )
     except KeyboardInterrupt as ki:
         print("\nKeyboardInterrupt: Stopping upload")
-        proc.terminate()
         handle_keyboard_interrupt(ki)
         raise
 
-    proc.wait()
-    success = proc.returncode == 0
-
-    if success:
+    if result.success:
         print("\n✅ Upload succeeded\n")
     else:
-        print(f"\n❌ Upload failed (exit code {proc.returncode})\n")
-
-    return success
+        print("\n❌ Upload failed\n")
+    return result.success
 
 
 def format_test_summary(result_events: list[dict[str, Any]]) -> str:
@@ -409,7 +355,7 @@ def run_monitor(
 
     Args:
         build_dir: Project directory containing platformio.ini
-        environment: PlatformIO environment to monitor (None = default)
+        environment: fbuild environment to monitor (None = default)
         monitor_port: Serial port to monitor (None = auto-detect)
         verbose: Enable verbose output
         timeout: Maximum time to monitor in seconds (default: 60)
@@ -992,6 +938,35 @@ def run_monitor(
     )
 
 
+def _default_environment(build_dir: Path) -> str | None:
+    """Pick the environment to build when none is given.
+
+    Staged projects live at ``.build/fbuild/<board>/``, so the directory name
+    is the board. Otherwise honour ``default_envs`` in the project's
+    ``platformio.ini``; a single ``[env:<name>]`` section is also unambiguous.
+    """
+    if build_dir.parent.name == "fbuild" and build_dir.parent.parent.name == ".build":
+        return build_dir.name
+
+    ini = build_dir / "platformio.ini"
+    if not ini.is_file():
+        return None
+    envs: list[str] = []
+    for raw in ini.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        m = re.match(r"default_envs\s*=\s*(.+)", line)
+        if m:
+            first = m.group(1).split(",")[0].strip()
+            if first:
+                return first
+        m = re.match(r"\[env:([^\]]+)\]", line)
+        if m:
+            envs.append(m.group(1).strip())
+    if len(envs) == 1:
+        return envs[0]
+    return None
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -1028,13 +1003,13 @@ Examples:
         "sketch",
         nargs="?",
         help="Sketch to compile (e.g., 'RX', 'examples/RX', 'examples/RX/RX.ino'). "
-        "Sets PLATFORMIO_SRC_DIR environment variable. Supports full paths and deep sketches.",
+        "Selects the sketch directory fbuild builds. Supports full paths and deep sketches.",
     )
     parser.add_argument(
         "--env",
         "-e",
         dest="environment",
-        help="PlatformIO environment to build (uses default_envs if not provided)",
+        help="fbuild environment to build (defaults to the board named by the project dir)",
     )
     parser.add_argument(
         "--verbose",
@@ -1064,7 +1039,7 @@ Examples:
         "-d",
         type=Path,
         default=Path.cwd(),
-        help="PlatformIO project directory (default: current directory)",
+        help="Project directory containing platformio.ini (default: current directory)",
     )
     parser.add_argument(
         "--exit-on-error",
@@ -1119,7 +1094,7 @@ Examples:
     parser.add_argument(
         "--kill-daemon",
         action="store_true",
-        help="Stop and restart the package daemon before running (useful if daemon is stuck)",
+        help="Stop the fbuild daemon before running (useful if it is stuck); fbuild restarts it on demand",
     )
     parser.add_argument(
         "--check-usage",
@@ -1163,20 +1138,17 @@ def main() -> int:
     # Verify platformio.ini exists
     if not (build_dir / "platformio.ini").exists():
         print(f"❌ Error: platformio.ini not found in {build_dir}")
-        print("   Make sure you're running this from a PlatformIO project directory")
+        print("   Make sure you're running this from an fbuild project directory")
         return 1
 
     if args.environment is None:
-        from ci.util.pio_package_daemon import get_default_environment
-
-        default_environment = get_default_environment(str(build_dir))
-        if default_environment is None:
+        args.environment = _default_environment(build_dir)
+        if args.environment is None:
             print("Error: fbuild requires an environment.")
             print("   Set default_envs in platformio.ini or pass --env <environment>.")
             return 1
-        args.environment = default_environment
 
-    # Handle sketch argument and set PLATFORMIO_SRC_DIR environment variable
+    # Handle sketch argument and point fbuild at the sketch directory
     if args.sketch:
         try:
             resolved_sketch = resolve_sketch_path(args.sketch, build_dir)
@@ -1205,7 +1177,8 @@ def main() -> int:
                 print()
                 return 1
 
-            # Use absolute path for PLATFORMIO_SRC_DIR (matches autoresearch.py behavior)
+            # Absolute path (matches autoresearch behavior); fbuild reads
+            # the sketch directory from this environment variable.
             absolute_sketch_path = str(build_dir / resolved_sketch)
             os.environ["PLATFORMIO_SRC_DIR"] = absolute_sketch_path
             print(f"📁 Sketch: {resolved_sketch}")
@@ -1252,78 +1225,29 @@ def main() -> int:
         print(f"❌ Error parsing JSON-RPC commands: {e}")
         return 1
 
-    # Auto-detect upload port if not specified
+    # An explicit port remains an override. Otherwise fbuild chooses from the
+    # central board registry during deploy and reports the application port.
     upload_port = args.upload_port
-    if not upload_port:
-        result = auto_detect_upload_port(args.environment)
-        if not result.ok:
-            # Port detection failed - display detailed error and exit
-            print(f"{Fore.RED}{'=' * 60}")
-            print(f"{Fore.RED}⚠️  FATAL ERROR: PORT DETECTION FAILED")
-            print(f"{Fore.RED}{'=' * 60}")
-            print(f"\n{Fore.RED}{result.error_message}{Style.RESET_ALL}\n")
-
-            # Display all scanned ports for diagnostics
-            if result.all_ports:
-                print("Available ports (all non-USB):")
-                for port in result.all_ports:
-                    print(f"  {port.device}: {port.description}")
-                    print(f"    hwid: {port.hwid}")
-            else:
-                print("No serial ports detected on system.")
-
-            print(
-                f"\n{Fore.RED}Only USB devices are supported. Please connect a USB device and try again.{Style.RESET_ALL}"
-            )
-            print(
-                f"{Fore.RED}Note: Bluetooth serial ports (BTHENUM) are not supported.{Style.RESET_ALL}\n"
-            )
-            return 1
-
-        # Port detection succeeded
-        upload_port = result.selected_port
 
     print("FastLED Debug Attached Device")
     print("=" * 60)
     print(f"Project: {build_dir}")
     if args.environment:
         print(f"Environment: {args.environment}")
-    print(f"Upload port: {upload_port}")
+    print(f"Upload port: {upload_port or 'auto (fbuild board registry)'}")
     print("=" * 60)
     print()
 
     try:
-        # Handle --kill-daemon flag (restart daemon before proceeding)
+        # Handle --kill-daemon flag (stop the fbuild daemon before proceeding)
         if args.kill_daemon:
-            from ci.util.pio_package_client import is_daemon_running, stop_daemon
+            from ci.util.fbuild_runner import stop_fbuild_daemon
 
-            print("🔄 Restarting package daemon...")
-            if is_daemon_running():
-                print("   Stopping existing daemon...")
-                stop_daemon()
-                time.sleep(1)  # Brief delay after stop
-                print("   ✅ Daemon stopped")
-            else:
-                print("   ℹ️  Daemon not running")
-            print("   Daemon will auto-start during package installation")
+            print("🔄 Stopping fbuild daemon...")
+            stop_fbuild_daemon()
+            time.sleep(1)  # Brief delay after stop
+            print("   ✅ Daemon stopped; fbuild restarts it on demand")
             print()
-
-        # ============================================================
-        # PHASE 0: Package Installation (GLOBAL LOCK via daemon)
-        # ============================================================
-        # The daemon acts as a global singleton lock for package installations.
-        # No explicit lock needed here - daemon serializes all pio pkg install.
-        print("=" * 60)
-        print("PHASE 0: ENSURING PACKAGES INSTALLED")
-        print("=" * 60)
-
-        from ci.util.pio_package_client import ensure_packages_installed
-
-        if not ensure_packages_installed(build_dir, args.environment, timeout=1800):
-            print("\n❌ Package installation failed or timed out")
-            return 1
-
-        print()
 
         # ============================================================
         # PHASE 1: Lint C++ Code (catches ISR errors before compile)
@@ -1337,39 +1261,23 @@ def main() -> int:
             print()
 
         # ============================================================
-        # PHASE 2: Compile (NO LOCK - parallelizable)
+        # PHASES 2-3: Build + Upload
         # ============================================================
-        # No lock needed: each project has isolated build directory.
-        # Multiple agents can compile different projects simultaneously.
-
         print("📦 Using fbuild")
-        from ci.util.fbuild_runner import run_fbuild_compile
-
-        if not run_fbuild_compile(build_dir, args.environment, args.verbose).success:
-            return 1
-
-        # ============================================================
-        # PHASES 3-4: Upload + Monitor
-        # ============================================================
-        # Note: Device locking is handled by fbuild (daemon-based)
-
-        # Clean up orphaned processes holding the serial port
-        if upload_port:
-            kill_port_users(upload_port)
-
-        # Phase 3: Upload firmware (with incremental rebuild if needed)
-        from ci.util.fbuild_runner import run_fbuild_upload
-
-        if not run_fbuild_upload(
-            build_dir, args.environment, upload_port, args.verbose
-        ):
+        monitor_port = _deploy_for_monitor(
+            build_dir,
+            args.environment,
+            upload_port,
+            args.verbose,
+        )
+        if not monitor_port:
             return 1
 
         # Phase 4: Monitor serial output
         monitor_result = run_monitor(
             build_dir,
             args.environment,
-            upload_port,  # Use same port for monitoring
+            monitor_port,
             args.verbose,
             timeout_seconds,
             fail_keywords,
@@ -1384,7 +1292,7 @@ def main() -> int:
         if not monitor_result.success:
             return 1
 
-        phases_completed = "three" if args.skip_lint else "four"
+        phases_completed = "two" if args.skip_lint else "three"
         print(f"\n✅ All {phases_completed} phases completed successfully")
         return 0
 

@@ -173,20 +173,12 @@ FL_TEST_CASE("debug macro configuration") {
 // ============================================================================
 
 FL_TEST_CASE("FL_WARN macros are defined") {
-    FL_SUBCASE("FL_WARN is defined") {
-        #ifdef FL_WARN
-        FL_CHECK(true);
-        #else
+    FL_SUBCASE("FL_HAS_WARN is a resolved boolean gate") {
+#if defined(FL_HAS_WARN)
+        FL_CHECK((FL_HAS_WARN == 0 || FL_HAS_WARN == 1));
+#else
         FL_CHECK(false);
-        #endif
-    }
-
-    FL_SUBCASE("FL_WARN_IF is defined") {
-        #ifdef FL_WARN_IF
-        FL_CHECK(true);
-        #else
-        FL_CHECK(false);
-        #endif
+#endif
     }
 
     FL_SUBCASE("FL_WARN is defined") {
@@ -204,6 +196,30 @@ FL_TEST_CASE("FL_WARN macros are defined") {
         FL_CHECK(false);
         #endif
     }
+
+    FL_SUBCASE("FL_WARN is defined") {
+        #ifdef FL_WARN
+        FL_CHECK(true);
+        #else
+        FL_CHECK(false);
+        #endif
+    }
+
+    FL_SUBCASE("FL_WARN_IF is defined") {
+        #ifdef FL_WARN_IF
+        FL_CHECK(true);
+        #else
+        FL_CHECK(false);
+        #endif
+    }
+}
+
+FL_TEST_CASE("category log gates are resolved booleans") {
+#if defined(FL_HAS_RMT_LOG)
+    FL_CHECK((FL_HAS_RMT_LOG == 0 || FL_HAS_RMT_LOG == 1));
+#else
+    FL_CHECK(false);
+#endif
 }
 
 FL_TEST_CASE("FL_WARN macro compiles and executes") {
@@ -416,6 +432,178 @@ FL_TEST_CASE("warning macros do not interfere with control flow") {
     }
 }
 
+// ============================================================================
+// Test Suite: Unified FL_WARN/FL_ERROR/FL_INFO/FL_PRINT (#3272)
+// Verifies that argument-count dispatch correctly routes single-arg calls
+// to stream form and multi-arg calls to printf form.
+// ============================================================================
+
+FL_TEST_CASE("FL_WARN unified - stream form with values") {
+    FL_SUBCASE("FL_WARN with printf format and one arg") {
+        int n = 42;
+        FL_WARN("Count: " << n);
+        FL_CHECK(true);
+    }
+
+    FL_SUBCASE("FL_WARN with printf format and multiple args") {
+        int x = 7, y = 11;
+        FL_WARN("x=" << x << " y=" << y);
+        FL_CHECK(true);
+    }
+
+    FL_SUBCASE("FL_WARN with literal containing percent and no args (stream)") {
+        // Single-arg path - '%' is NOT interpreted as a format specifier.
+        FL_WARN("100% loaded");
+        FL_CHECK(true);
+    }
+
+    FL_SUBCASE("FL_WARN alias still compiles") {
+        int n = 5;
+        FL_WARN("Legacy: " << n);
+        FL_CHECK(true);
+    }
+
+}
+
+FL_TEST_CASE("FL_ERROR unified - stream form with values") {
+    FL_SUBCASE("FL_ERROR with printf format") {
+        int code = -1;
+        FL_ERROR("Error code: " << code);
+        FL_CHECK(true);
+    }
+
+    FL_SUBCASE("FL_ERROR alias still compiles") {
+        FL_ERROR("Legacy err: " << ("oops"));
+        FL_CHECK(true);
+    }
+
+    FL_SUBCASE("FL_ERROR with stream chain still works") {
+        int v = 9;
+        FL_ERROR("value=" << v);
+        FL_CHECK(true);
+    }
+}
+
+#define FL_TEST_STRINGIZE_IMPL(...) #__VA_ARGS__
+#define FL_TEST_STRINGIZE(...) FL_TEST_STRINGIZE_IMPL(__VA_ARGS__)
+
+FL_TEST_CASE("unified logging keeps literals off the stream path") {
+    const fl::string literal = FL_TEST_STRINGIZE(FL_WARN("literal"));
+
+    FL_CHECK_NE(literal.find("log_emit_auto"), fl::string::npos);
+    FL_CHECK_NE(literal.find("log_seed"), fl::string::npos);
+    FL_CHECK_EQ(literal.find("sstream"), fl::string::npos);
+}
+
+FL_TEST_CASE("unified logging wrappers keep literals off the stream path") {
+    const fl::string warn = FL_TEST_STRINGIZE(FL_WARN("literal"));
+    const fl::string error = FL_TEST_STRINGIZE(FL_ERROR("literal"));
+    const fl::string print = FL_TEST_STRINGIZE(FL_PRINT("literal"));
+    const fl::string async =
+        FL_TEST_STRINGIZE(FL_LOG_ASYNC(logger, "literal"));
+    const fl::string warn_if =
+        FL_TEST_STRINGIZE(FL_WARN_IF(true, "literal"));
+    const fl::string warn_once = FL_TEST_STRINGIZE(FL_WARN_ONCE("literal"));
+    const fl::string warn_every =
+        FL_TEST_STRINGIZE(FL_WARN_EVERY(10, "literal"));
+
+    FL_CHECK_NE(warn.find("log_emit_auto"), fl::string::npos);
+    FL_CHECK_NE(error.find("log_emit_auto"), fl::string::npos);
+    FL_CHECK_NE(print.find("print_emit_auto"), fl::string::npos);
+    FL_CHECK_NE(async.find("async_log_emit_auto"), fl::string::npos);
+    FL_CHECK_NE(warn_if.find("log_emit_auto"), fl::string::npos);
+    FL_CHECK_NE(warn_once.find("log_emit_auto"), fl::string::npos);
+    FL_CHECK_NE(warn_every.find("log_emit_auto"), fl::string::npos);
+
+    FL_CHECK_EQ(warn.find("sstream"), fl::string::npos);
+    FL_CHECK_EQ(error.find("sstream"), fl::string::npos);
+    FL_CHECK_EQ(print.find("sstream"), fl::string::npos);
+    FL_CHECK_EQ(async.find("sstream"), fl::string::npos);
+}
+
+// #4709: printf-style log formatting is a compile error. A static_assert
+// cannot be caught at runtime, so check the expansion instead: every log
+// macro's multi-argument form must route to _FL_LOG_PRINTF_BANNED.
+FL_TEST_CASE("printf-form log calls expand to the compile-time ban") {
+    const char* const expansions[] = {
+        FL_TEST_STRINGIZE(FL_WARN("x=%d", 1)),
+        FL_TEST_STRINGIZE(FL_ERROR("x=%d", 1)),
+        FL_TEST_STRINGIZE(FL_INFO("x=%d", 1)),
+        FL_TEST_STRINGIZE(FL_PRINT("x=%d", 1)),
+        FL_TEST_STRINGIZE(FL_DBG("x=%d", 1)),
+        FL_TEST_STRINGIZE(FASTLED_WARN("x=%d", 1)),
+        FL_TEST_STRINGIZE(FASTLED_ERROR("x=%d", 1)),
+        FL_TEST_STRINGIZE(FL_WARN_IF(true, "x=%d", 1)),
+        FL_TEST_STRINGIZE(FL_WARN_ONCE("x=%d", 1)),
+        FL_TEST_STRINGIZE(FL_WARN_EVERY(10, "x=%d", 1)),
+        FL_TEST_STRINGIZE(FL_LOG_ASYNC(logger, "x=%d", 1)),
+        FL_TEST_STRINGIZE(_FL_LOG_CHECK("x=%d", 1)),
+    };
+    for (const char* text : expansions) {
+        const fl::string expansion(text);
+        FL_CHECK_NE(expansion.find("printf-style log formatting is not allowed"), fl::string::npos);
+    }
+    // The one-argument forms stay legal.
+    const fl::string ok = FL_TEST_STRINGIZE(_FL_LOG_CHECK("x=" << 1));
+    FL_CHECK_EQ(ok.find("printf-style"), fl::string::npos);
+}
+
+#undef FL_TEST_STRINGIZE
+#undef FL_TEST_STRINGIZE_IMPL
+
+FL_TEST_CASE("FL_INFO unified - stream form with values") {
+    FL_SUBCASE("FL_INFO with printf format") {
+        FL_INFO("info: " << (123));
+        FL_CHECK(true);
+    }
+
+    FL_SUBCASE("FL_INFO with stream chain") {
+        FL_INFO("info " << 456);
+        FL_CHECK(true);
+    }
+}
+
+FL_TEST_CASE("FL_INFO_IF unified - stream form with values") {
+    FL_SUBCASE("FL_INFO_IF with printf format and true condition") {
+        FL_INFO_IF(true, "info conditional fmt " << (9));
+        FL_CHECK(true);
+    }
+
+    FL_SUBCASE("FL_INFO_IF with stream chain") {
+        FL_INFO_IF(true, "info stream " << 22);
+        FL_CHECK(true);
+    }
+}
+
+FL_TEST_CASE("FL_PRINT unified - stream form with values") {
+    FL_SUBCASE("FL_PRINT with printf format") {
+        FL_PRINT("printed: " << (99));
+        FL_CHECK(true);
+    }
+
+    FL_SUBCASE("FL_PRINT with stream chain") {
+        FL_PRINT("stream " << 42);
+        FL_CHECK(true);
+    }
+
+    FL_SUBCASE("FL_PRINT alias still compiles") {
+        FL_PRINT("Legacy: " << ("abc"));
+        FL_CHECK(true);
+    }
+}
+
+FL_TEST_CASE("FL_WARN_IF unified - stream form with values") {
+    FL_SUBCASE("FL_WARN_IF with printf format and true condition") {
+        FL_WARN_IF(true, "conditional fmt " << (7));
+        FL_CHECK(true);
+    }
+
+    FL_SUBCASE("FL_WARN_IF with printf format and false condition") {
+        FL_WARN_IF(false, "conditional fmt " << (7));
+        FL_CHECK(true);
+    }
+}
+
 FL_TEST_CASE("warning macro edge cases") {
     FL_SUBCASE("empty message (should still compile)") {
         FL_WARN("");
@@ -441,3 +629,20 @@ FL_TEST_CASE("warning macro edge cases") {
     }
 }
 
+// The prefix is built without fl::printf so logging does not link the printf
+// engine (FastLED#4671); pin its exact text, including a negative line.
+FL_TEST_CASE("log_emit_prefix writes file(line): KIND: without printf") {
+    static fl::string captured;
+    captured.clear();
+    fl::inject_print_handler([](const char* s) { captured += s; });
+    fl::detail::log_emit_prefix(fl::detail::log_kind::WARN, "src/fl/x.h", 42);
+    fl::detail::log_emit_newline();
+    fl::detail::log_emit_prefix(fl::detail::log_kind::ERROR, "a.cpp", 0);
+    fl::detail::log_emit_prefix(fl::detail::log_kind::INFO, "b.cpp", -7);
+    fl::detail::log_emit_prefix(fl::detail::log_kind::INFO, "c.cpp", 2147483647);
+    fl::clear_print_handler();
+    FL_CHECK_EQ(captured, fl::string("src/fl/x.h(42): WARN: \n"
+                                     "a.cpp(0): ERROR: "
+                                     "b.cpp(-7): INFO: "
+                                     "c.cpp(2147483647): INFO: "));
+}

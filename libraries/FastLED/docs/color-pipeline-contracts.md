@@ -1,0 +1,431 @@
+# Color pipeline implementation contracts
+
+This implementation addendum addresses the cross-phase findings in
+[review #4156](https://github.com/FastLED/FastLED/issues/4156). The program remains
+[tracker #4034](https://github.com/FastLED/FastLED/issues/4034), implementing
+[specification #4032](https://github.com/FastLED/FastLED/issues/4032) and its
+[decision record #4033](https://github.com/FastLED/FastLED/issues/4033).
+
+These are implementation requirements, not a statement that the managed output
+path is already available. Phase PRs must link their actual tests and artifacts.
+Unimplemented requirements remain open; accepting this document does not close
+any implementation phase or the hardware measurement gate.
+
+## Typed boundaries and stage ordering (R2, R5, D1)
+
+The managed path carries these distinct quantities:
+
+1. Encoded source view: storage format, component byte order, pixel stride,
+   immutable frame data, and an independent source-color profile.
+2. Linear source RGB: decode RGB8 directly to unsigned RGB16; preserve RGB16
+   source samples without an RGB8 intermediate.
+3. Signed, wide device-independent coordinates: source RGB to XYZ, white-point
+   adaptation, and gamut mapping. Negative intermediates must survive until
+   gamut mapping; signed multiplication uses wider products with defined
+   rounding and overflow admission checks.
+4. Linear emitter contributions: three, four, or five normalized light outputs
+   produced by the device solve, including white-channel allocation.
+5. Dimmed linear emitter contributions: multiply by brightness and the shared
+   power scalar once in this domain.
+6. Physical drive coordinates: inverse measured code-to-light response,
+   followed by chipset-specific current/brightness-field selection and final
+   quantization/dithering.
+
+Response inversion in step 6 is necessary physical calibration. It is not a
+second artistic gamma stage, and it must not stack with legacy correction.
+Multiplying already response-compensated drive codes by brightness is wrong:
+if red light is `d` and green light is `d*d`, quartering full-scale drive yields
+red light `1/4` but green light `1/16`. Quarter light requires drives `1/4` and
+`1/2` respectively. P5 golden vectors and P6/P8 integration must cover this.
+
+Source-profile defaults for ordinary managed, containerless RGB buffers are
+linear transfer, BT.709 primaries, and D65 white. This applies to RGB8 buffers
+too; eight-bit storage alone does not imply sRGB transfer. In contrast,
+[RGB8 `.fled` input with absent metadata](#source-admission-and-playback-r1-r5-r6-r10)
+defaults to sRGB transfer. Enabling management is explicit and can change
+appearance. With management disabled, existing byte output remains unchanged.
+
+### Container formats and generic storage
+
+`fl::fled::PixelFormat` owns the stable `.fled` wire identifiers. Generic
+`fl::PixelFormat` describes FastLED storage. The generic API is independent of
+the container. Matching numeric enum values are permitted but do not establish
+a casting or serialization contract.
+
+| Container format | Generic storage | Additional meaning |
+|---|---|---|
+| `Rgb8`, wire `0x00` | RGB8 | Source transfer/primaries from resolved metadata |
+| `Rgb16Linear`, wire `0x05` | RGB16 | Little-endian payload, linear transfer, full range |
+
+The `.fled` layer performs checked conversion. It retains the resolved source
+profile and payload byte order alongside the storage descriptor. Reverse
+serialization validates both storage and source semantics: generic RGB16 is
+not enough to label data `rgb16_linear`.
+
+`resolveVideoColor` remains a `.fled` operation and accepts the container enum
+through a public header. Unknown raw values are rejected at parsing/admission
+boundaries. Its byte-valued compatibility overload, if retained, has identical
+validation behavior.
+
+## Source admission and playback (R1, R5, R6, R10)
+
+Recognizing FLED magic commits a reader to container parsing. An unsupported
+version, format, or malformed/truncated envelope must not rewind into legacy
+raw RGB. Headerless RGB compatibility applies only when FLED magic is absent.
+Readers must document how non-seekable input is probed without losing bytes.
+Older deployed binaries cannot be assumed to reject newer formats safely.
+
+Loading a bundle, resolving its declaration, and admitting it for rendering
+are separate operations. Managed playback is strict by default. Unknown or
+unsupported explicit color semantics cause an error; best-effort fallback for
+advisory RGB formats requires explicit caller opt-in and a diagnostic. A
+mandatory unsupported format never falls back to a byte interpretation.
+
+Absent metadata resolves using these existing default tuples:
+
+- RGB8: BT.709 primaries, sRGB transfer, RGB matrix, full range.
+- RGB16-linear: BT.709 primaries, linear transfer, RGB matrix, full range.
+
+An explicit contradictory declaration is rejected. The term "mandatory" means
+that the format's semantics cannot be ignored, not that redundant default
+metadata must physically appear in every envelope.
+
+File metadata owns the source meaning for file playback. Channel defaults
+apply to ordinary buffers and do not silently override file metadata. An
+explicit override must be visible as such. Switching sources replaces the
+complete profile/view atomically between frames and invalidates derived
+caches. Two channels consuming the same source may have different emitter
+profiles without changing the source buffer.
+
+Same-space effect arithmetic retains its declared-space semantics. Mixed-space
+composition is rejected in v1 unless all inputs have first been converted to
+one explicitly typed wide working domain. A decode inside `show()` cannot
+retroactively correct an earlier RGB8 blend.
+
+On a playback error after a lit frame, a dark-output policy requires an actual
+black-frame submission and an observable error result. Skipping output alone
+leaves addressable LEDs displaying the previously latched frame.
+
+### Numerical admission
+
+Syntactic metadata validation is not numerical transform admission. Before a
+profile is installed, require finite values, usable white, nondegenerate source
+primaries, positive usable emitter capacities, and representable, sufficiently
+conditioned matrix coefficients. The embedded implementation publishes its
+coefficient bounds and tests their edges against the reference. Profiles
+outside those bounds fail explicitly; they do not become native-drive input.
+
+The initial physical-emitter domain uses realizable nonnegative chromaticities.
+Support for imaginary *source* primaries must be explicit and bounded by the
+same numerical admission checks, never inferred from successful JSON parsing.
+Measured response tables must be finite, bounded, monotone, and have defined
+endpoints. Inverse response uses a deterministic policy for plateaus and rejects
+unachievable targets rather than dividing by a zero response interval.
+
+## White and gamut coordinates (R7)
+
+Separate measured emitter XYZ capacities from the selected rendering white and
+its maximum achievable neutral luminance. All emitters at full drive are not
+necessarily that white, particularly for RGBWW and target-white overrides.
+
+For a managed RGB channel, absent an override the selected white is D65 and
+the existing output path is unchanged. A source white describes the source
+RGB encoding; it is adapted to D65 independently of the selected rendering
+white. `setTargetWhite()` selects the physical neutral emitted for that D65
+working neutral. It does not change emitter capacities or mean "all emitters
+at full drive." The attainable neutral luminance is recomputed for that
+selection at bind time. An accepted xy value outside the emitter gamut cannot
+produce a managed pipeline: the channel reports fallback, or rejection with
+strict color management. Managed RGBW/RGBWW overrides require #4515.
+
+Bradford adapts source-relative XYZ to the selected rendering white. Standard
+Oklab/OKLCh computations use D65-relative XYZ with white Y=1; see the
+[Oklab definition](https://bottosson.github.io/posts/oklab/). Therefore the mapper
+adapts both target XYZ and the entire feasible emitter gamut from rendering
+white to D65 for its objective, and transforms mapped results back before the
+device solve. The target and boundary must use exactly the same transforms.
+
+P5/P7 must publish the exact compression objective, luminance/chroma tradeoff,
+boundary tolerances, and deterministic tie-breaks as an executable reference.
+The algorithm must preserve feasible input exactly within the stated numerical
+budget, preserve the selected neutral axis, and be continuous at gamut and
+white-allocation boundaries. A named color space by itself is not an algorithm.
+Iterative optimization may run at profile/LUT construction, never per pixel in
+the embedded output path. RGBW/RGBWW feasibility includes all emitters.
+
+### Stated tolerances (P7)
+
+The objective, the luminance/chroma tradeoff and the tie-breaks are the
+executable reference in `ci/color_gamut_study.py`, derived in
+[color-gamut-algorithm-selection.md](color-gamut-algorithm-selection.md). The
+numerical tolerances the embedded mappers are held to are these. Each is
+asserted in `tests/fl/gfx/gamut_map.cpp` on all three mappers (RGB, RGBW,
+RGBWW) unless the row says otherwise.
+
+| property | tolerance | worst measured |
+|---|---|---|
+| in-gamut target preserved (RGB, RGBW) | drives identical to the unmapped solve, which is within 0.002 of the requested drive | identical |
+| in-gamut target preserved (RGBWW) | re-rendered XYZ within 0.01 of the target, per component | within bound |
+| neutral ramp stays neutral (RGBW, RGBWW) | xy within 0.002 of the rendering white | within bound |
+| hue, in gamut and under compression | `hueDivergence` < **0.005** (`kHueTolerance`) | below 0.002 at every mapper case; 0.0034 across the 283 in-gamut targets of the allocator plane sweep |
+| continuity (RGB) | one input step moves summed drive < 1.5 codes at 8 bits | 1.03 codes (neutral luminance ramp); 0.80 across the hull boundary |
+| continuity across the neutral cap | < 0.02 summed drive (about five 8-bit codes) | 1 to 3 codes |
+| continuity through the hull boundary (RGBWW) | largest per-component XYZ output change < 0.05 between adjacent samples (input Y step 0.0125, 240 steps) | within bound |
+
+**The hue tolerance.** `hueDivergence` is the sine of the angle between
+target and mapped OKLab chroma. It returns 1 for a collapse to grey or a 180°
+rotation, so a small value cannot hide either. 0.005 is about 0.29° of hue. At
+chroma 0.4, above any display-class primary, that displaces the colour by
+0.002 in OKLab. The ΔE<sub>OK</sub> just-noticeable difference that
+[CSS Color 4 gamut mapping](https://www.w3.org/TR/css-color-4/#gamut-mapping)
+uses is 0.02, so the displacement is a tenth of one JND.
+
+Until #4313, the allocator measured 0.026 at one RGBW target. That is five
+times this bound, and it was a defect: a feasibility slack sized in drive
+units and paid in colour units. It was not a property of the mapping. A value
+at that scale is exactly what this bound exists to fail.
+
+## Power and presentation (R3, R4, R8)
+
+The managed implementation uses two-pass streaming over stable frame inputs:
+
+1. Evaluate solved demand across every channel participating in a supply
+   budget; include response inversion, current-field policy, and quantization
+   reserve. Compute a wide shared power scalar without advancing dither state.
+2. Encode the same source/profile snapshot with that scalar and submit output.
+
+This requires no RGB16 framebuffer. Async drivers may continue owning their
+existing encoded wire buffers. The prepass and encode cost both count toward
+throughput budgets. Caller-owned source storage must not mutate during either
+pass; profile bindings are immutable snapshots until the frame ends.
+
+The current implementation of this frame-wide prepass is the large-memory,
+shared-pipeline path of `FastLED.show()` when the built-in power limiter is
+installed and at least one enabled channel has a managed profile. It keeps
+64 upward-rounded linear-light bins per emitter per managed channel (at most
+five emitters, about 1.3 KiB of temporary histogram storage per channel),
+then searches a Q16 scalar. Histogram storage is sized once and filled in
+place, so no per-channel histogram copy or vector reallocation is required.
+If snapshot allocation fails, the solver fails closed at zero controllable
+flux and marks the frame infeasible/uncertified. Legacy channels are walked for each candidate;
+the prepass is therefore not a fixed two source walks for those channels.
+Small-memory tiers retain the legacy u8 limiter and do not provide this
+per-latched-frame managed bound. `showColor()` also retains its separate
+legacy path and is outside this managed-frame guarantee.
+
+User brightness remains `b/255` in linear light. The internal power scalar is
+wide, not an eight-bit replacement brightness. Fixed controller/LED idle
+consumption is independent of that scalar. A budget below unavoidable baseline
+returns an infeasible-budget diagnostic and minimum controllable output; it
+does not claim zero total consumption. Mixed legacy and managed channels must
+be aggregated with their respective electrical models.
+
+The electrical contract bounds modeled demand for each latched output frame,
+including upward quantization/dither choices. It does not guarantee limits on
+unmodeled internal PWM transients or replace electrical supply protection.
+Nonlinear electrical models require a bounded/conservative scalar solution;
+assuming watts proportional to XYZ Y is not supported.
+
+### The legacy estimator's emitter count
+
+"Aggregated with their respective electrical models" is not free wording. The
+legacy estimator walks the source `CRGB` array, which is what the sketch
+wrote, not what the strip is driven with. A controller in RGBW mode converts
+every pixel with `rgb_2_rgbw` before latching, and the resulting four drives
+are neither bounded by nor proportional to the source triple.
+
+Measured on 300 pixels of source white with the shipped default
+`PowerModelRGBW` (r90 g70 b90 w100 dark5), in milliwatts:
+
+| RGBW mode | source triple | four emitters | |
+|---|---|---|---|
+| `kRGBWMaxBrightness` | 76,205 | 106,086 | source triple is **28% under** |
+| `kRGBWBoostedWhite` | 76,205 | 81,470 | **6.5% under** |
+| `kRGBWExactColors` | 76,205 | 30,485 | **150% over** |
+
+The first two are budget under-spent against; the third is a strip dimmed for
+no reason. `set_power_model(const PowerModelRGBW&)` compounded it by routing
+through `toRGB()`, which dropped `white_mW`: the API accepted the figure and
+discarded it, so the fourth diode could not have been charged even in
+principle. The estimator now runs the same conversion the encoder will and
+charges all four emitters.
+
+Two boundaries this leaves in place, both deliberate:
+
+- **Demand is still projected linearly in brightness.** The estimator reports
+  demand at full brightness and the limiter scales it. That commutes with
+  `kRGBWExactColors` and `kRGBWMaxBrightness` to within 0.4% over the measured
+  cases, but not with `kRGBWBoostedWhite`, which reallocates between emitters
+  as the scale falls: demand there runs up to **12.1% above** the linear
+  projection at low brightness. Closing it means evaluating demand per
+  candidate brightness, which is a pixel walk per step of the limiter's
+  search. Charging four emitters instead of three is the larger correction by
+  a wide margin; the residual is recorded rather than folded into the claim.
+- **RGBWW still folds.** `PowerModelRGBWW::toRGB()` spreads its two white
+  emitters across R/G/B rather than dropping them, which over-estimates and
+  so cannot break a budget. A five-emitter accounting needs the RGBWW
+  allocation the way the RGBW path needs `rgb_2_rgbw`.
+
+A controller in RGBW mode under a model that declares no white emitter is
+diagnosed once rather than guessed at. There is no basis for a fourth
+emitter's draw in a three-emitter declaration, and inventing one is the shape
+of the defect this replaced.
+
+### Fidelity accounting
+
+Report three distinct errors:
+
+- Numerical error before native quantization versus the float64 reference,
+  including source decode, mapping, solve, and brightness.
+- Native encoding error versus ideal emitter light, including quantization,
+  response inversion, and current-field effects.
+- Profile error versus measured physical output, including instrument
+  uncertainty and reference operating conditions.
+
+A reference quantized to the same wire format can prove implementation parity,
+but cannot prove ideal-light accuracy. Publish luminance normalization,
+relative-error denominators, black-floor treatment, and the exact corpus.
+Do not silently exclude difficult vectors to satisfy the issue's budgets.
+
+#### The black floor, stated
+
+The paragraph above requires a black-floor treatment to be published. This is
+it, measured rather than chosen.
+
+**A reference drive below one s16.16 unit is outside the budget's scope.** One
+unit is `1/65536` = `1.5259e-05` in normalized emitter flux. Below that the
+fixed-point path can only answer zero or a whole unit where the reference asks
+for a fraction of one, and CIELAB's kappa branch turns that into a whole unit
+of L*.
+
+The floor is the arithmetic's resolution and **not** a luminance threshold,
+which is the part worth being exact about because the obvious form does not
+work. Measured on the P5 corpus's `rgb` device, `bt2020-rgb-02` misses at
+Y = 5.4e-04 while `srgb_bt709-rgb-00` passes at Y = 3.0e-04 -- a *darker*
+vector inside the budget and a brighter one outside it. What separates them is
+that the first has a sub-ULP drive and the second does not.
+
+Its effect on A1, over all 57 vectors the corpus holds for that device:
+
+| | worst dE2000 |
+|---|---:|
+| every vector | 1.3055, at `bt2020-rgb-03` -- source code (0,0,1) in BT.2020, whose reference drives are (0, 5.242e-05, **1.447e-05**) |
+| vectors with no sub-ULP drive (49 of 57) | **0.3951** |
+
+So A1's 0.5 is met everywhere the arithmetic can represent the target **in a
+single frame**, which is what these figures measure: `processPixelQ16` returns
+one `i32` triple per pixel and the corpus is compared frame by frame. The
+vectors above 0.5 are out of reach of a one-frame fixed-point answer of this
+width -- by any implementation of it, not just this one. They are not thereby
+unreachable altogether, because a cycle can average to a sub-ULP drive; see
+the note below on the unsupported low-light region, which is the same
+distinction from the other side. Eight of the 57 carry a sub-ULP drive.
+
+What `tests/fl/gfx/pipeline.cpp` asserts, stated exactly rather than as "both
+figures are pinned", which they are not:
+
+* the corpus size and the excluded count are pinned exactly -- `kVectorCount
+  == 57` and `below_floor == 8` -- so a shrunken corpus, or a floor that
+  swallowed it, cannot satisfy the bounds below;
+* the floored worst is bounded above twice, at A1's `0.5` and again at `0.45`,
+  so a regression that stays inside A1 still fails;
+* the unfloored worst is bounded above at `1.4`, so the low-light miss cannot
+  quietly grow while the floored bound keeps passing.
+
+Those are upper bounds and not equalities: a floored worst of 0.44 would pass.
+The measured values, 0.3951 and 1.3055, are recorded in the comments beside
+those assertions and here, and are what a change should be read against. The
+count of vectors above 0.5 is not asserted at all -- `below_floor` is.
+
+This does not silently exclude difficult vectors: the excluded set is defined
+by a property of the arithmetic, its size is asserted, and the unfloored
+number is published beside the floored one.
+
+What this floor does **not** settle is the *unsupported low-light region* the
+same paragraph asks for -- that is a statement about what a device is allowed
+to render, and it needs P8's dithering answer, since a sub-ULP average drive is
+reachable over a cycle even though it is not reachable in one frame.
+
+Dither accuracy for the current eight-presentation cycle is specified for
+equally timed accepted presentations at a declared nominal cadence and
+observation window. Evaluate the emitted light over the whole cycle in XYZ
+before calculating perceptual error; do not average frame Delta E values.
+Each channel advances its phase when its driver accepts a frame, so dropped
+submissions do not consume a phase. Acceptance does not report when the frame
+becomes visible or how long it remains visible. Unequal dwell between accepted
+presentations can bias the time-weighted result and is **not** covered by the
+cycle-mean accuracy guarantee; tests must demonstrate this limitation as well
+as the equal-dwell and dropped-submission behavior. The existing refresh-rate
+gate can disable dithering at low cadence; it does not measure frame dwell.
+For scale: linear16 code 1 needs
+one native RGB8 code-1 frame per 257 equally timed frames to match its average
+on an ideal linear PWM device. At 60 Hz that is about 4.28 seconds. The native
+output report must state the resulting fidelity/flicker limitations.
+
+### Encoder table: what each chipset does after the device solve (P8, §6)
+
+B1 and §6 allow a chipset encoder to do only chipset-specific quantization and current encoding after the device solve. It must not add a second correction or gamma stage. This table records, **as built**, what each encoder on the `fl::Channel` path does to a colour-managed channel's drives, and which modes embed their own shaping stage. The dispatch is `Channel::showPixels` in `src/fl/channels/channel.cpp.hpp`.
+
+**The managed source.** `ColorManagedPixelSource` hands every encoder the pipeline's drive:
+- rounded once to 8 bits (`quantize`), or
+- to 16 bits for wide encoders (`quantize16`);
+
+with brightness already applied as C4's flux scalar.
+
+**RGBW and RGBWW.** On a managed channel the RGBW and RGBWW sources still hand off to the legacy controller, because the two-white allocation is not on the pipeline (#4198). The legacy rows apply to them.
+
+| encoder (Channel) | wire | managed channel receives | embedded shaping stage | notes |
+|---|---|---|---|---|
+| WS2812-class clockless | 8-bit | the 8-bit drive, verbatim | none | |
+| TM1908 | 8-bit | the 8-bit drive, verbatim, after the command prefix | none | |
+| UCS7604 8-bit | 8-bit | the 8-bit drive, verbatim | none | header carries the current fields |
+| UCS7604 16-bit, 16-bit/1600 | 16-bit | the 16-bit drive (`encodeUCS7604_16bit_RGB_wide`) | **Gamma8 LUT (expansion), unmanaged only** | #4368; the managed path skips it |
+| HD108 | 16-bit + 5-bit gains | the 16-bit drive; gains held at 31 | **gamma 2.8 (`hd108GammaCorrect`), unmanaged only** | #4387 |
+| APA102, SK9822, DOTSTAR, HD107 | 8-bit + 5-bit field | the 8-bit drive, verbatim; **field held at 31** | none | managed channels encode through `encodeManagedSpi` with a fixed field, whatever `FASTLED_USE_GLOBAL_BRIGHTNESS` says (#4457). On the legacy path that option still derives a strip-wide field from pixel 0 and rescales only that pixel, dimming the rest by field/31: long-standing behaviour of an opt-in flag, left unchanged. |
+| APA102HD, SK9822HD, DOTSTARHD, HD107HD | 8-bit + 5-bit field | the 8-bit drive; **field held at 31** | brightness→field map, **unmanaged only** | #4441, B1's conservative treatment. A joint code/field solve needs B1's flicker floor. |
+| WS2801, WS2803, SM16716 | 8-bit | the 8-bit drive, verbatim | none | |
+| P9813 | 8-bit | the 8-bit drive, verbatim, after the per-pixel checksum byte | none | |
+| LPD8806 | 7-bit | the 16-bit drive quantized **once** to 7 bits (`writeLPD8806Wide`) | none | managed path only; the legacy path's low-bit nudge does not apply |
+| LPD6803 | 5-bit | the 16-bit drive quantized **once** to 5 bits (`writeLPD6803Wide`) | none | managed path only |
+| TM1812 RGBWW | 8-bit | legacy path (#4198) | legacy | |
+| WS2816, MY9221 | — | not on the Channel path (legacy `addLeds<>` only) | — | |
+
+**Where §6 is met.** Every encoder that embeds a gamma, expansion or field-derivation stage skips it on a managed channel. That includes APA102/SK9822 under `FASTLED_USE_GLOBAL_BRIGHTNESS` (#4457), and nothing on the managed path applies a second shaping stage after the device solve.
+
+**Narrow wires (B3).** LPD8806 and LPD6803 have wires narrower than 8 bits. On a managed channel they quantize the 16-bit drive once, straight to their width, through `ColorPipelineHooks::encodeManagedSpi`. Their 8-bit path would round to 8 bits and then shift or truncate again. `tests/fl/channels/color_managed_source.cpp` checks every byte against the single-step computation, and requires that it differ from the two-step result somewhere.
+
+## Ownership and tiers (R9)
+
+New emitter/source profile configuration belongs exclusively to `fl::Channel`
+and its `ChannelOptions`. The legacy `CLEDController`/`FastLED.addLeds()` path
+stores only compact legacy settings; it has no new profile binding or pipeline
+accessor. Runtime profiles are disabled on AVR, including Uno. The traditional
+correction and temperature enums remain legacy RGB multipliers, and supported
+RGBW/RGBWW output remains available. UCS7604 gamma is driver-owned through
+`setGamma()` and `clearGamma()`, rather than stored in every controller.
+
+Runtime bindings own immutable profile/configuration data, including response
+tables, or accept an explicitly lifetime-bound immutable source handle. Global
+defaults always own their values. Do not retain a pointer to a caller's stack
+temporary. Rebinding replaces a profile/cache identity, not fields behind an
+unchanged cache key.
+
+On supported non-AVR platforms, the TINY minimal configuration uses compile-time/static profile specialization
+with no additional per-controller runtime fields. Runtime profile storage is a
+separate capability on larger tiers. Prove disabled, static-minimal, and runtime
+layouts independently; default-null pointers are not zero added state.
+
+Managed-mode legacy exclusion covers correction, temperature, artistic gamma,
+and binary dithering. Binding configuration is distinguishable from active
+managed rendering; an API-only phase must not report calibrated output while
+the legacy encoder is still used.
+
+## Completion evidence
+
+Each phase has its own implementation PR, focused RED-to-GREEN evidence,
+appropriate review and regression checks, and verified merged state. A
+prerequisite slice may land separately, but it must not auto-close a phase
+whose acceptance criteria remain unmet. The overall program requires measured
+reports for representative clockless and high-precision strips, plus the
+specified platform budgets and legacy compatibility gates. Neither this
+addendum nor synthetic golden vectors substitutes for that evidence.

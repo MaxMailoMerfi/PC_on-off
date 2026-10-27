@@ -8,8 +8,6 @@ optimizations to the STATIC_LINKER rule: ``restat=1`` (lets ninja skip the
 relink cascade when the archive is unchanged) and the
 ``ar_content_preserving.py`` wrapper (preserves the archive's mtime when
 content is unchanged).
-
-Also contains stale-lockfile cleanup for the Windows DirectoryLock bug.
 """
 # pyright: reportMissingImports=false, reportUnknownVariableType=false
 
@@ -24,51 +22,12 @@ from ci.util.global_interrupt_handler import handle_keyboard_interrupt
 from ci.util.timestamp_print import ts_print as _ts_print
 
 
-def cleanup_stale_meson_lockfile(build_dir: Path) -> bool:
-    """Remove a stale ``meson-private/meson.lock`` left by a killed meson process.
-
-    On Windows, meson <= 1.10.x crashed cryptically in ``DirectoryLock.__enter__``
-    when the underlying lockfile open() raised an OSError (e.g., from a stale
-    lockfile left by a killed/abandoned meson process). meson 1.11.0 fixed the
-    crash itself, but the underlying cause — a stale ``meson-private/meson.lock``
-    file — still produces an avoidable setup failure on Windows. Deleting the
-    stale lockfile before invoking ``meson setup`` avoids the failure entirely.
-
-    Args:
-        build_dir: The meson build directory (parent of ``meson-private``).
-
-    Returns:
-        True if a stale lockfile was found and successfully removed, False
-        otherwise (including when no lockfile exists or removal failed).
-    """
-    # Stale lockfile cleanup is intended for the Windows DirectoryLock bug.
-    # On POSIX, meson uses fcntl/flock (advisory) — removing an in-use lockfile
-    # could let a concurrent meson setup bypass the intended lock.
-    if os.name != "nt":
-        return False
-
-    lockfile = build_dir / "meson-private" / "meson.lock"
-    if not lockfile.exists():
-        return False
-    try:
-        lockfile.unlink()
-        _ts_print(f"[MESON] Removed stale lockfile: {lockfile}")
-        return True
-    except KeyboardInterrupt as ki:
-        handle_keyboard_interrupt(ki)
-        raise
-    except OSError as e:
-        # Be tolerant of file-in-use errors on Windows — if removal fails, log
-        # and continue. The caller will hit the original OSError from meson,
-        # which is now visible thanks to the 1.11.0 bump.
-        _ts_print(f"[MESON] Warning: Could not remove stale lockfile {lockfile}: {e}")
-        return False
-
-
 def _write_configuration_markers(
     *,
     build_mode_marker: Path,
     build_mode: str,
+    native_linker_marker: Path,
+    native_linker_identity: str,
     thin_archive_marker: Path,
     use_thin_archives: bool,
     debug_marker: Path,
@@ -88,6 +47,8 @@ def _write_configuration_markers(
     current_zccache_version: Optional[str] = None,
     enable_examples_marker: Optional[Path] = None,
     enable_examples: Optional[bool] = None,
+    enable_full_examples_marker: Optional[Path] = None,
+    enable_full_examples: Optional[bool] = None,
     enable_unit_tests_marker: Optional[Path] = None,
     enable_unit_tests: Optional[bool] = None,
     only_missing: bool = False,
@@ -102,6 +63,7 @@ def _write_configuration_markers(
     """
     markers: list[tuple[Path, str, str]] = [
         (build_mode_marker, build_mode, f"build_mode: {build_mode}"),
+        (native_linker_marker, native_linker_identity, "native linker identity"),
         (
             thin_archive_marker,
             str(use_thin_archives),
@@ -133,6 +95,14 @@ def _write_configuration_markers(
                 enable_examples_marker,
                 str(enable_examples),
                 f"enable_examples: {enable_examples}",
+            )
+        )
+    if enable_full_examples_marker is not None and enable_full_examples is not None:
+        markers.append(
+            (
+                enable_full_examples_marker,
+                str(enable_full_examples),
+                f"enable_full_examples: {enable_full_examples}",
             )
         )
     if enable_unit_tests_marker is not None and enable_unit_tests is not None:
@@ -199,8 +169,14 @@ def inject_ar_optimization_patches(build_dir: Path, source_dir: Path) -> bool:
     Returns:
         True if both patches are active after this call, False if not applicable
     """
-    ar_wrapper_script = source_dir / "ci" / "meson" / "ar_content_preserving.py"
-    build_ninja_path = build_dir / "build.ninja"
+    # Ninja runs archive commands with the build directory as cwd. Keep the
+    # wrapper absolute even when the caller supplied a relative source/build
+    # path; otherwise Ninja resolves it under `.build/meson-quick/ci/meson`
+    # and the first archive link fails before tests can start (FastLED#3693).
+    ar_wrapper_script = (
+        source_dir / "ci" / "meson" / "ar_content_preserving.py"
+    ).resolve()
+    build_ninja_path = (build_dir / "build.ninja").resolve()
 
     if not ar_wrapper_script.exists() or not build_ninja_path.exists():
         return False
@@ -216,8 +192,9 @@ def inject_ar_optimization_patches(build_dir: Path, source_dir: Path) -> bool:
     # Idempotency check: if both patches already present, no write needed
     has_ar_wrapper = ar_wrapper_script.name in content
     has_restat = "restat = 1" in content
+    stale_wrapper_prefix = f'"{ar_wrapper_script}" rm -f $out && '
 
-    if has_ar_wrapper and has_restat:
+    if has_ar_wrapper and has_restat and stale_wrapper_prefix not in content:
         _ar_opt_status_cache[str(build_dir)] = True
         return True
 
@@ -232,6 +209,13 @@ def inject_ar_optimization_patches(build_dir: Path, source_dir: Path) -> bool:
 
     rule_text = content[static_linker_pos:rule_end]
     new_rule_text = rule_text
+
+    # Repair build.ninja files patched by earlier versions of this function.
+    # Reconfiguration need not occur for a source-only change, so the stale
+    # shell prefix may persist in an existing build directory.
+    new_rule_text = new_rule_text.replace(
+        stale_wrapper_prefix, f'"{ar_wrapper_script}" '
+    )
 
     # Patch 1: restat = 1 (enables ninja cascade suppression after archive)
     if not has_restat:
@@ -253,6 +237,10 @@ def inject_ar_optimization_patches(build_dir: Path, source_dir: Path) -> bool:
                 cmd_line_end = len(new_rule_text)
             original_cmd = new_rule_text[cmd_line_start:cmd_line_end]
             if "$LINK_ARGS $out $in" in original_cmd:
+                # Meson prefixes static archive commands with a shell cleanup.
+                # The content-preserving wrapper handles replacement itself;
+                # passing `rm` as its archiver would fail before any test builds.
+                original_cmd = original_cmd.removeprefix("rm -f $out && ")
                 python_exe = sys.executable
                 new_cmd = f'"{python_exe}" "{ar_wrapper_script}" {original_cmd}'
                 new_rule_text = (
@@ -287,6 +275,10 @@ _ZCCACHE_TARGET_RULES: tuple[str, ...] = (
     "c_COMPILER",
     "c_LINKER",
 )
+
+# Windows parallel DLL links remain unwrapped after daemon IPC failures (#3126).
+# Compile commands need zccache for its private PCH input view on every host.
+_ZCCACHE_WINDOWS_TARGET_RULES: tuple[str, ...] = ("cpp_COMPILER", "c_COMPILER")
 
 
 def inject_zccache_wrapping(build_dir: Path, zccache_path: Optional[str]) -> bool:
@@ -338,6 +330,9 @@ def inject_zccache_wrapping(build_dir: Path, zccache_path: Optional[str]) -> boo
     zccache_quoted = f'"{zccache_path_normalized}"'
 
     new_content = content
+    target_rules = (
+        _ZCCACHE_WINDOWS_TARGET_RULES if os.name == "nt" else _ZCCACHE_TARGET_RULES
+    )
     for rule_name in _ZCCACHE_TARGET_RULES:
         rule_marker = f"rule {rule_name}\n"
         rule_pos = new_content.find(rule_marker)
@@ -355,6 +350,11 @@ def inject_zccache_wrapping(build_dir: Path, zccache_path: Optional[str]) -> boo
         # Idempotency: if the command already starts with the zccache path,
         # nothing to do for this rule.
         existing_value = new_content[value_start:block_end]
+        if rule_name not in target_rules:
+            if existing_value.startswith(zccache_quoted + " "):
+                remove_end = value_start + len(zccache_quoted) + 1
+                new_content = new_content[:value_start] + new_content[remove_end:]
+            continue
         if existing_value.startswith(zccache_quoted + " "):
             continue
         new_content = (

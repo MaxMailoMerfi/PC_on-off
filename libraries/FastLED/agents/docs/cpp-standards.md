@@ -54,6 +54,7 @@ src/fl/stl/fixed_point/          ← implementation directory
 
 ## Platform Dispatch Headers
 - FastLED uses dispatch headers in `src/platforms/` (e.g., `int.h`, `io_arduino.h`) that route to platform-specific implementations via coarse-to-fine detection. See `src/platforms/README.md` for details.
+- **ESP32: dispatch Arduino-vs-native on capability detection, not `#ifdef ARDUINO`.** Ask "is the ESP-IDF driver header available" (`FL_HAS_INCLUDE("driver/gpio.h")`), not "is Arduino the active framework" — Arduino-ESP32 bundles the same ESP-IDF drivers, so capability detection picks the IDF-native implementation under both Arduino and bare ESP-IDF, with Arduino APIs reachable only as an explicit opt-in (e.g. `FL_ESP32_SPI_ARDUINO=1`). See `src/platforms/esp/32/ARCHITECTURE.md` → "No Environment Directories (Arduino vs ESP-IDF)" for the full rule, exceptions (platform identification, host-mock selection), and reference implementation (`pin_esp32_native.hpp`). Established by FastLED#3715/#3722.
 - **Platform-specific headers (`src/platforms/**`)**: Header files typically do NOT need platform guards (e.g., `#ifdef ESP32`). Only the `.cpp` implementation files require guards. When the `.cpp` file is guarded from compilation, the header won't be included. This approach provides better IDE code assistance and IntelliSense support.
   - Correct pattern:
     - `header.h`: No platform guards (clean interface)
@@ -139,6 +140,34 @@ When the no-op only makes sense for the host/stub build (because it pretends to 
   - Avoid: `std::vector<uint8_t> getData()` (unnecessary copy)
   - Use `fl::span<const T>` for read-only views to prevent accidental modification
 
+## No Raw Pointers Into `fl::` Containers (lint-enforced)
+
+Do not treat an `fl::` container as a flat buffer by taking a raw pointer into
+its storage. `fl::deque<T>` stores elements as a chunked map of fixed-size
+blocks (PR #3282), so `&dq[0]` / `dq.data()` addresses at most one chunk —
+that was the `json::to_string_native` overrun and the #3286 audio-detector
+crash. Even on containers that ARE contiguous today the idiom is brittle to
+layout changes and bypasses bounds checking.
+
+Banned forms on `fl::` containers: `.data()` (non-contiguous containers only),
+`&c[i]`, `&c.at(i)`, `&c.front()`, `&c.back()`.
+
+Use instead:
+
+- `fl::span<T>` — a bounded view; contiguity is proven at the type level.
+- An iterator pair `[begin, end)` — works for any container, including `fl::deque`.
+- An explicit copy for legacy C APIs:
+  `fl::vector<T> flat(dq.begin(), dq.end()); use(flat.data(), flat.size());`
+
+Enforced by two Rust lint checkers in
+`ci/lint_cpp_rs/src/checkers/container_ptr.rs` (FastLED#3287):
+`ContainerNonContiguousPtrChecker` hard-fails on `fl::deque` /
+`fl::circular_buffer`; `ContainerElementAddressChecker` is warn-only for
+address-of-element on `fl::vector` / `fl::string` / `fl::array` and friends.
+Genuine C-API interop sites can carry a `// fl-lint: container-data-ptr-ok`
+comment (line suffix or the line immediately above), justified by a short
+reason.
+
 ## Macro Definition Patterns
 
 ### Type 1: Platform/Feature Detection Macros (defined/undefined pattern)
@@ -148,6 +177,22 @@ When the no-op only makes sense for the host/stub build (because it pretends to 
 - Correct: `FL_IS_STM32`, `FL_IS_STM32_F1`, `FL_IS_STM32_H7`, `FL_IS_ESP_32S3`
 - Wrong: `FASTLED_STM32_F1`, `FASTLED_STM32` (missing `FL_IS_` prefix)
 - Wrong: `FL_STM32_F1`, `IS_STM32_F1` (incorrect prefix pattern)
+
+**Enforced, as of FastLED#4021.** The Rust `MacroPrefixChecker` runs inside
+`bash lint --cpp` and fails on a *new* `FASTLED_*` macro name. Existing public
+and compatibility names that cannot yet be renamed are explicitly listed in
+`ci/lint_cpp_rs/legacy_macro_amnesty.txt`. That centralized list is reviewed
+by hand and may shrink freely; it must never be bulk-regenerated from source.
+
+It matches names on preprocessor lines, so a macro that is only ever *tested*
+counts. That is deliberate: `FASTLED_SAMD51_HW_SPI` was a user-supplied opt-in
+appearing solely as `#if defined(...)`, never defined here, and a
+definitions-only check would have passed exactly the case that motivated the
+rule's enforcement.
+
+If a name genuinely has to match one published outside this repo, add it to
+the centralized amnesty with reviewable compatibility justification in the
+change description. New internal macros still use `FL_`.
 
 **Detection and Usage:**
 - Platform defines like `FL_IS_ARM`, `FL_IS_STM32`, `FL_IS_ESP32` and their variants
@@ -191,12 +236,69 @@ For a subsystem (e.g., `Watchdog`, `Audio`, `Codec`) that has multi-tier platfor
 
 **Distinction from Type 1 (`FL_IS_*`):** Type 1 says "I am running on platform X." Type 3 says "this component has feature Y on this platform." A single platform may carry many Type 3 flags from independent components.
 
+## Default Example Pins (`FL_PIN_*`) — Platform Declares, Header Falls Back
+
+Examples must not hardcode pin numbers. A literal in a sketch is a guess about hardware the sketch cannot see; the platform is the only layer that knows which pins exist.
+
+| Macro | Fallback | Use |
+|---|---|---|
+| `FL_PIN_CLOCKLESS_1` | `3` | data pin, single-wire chipsets (WS2812 etc.) |
+| `FL_PIN_SPI_DATA_1` | `1` | data pin, clocked chipsets (APA102 etc.) |
+| `FL_PIN_SPI_CLOCK_1` | `2` | clock pin, clocked chipsets |
+
+**The contract, both halves:**
+
+1. **A platform SHOULD declare its own value** beside its `_FL_DEFPIN` table (or its pin-mask block), guarded with `#ifndef` so a sketch or build flag still wins.
+2. **A platform that declares nothing gets the fallback**, defined in `src/platforms/default_pins.h`. That is a supported outcome, not an omission to be linted — most platforms are fine on pin 3.
+
+```cpp
+// in the platform's fastpin_*.h, next to the pin table that justifies it
+#ifndef FL_PIN_CLOCKLESS_1
+#define FL_PIN_CLOCKLESS_1 4
+#endif
+```
+
+`platforms/default_pins.h` is included from `FastLED.h` *after* `platforms.h`, so platform declarations always win. Declaring in a `.cpp.hpp` is wrong — examples need the value at preprocess time.
+
+**Examples consume the macro, never a literal:**
+
+```cpp
+#ifndef PIN_DATA
+#define PIN_DATA FL_PIN_CLOCKLESS_1   // sketch/build flag still overrides
+#endif
+```
+
+### Choosing a value
+
+Compiling is the floor, not the bar. `FastPin<N>::validpin()` catches only pins the platform declares invalid; it cannot catch a pin that exists and is still a bad default. A good value is:
+
+- **present in that board's `_FL_DEFPIN` table** — the compile-time failure, and the cheapest to check
+- **not the UART the examples print on** — most examples call `Serial.begin()`, so a default that lands on `RX`/`TX` has the sketch fighting its own console
+- **not a boot-strapping pin** — sampled at reset; an attached strip can hold it and stop the board booting
+- **not reserved for flash, PSRAM, or USB/JTAG**
+- **actually broken out** on the reference board for that platform
+
+Platform headers usually already record this. `fastpin_esp32.h` documents its UART and flash pins per variant in the `FASTLED_UNUSABLE_PIN_MASK` comments — read those before picking, rather than inferring from a datasheet.
+
+### Enforcement
+
+`ci/tests/test_samd_default_pins.py` parses each board branch's pin table, resolves all three macros (declared value, else fallback), and asserts the result is in that table. It is preprocessor/parser level, so it needs no cross-toolchain. Extend it as platforms declare values — the shape generalises beyond SAMD.
+
+### Why this exists
+
+Two failures, both invisible for a long time:
+
+- **Adafruit Feather M4 has no pin 2 and no pin 3** (`fastpin_arm_d51.h` says so outright: "no pins 2 3"). `Blink` hardcoded 3 and `Apa102` hardcoded 1/2, so neither compiled for that board — with a `validpin()` assertion whose message talks about ground and read-only and noisy pins, sending you to look at wiring rather than at a pin table. Nobody noticed because SAMD had never built at all (#4011).
+- **On ESP32 classic, GPIO 3 is `U0RXD`** — the pin `Serial` receives on. That compiles cleanly and is wrong on hardware, which is the worse failure: the example silently does nothing and there is nothing to search for.
+
+Tracking issue for the per-platform audit: **#4018**.
+
 ## Warning and Debug Output
 - **Use proper warning macros** from `fl/stl/compiler_control.h`
 - **Use `FL_DBG("message" << var)`** for debug prints (easily stripped in release builds)
 - **Use `FL_WARN("message" << var)`** for warnings (persist into release builds)
 - **Avoid `fl::printf`, `fl::print`, `fl::println`** - prefer FL_DBG/FL_WARN macros instead
-- Note: FL_DBG and FL_WARN use stream-style `<<` operator, NOT printf-style formatting
+- **printf-style log formatting is a compile error** (#4709): every log macro (`FL_WARN`, `FL_ERROR`, `FL_INFO`, `FL_DBG`, `FL_PRINT`, `FL_LOG_*`, `FASTLED_*`, `FL_LOG_ASYNC`) takes one literal or one `<<` stream chain. `FL_WARN("x=%d", x)` fails with a static_assert because it links the whole `fl::printf` engine (RAM1 on Teensy 4). Write `FL_WARN("x=" << x)`; use `fl::to_hex(v)` for `%x`.
 
 ## Teensy 3.x `__cxa_guard` Conflicts
 - **Problem**: Function-local statics with non-trivial constructors generate implicit `__cxa_guard_*` function calls. If Teensy's `<new.h>` is included after the compiler sees the static, the signatures conflict.
@@ -212,14 +314,88 @@ For a subsystem (e.g., `Watchdog`, `Audio`, `Codec`) that has multi-tier platfor
 - **Alternative Solution (header files)**: Move static initialization to corresponding `.cpp` file
   - Example: See `src/platforms/shared/spi_hw_1.{h,cpp}` for the correct pattern
 - **Exception**: Statics inside template functions are allowed (each template instantiation gets its own static, avoiding conflicts)
-- **Linter**: Enforced by `ci/lint_cpp/test_no_static_in_headers.py` for critical directories (`src/platforms/shared/`, `src/fl/`, `src/fx/`)
+- **Linter**: Enforced by `StaticInHeaderChecker` in the Rust crate (`ci/lint_cpp_rs/src/checkers/style.rs`) for critical directories (`src/platforms/shared/`, `src/fl/`, `src/fx/`)
 - **Suppression**: Add `// okay static in header` comment if absolutely necessary (use sparingly)
+
+## Peripheral Mocks: Singleton + `MockWrapper` Forwarder (REQUIRED)
+- **Rule:** Every peripheral mock in FastLED (`Rmt4PeripheralMock`, `Rmt5PeripheralMock`, `UartPeripheralMock`, `I2sLcdCamPeripheralMock`, `I2sPeripheralEsp32DevMock`, `SpiPeripheralMock`, `FlexIOPeripheralMock`, etc.) MUST expose `static XxxMock& instance() FL_NO_EXCEPT` backed by `fl::Singleton<XxxMockImpl>`. Per-test factories (`createShared()`, `create()`, `make_shared<Mock>()`) are **not** acceptable — they fragment state across the process, break the mental model shared with every peer mock, and turn `reset()` between tests from mandatory hygiene into an unreachable no-op.
+- **How to wire a singleton mock into an engine that takes `fl::shared_ptr<IPeripheral>`:** define a thin `MockWrapper : public IPeripheral` class inside the test TU that forwards every interface method to `XxxMock::instance().foo(...)`, then pass `fl::make_shared<MockWrapper>()` to the engine ctor. See `tests/platforms/esp/32/drivers/i2s/channel_driver_i2s.cpp:43-87` for the canonical `createMockPeripheral()` helper — every new engine test copies this pattern.
+- **Why:** The peripheral is a real hardware resource — there is exactly one on the chip. The mock mirrors that constraint. Tests that need different mock configurations use error-injection knobs on the singleton (`setTransmitFailure(true)` etc.) and `reset()` between cases, not a fresh mock per test.
+- **Exception:** none. If your engine's ctor doesn't take a `shared_ptr<IPeripheral>`, put the mock in a member field of the test fixture and call `instance()` directly — the singleton pattern still holds.
+- **History:** Established during #3471 (I2S esp32dev bring-up) after an earlier draft used `createShared()`. Every peer mock in the tree pre-dates that draft and uses the singleton — the wrapper pattern was documented in code but not in the standards until this point.
+
+## One peripheral, one `Bus::FLEX_IO` slot (REQUIRED)
+- **Rule:** A physical peripheral (I2S1, PARLIO, LCD_CAM, FlexIO2, etc.) is bound to EXACTLY ONE `Bus::FLEX_IO` slot on any given silicon. Never register two `BusTraits<Bus::FLEX_IO, N>` specializations that both wrap the same underlying hardware, even at different `N` values.
+- **How to spot the mistake:** if two drivers you're about to register both call into the same peripheral's registers (I2S1 conflict, PARLIO channel conflict, LCD_CAM peripheral, etc.), and you're tempted to put them at `Bus::FLEX_IO, 0` and `Bus::FLEX_IO, 1` respectively — stop. The correct move is a **unified engine at one slot** (see the next section) that dispatches per-channel by mode.
+- **Why:** the peripheral can only run one mode / one configuration at a time. Two slots claiming the same hardware creates a runtime race where whichever slot got its `initialize()` called last wins, silently. Users diagnosing "why did my SPI-mode strip stop working after I called `enableAllDrivers()`" have no way to figure out that a clockless-mode registration at a different slot number stole the hardware.
+- **Correct multi-slot usage:** slots ARE for genuinely separate peripherals. On ESP32-P4, `Bus::FLEX_IO, 0` = PARLIO peripheral, `Bus::FLEX_IO, 1` = LCD_CAM RGB peripheral. Different silicon blocks, different registers, no conflict. On classic ESP32, both `I2S_SPI` and the modern `ChannelEngineI2sEsp32Dev` wrap I2S1 — same peripheral — so both live at `Bus::FLEX_IO, 0` and the transition from one to the other is a swap, not a coexistence.
+- **History:** Established 2026-07-01 during FastLED#3516 I2S driver rewrite. Agent proposed registering the new modern I2S engine at `Bus::FLEX_IO, 1` on classic ESP32 to bench-verify it in parallel with the existing `I2S_SPI` at `Bus::FLEX_IO, 0`. Developer caught the mistake — "if these are using the same peripheral then they both need to be flexio 0." Rule captured so future agents don't repeat the "temporary parallel binding for bench testing" shortcut. Both drivers own I2S1; only one can be bound; the transition is a swap-at-Phase-2c, not a two-slot coexistence.
+
+## Parallel-IO Driver: Unified Clockless + SPI Engine (REQUIRED)
+- **Rule:** Any parallel-IO peripheral driver (FlexIO, ObjectFLED, ESP32 PARLIO, LCD_CAM, I2S, etc.) MUST put its SPI mode and its clockless mode in the SAME `ChannelEngine` — do NOT fork into separate `ChannelEngineXxx` + `ChannelEngineXxxSPI` classes, separate `Bus::X` + `Bus::X_SPI` enum values, or separate `BusTraits<>` specializations.
+- **How:** The unified engine's `getCapabilities()` returns `Capabilities(true, true)`. Both `BusSupports<Bus::X, ClocklessChipset>` and `BusSupports<Bus::X, SpiChipsetConfig>` specialize to `fl::true_type`. `canHandle()` accepts both `data->isClockless()` and `data->isSpi()` channels (gated by pin / timing routability for each mode). `show()` routes per-channel — if the prior channel ran clockless and the current channel is SPI, reconfigure the peripheral (shifter / timer / DMA TCD) before transmitting.
+- **Why:** The peripheral itself can only run in one mode at a time, so the mode switch always happens AT show-time anyway. Forking duplicates Bus enum entries, priority-table rows, registration calls, `_build.cpp.hpp` includes, and `BusTraits<>` specializations for zero behavioral benefit. The peripheral is the dispatch boundary, not the mode.
+- **Exception:** genuinely separate peripherals (e.g. ESP32 LPSPI vs I2S_SPI are different silicon blocks with completely different register surfaces) get separate drivers. The "parallel-IO" qualifier excludes the different-peripheral-same-protocol case.
+- **History:** Established 2026-06-27 during #3428 FlexIO-SPI/ObjectFLED-SPI implementation. Initial design forked into separate FLEX_IO_SPI / OBJECT_FLED_SPI bus slots; user reverted because forking made the maintenance surface 4× larger with no benefit. See `src/fl/channels/README.md` → "Rule: Parallel-IO peripherals — one engine for both clockless and SPI modes" for the full pattern + reference code.
+
+## Runtime driver selection is `Bus::FLEX_IO` — legacy chipset templates are not (REQUIRED)
+- **Rule:** When adding an AutoResearch harness, on-device test, or any test-driver code that exercises a parallel-IO peripheral (FlexIO, ObjectFLED, ESP32 PARLIO, LCD_CAM, I2S1 parallel-out, etc.), **reach for the `Bus::FLEX_IO` runtime-selection surface**, never the legacy chipset template class directly.
+- **Old (wrong) way — reaching for the class template:**
+  ```cpp
+  // Rebuilds a whole custom pipeline around one specific driver's
+  // template and blocks driver unification. NEVER do this in a
+  // test harness or validation sketch.
+  ClocklessI2S<PIN, WS2812_TIMING, GRB> controller;   // ← wrong
+  FastLED.addLeds(&controller, leds, N);
+  ```
+- **New (right) way — runtime binding through `Bus::FLEX_IO`:**
+  ```cpp
+  // Bind whatever peripheral BusTraits<Bus::FLEX_IO, 0> resolves to
+  // on this silicon (classic ESP32 → I2S1; ESP32-P4/C6/H2/C5 →
+  // PARLIO; Teensy 4.x → FlexIO or ObjectFLED; ESP32-S3 → LCD_CAM).
+  FastLED.setExclusiveDriver<fl::Bus::FLEX_IO, 0>();
+  FastLED.addLeds<WS2812, PIN, GRB>(leds, N);
+  ```
+- **Subtype information (which concrete peripheral is actually bound, which port/instance number, which mode) goes into a device-info JSON structure returned by the RPC handler.** The handler is peripheral-agnostic; the runtime driver reports what it is. Example shape:
+  ```json
+  {
+    "bus": "FLEX_IO",
+    "instance": 0,
+    "peripheral": "I2S1_PARALLEL",
+    "port": 1,
+    "silicon": "ESP32-D0WD-V3",
+    "mode": "clockless"
+  }
+  ```
+- **Caveat — mind the `Bus::FLEX_IO, 0` binding on classic ESP32 today:** as of 2026-07-01, the `Bus::FLEX_IO, 0` slot on classic ESP32 routes to the **I2S-SPI** driver (`src/platforms/esp/32/drivers/i2s_spi/`), NOT the Yves parallel-out clockless driver (`src/platforms/esp/32/drivers/i2s/clockless_i2s_esp32.h`). The unified clockless-plus-SPI engine that would make the parallel-out clockless reachable via `Bus::FLEX_IO, 0` is tracked in [FastLED#3512 Phase 4](https://github.com/FastLED/FastLED/issues/3512). Until Phase 4 lands, an AutoResearch harness or test harness that wants to validate the Yves clockless parallel-out driver cannot reach it through the modern channel API — that harness is genuinely blocked on Phase 4. Do NOT invent a workaround by reaching for `ClocklessI2S<>` directly; write the harness once Phase 4 makes it reachable via `Bus::FLEX_IO, 0`.
+- **Rationale:** the whole point of the parallel-IO unified-engine rule (previous section) is that the `Bus::FLEX_IO` slot dispatches per-silicon to the right peripheral in the right mode, and users select drivers at runtime rather than compile-time. If a test harness reaches for one specific chipset template, that harness only works for one specific driver — and every future driver has to grow its own harness. One `Bus::FLEX_IO` harness works across every parallel-IO driver on every silicon, with subtype info flowing through the device-info JSON.
+- **History:** Established 2026-07-01 during [FastLED#3515 Phase B](https://github.com/FastLED/FastLED/issues/3515) drafting. Agent initially reached for `ClocklessI2S<>` directly to write an I2S-specific harness; user rejected because the modern channel-manager surface makes I2S "just a `Bus::FLEX_IO` implementation," and subtype info belongs in a device-info JSON, not baked into the harness. See [FastLED#3516](https://github.com/FastLED/FastLED/issues/3516) meta and the surrounding refactor phases.
+
+## Check if the target hardware might already be attached (REQUIRED)
+- **Rule:** Before declaring a task "bench-blocked" or "requires physical hardware I don't have," **first check whether the target device might already be attached to the developer's machine and try running the on-device validation.** Do not assume hardware is absent — the developer's bench is often live.
+- **MANDATORY FIRST STEP — `fbuild port scan` before ANY "not attached" claim.** You may **never** write "board X is not attached" / "I don't have that board" / "static-verified only, target board absent" **without first enumerating what is physically connected.** A "no board" statement that was not preceded by a port scan in the same session is a rule violation. Enumerate with fbuild's native scanner (NOT raw pyserial — same reason as the PYS001 ban):
+  ```bash
+  fbuild port scan
+  ```
+  It renders two rows per port — the OS identity (`COM11  10C4:EA60  Silicon Labs CP210x …`) plus a `└─ vendor / product` line resolved from the FastLED boards DB (e.g. `└─ Arduino / NodeMCU 0.9 (ESP-12 Module)` for an ESP32-WROOM-class board, `└─ Espressif Systems / WEMOS LOLIN S3`, `└─ NXP Semiconductors / LPC-Link2 CMSIS-DAP` for the LPC845-BRK). `bash autoresearch` with no args also auto-detects a single board via `detect_attached_chip()`, but `fbuild port scan` is the tool for "what is attached right now" because it lists **all** ports at once. Multiple boards are routinely attached simultaneously — do not reason about attachment from memory, prior turns, or which board "this task is about." Read the scan.
+- **How to check a specific target once you know it's present:**
+  - **ESP32 / classic-ESP32 / ESP32-S3 / etc.:** run `bash autoresearch <board>` (e.g. `bash autoresearch esp32dev`). If a device is attached and reachable, autoresearch will compile via fbuild, flash it, boot it, and RPC-ping it. A successful `RESULT: {"type":"ready",...}` boot line + `Ping successful` response confirms live hardware.
+  - **Teensy 4.x:** same — `bash autoresearch teensy41`.
+  - **LPC845-BRK:** `bash autoresearch --pwm-dma-cl` for the SCT+DMA self-loopback.
+  - **Board-specific auto-detect:** running `bash autoresearch` with no arguments will attempt to auto-detect the attached board via its USB serial VID:PID.
+- **When the check applies:** any time an agent is about to write "requires bench validation, deferred," "static-verified only," or "the target board isn't attached" for a driver / peripheral / autoresearch task on any platform the AutoResearch harness supports.
+- **What to do when the device IS attached:** proceed. Land the code, flash it, run the validation, iterate. The whole point of the AutoResearch harness is that on-device validation is a first-class, in-loop step — not a downstream ask on the human.
+- **What to do when the device is NOT attached:** if `bash autoresearch <board>` fails at the connect / serial / RPC-ping stage with a device-not-found or timeout error, THEN the task is genuinely bench-blocked. Document the specific failure (e.g. "COM11 not present," "RPC ping timed out after boot") so the next agent doesn't repeat the check unnecessarily.
+- **Rationale:** repeatedly deferring "bench work" that could actually run in-loop is a productivity killer. The AutoResearch harness exists to eliminate the loop-out-to-human step for the routine "flash and verify" cycle. Assuming hardware is absent when the developer's own answer would be "just try it" wastes both sides' time.
+- **History:**
+  - Established 2026-07-01 during [FastLED#3516](https://github.com/FastLED/FastLED/issues/3516) I2S driver rewrite session. Agent had spent multiple rounds deferring Phases 2b–2e as "bench-blocked" while the developer's ESP32-WROOM was in fact attached to COM11 and running. Developer prompted "the esp32wroom is attached" — one line unblocked a whole cluster of previously-deferred phases. Rule captured so future agents check first, defer second.
+  - **Reinforced 2026-07-04** (LPC pyserial migration session). Agent migrated the flexio/objectfled bench runners and declared them "static-verified only, target ESP32/Teensy boards not attached" — **without ever running a port scan.** The ESP32-WROOM (COM11), three ESP32-S3 boards, and Teensy were attached the whole time and could have been used for a full hardware run. Developer: "esp32wroom and teensy boards ARE attached and you would have known that if you had done a port scan." When the agent then ran the wrong scanner (raw pyserial `list_ports`), the developer corrected it again: use **`fbuild port scan`** — the native scanner that resolves each port's vendor/product from the FastLED boards DB. Both points folded into the MANDATORY step above: never infer absence, and enumerate with `fbuild port scan`.
 
 ## Channel Engine DMA Wait Pattern
 - **`onBeginFrame()` / `show()` must wait for `poll() == READY` before starting a new frame** — use a simple `while (poll() != READY)` loop
-- **Yield in wait loops with `fl::task::run()`** — never busy-spin without yielding. Use `fl::task::run(250, fl::task::ExecFlags::SYSTEM)` inside wait loops to yield to the OS scheduler (FreeRTOS `vTaskDelay(0)` on ESP32, `std::this_thread::yield()` on host). This prevents watchdog timeouts and starvation of WiFi/BT/system tasks. Include `fl/task/executor.h`.
-  - **Do NOT use** bare `fl::yield()`, `vTaskDelay()`, or `taskYIELD()` — `fl::task::run()` is the unified API
-  - For tight DMA polling use `ExecFlags::SYSTEM` (OS yield only, minimal overhead)
+- **Yield in wait loops with `fl::task::yield_system()`** — never busy-spin without yielding. Use `fl::task::yield_system(250)` inside wait loops to yield to the OS scheduler (at least one FreeRTOS tick on ESP32; on host it only pumps the stub coroutine runner and spins out the budget when idle, exactly like `run(us, SYSTEM)`). This prevents watchdog timeouts and starvation of WiFi/BT/system tasks. Include `fl/task/executor.h`.
+  - **Do NOT use** bare `fl::yield()`, `vTaskDelay()`, or `taskYIELD()` — the `fl::task` entry points are the unified API
+  - For tight DMA polling use `fl::task::yield_system(us)` (OS yield only). It behaves exactly like `fl::task::run(us, ExecFlags::SYSTEM)`, but `run()` dispatches on its flags at runtime, so even a SYSTEM-only call links the task Scheduler and Executor into every sketch (~1.8 KB flash, ~200 B RAM on ESP32, #4797)
   - For longer waits use `ExecFlags::ALL` (also pumps coroutines and scheduled tasks)
 - **Do NOT branch on DRAINING or other intermediate states** inside the wait loop in `show()` or `onBeginFrame()`. The `poll()` method drives the state machine to READY; callers just wait for it.
 - **`onEndFrame()` may wait for READY *or* DRAINING** — after `show()` kicks off DMA, it's fine to return once DMA is running (DRAINING). `onBeginFrame()` will ensure READY before the next frame.
@@ -259,12 +435,12 @@ class CFastLED {
 2. ✅ **The wrapper is a `inline` one-liner that delegates** — no logic, no validation, no error handling. The free function holds all behavior.
 3. ✅ **Per-object configuration (e.g. one strip's diode profile, one controller's correction) MAY live on the per-object API.** This rule targets *library-wide / process-wide / default-profile* state.
 4. ✅ **Documentation, examples, and PR descriptions reference the god-instance form.** The free function is an implementation detail.
-5. ⚠️ **Strict for new code; transitional allowlist for legacy names only.** Every *new* public global setter under `fl::` must ship with a `CFastLED` wrapper. A small transitional allowlist (`GRANDFATHERED_NAMES` in `ci/lint_cpp/public_settings_pattern_checker.py`) exempts pre-existing bare setters (e.g. `fl::set_input_gamut` #2710, `fl::enable_rgbw_colorimetric_lut`, `fl::set_rgbww_colorimetric_profile`) until their wrappers land. Entries are removed as each name is wrapped — the goal is an empty allowlist. New additions do NOT get grandfathered.
+5. ⚠️ **Strict for new code; transitional allowlist for legacy names only.** Every *new* public global setter under `fl::` must ship with a `CFastLED` wrapper. A small transitional allowlist (`PUBLIC_SETTINGS_GRANDFATHERED` in `ci/lint_cpp_rs/src/checkers/public_settings.rs`) exempts pre-existing bare setters (e.g. `fl::set_input_gamut` #2710, `fl::enable_rgbw_colorimetric_lut`, `fl::set_rgbww_colorimetric_profile`) until their wrappers land. Entries are removed as each name is wrapped — the goal is an empty allowlist. New additions do NOT get grandfathered.
 
 **Check Process**:
 1. For every new public function in `src/fl/**/*.h` whose name matches `^set_|^enable_|^disable_|^use_` and that mutates a static / global / namespace-scope variable, grep `src/FastLED.h` for a `CFastLED` method that delegates to it.
 2. If none exists: violation — add the wrapper in the same PR.
-3. Enforced by `ci/lint_cpp/public_settings_pattern_checker.py`. The checker carries a shrinking `GRANDFATHERED_NAMES` allowlist for legacy bare setters; remove a name from the list once its `CFastLED` wrapper is merged.
+3. Enforced by `PublicSettingsPatternChecker` in `ci/lint_cpp_rs/src/checkers/public_settings.rs`. The checker carries a shrinking `PUBLIC_SETTINGS_GRANDFATHERED` allowlist for legacy bare setters; remove a name from the list once its `CFastLED` wrapper is merged.
 
 **Where the rule does NOT apply**:
 - Helpers, constructors, factory functions — these are not setters of global state.
@@ -280,21 +456,21 @@ class CFastLED {
    - ❌ Bad:
      ```cpp
      namespace { const RgbcctProfile* sActive = nullptr; }
-     void set_rgbww_colorimetric_profile(const RgbcctProfile* p) FL_NOEXCEPT {
+     void set_rgbww_colorimetric_profile(const RgbcctProfile* p) FL_NO_EXCEPT {
          sActive = p;  // caller's lifetime, BOOM if they pass a stack temporary
      }
      ```
    - ✅ Good (value semantics, preferred):
      ```cpp
      namespace { RgbcctProfile sActive = kRgbwwDefaultProfile; }
-     void set_rgbww_colorimetric_profile(const RgbcctProfile& p) FL_NOEXCEPT {
+     void set_rgbww_colorimetric_profile(const RgbcctProfile& p) FL_NO_EXCEPT {
          sActive = p;  // copy, lifetime owned by library
      }
      ```
    - ✅ Good (nullable-reset exception — `const T*` allowed when null means "reset"):
      ```cpp
      namespace { RgbcctProfile sActive = kRgbwwDefaultProfile; }
-     void set_rgbww_colorimetric_profile(const RgbcctProfile* p) FL_NOEXCEPT {
+     void set_rgbww_colorimetric_profile(const RgbcctProfile* p) FL_NO_EXCEPT {
          sActive = (p != nullptr) ? *p : kRgbwwDefaultProfile;  // copy on non-null, reset on null
      }
      ```
@@ -308,6 +484,55 @@ class CFastLED {
 2. If the parameter is `const T*` AND the storage is `const T*`, flag as HIGH severity (pointer storage = use-after-scope).
 3. If the parameter is `const T*` but the storage is `T` and the body copies on non-null + resets on null, that's the allowed nullable-reset shape — no violation.
 
+## Long-Lived Pointers Are `fl::shared_ptr` (Lifetime Must Be Owned, Not Assumed)
+
+**Core Principle**: A pointer that is **stored**, or **held across anything that could free its target**, MUST be an `fl::shared_ptr<T>` reference that its holder owns. It must never be a raw `T*` or a `.get()` taken from someone else's `unique_ptr`. Then the memory cannot be freed out from under a reader that is still using it. The owner only drops *its* reference; the reader keeps the object alive until it lets go.
+
+**"Long-lived" means any of these:**
+- stored in a member, a static, a singleton, a queue, or a callback/closure;
+- held across an async boundary: a driver or DMA callback, an ISR, another task or core, `fl::task`, a deferred or queued job;
+- held across a call that can reconfigure or destroy the owner, such as `applyConfig`, `setColorProfile`, `clear*`, or removing a channel or controller;
+- returned from a virtual or public accessor, where the caller decides how long to keep it.
+
+**Rules**:
+1. ✅ **Owners hold `fl::shared_ptr<T>`** (built with `fl::make_shared`). An owner that replaces or clears its object resets *its* pointer and nothing else.
+2. ✅ **A reader takes its own `fl::shared_ptr<T>` copy for as long as it uses the object**. Examples: a frame encode, a power-estimate pass, an async transmission. A local `const fl::shared_ptr<T> ref = mThing;` at the top of the scope is the idiom.
+3. ✅ **Accessors that hand out a long-lived object return `fl::shared_ptr<T>`**, not `T*`.
+4. ✅ **Allowed exception: a raw pointer or reference in synchronous code where you can *prove* the target outlives the use.** Examples:
+   - a function parameter `const T&` that the callee does not store;
+   - `ref.get()` passed down a call chain while the caller's `shared_ptr` `ref` is still in scope;
+   - a pointer into an object whose owner is on the same stack frame and cannot be reconfigured during the call.
+
+   If the proof depends on "nothing else runs meanwhile", and anything in the call could reconfigure the owner, the exception does not apply.
+5. ❌ **NEVER store `unique_ptr::get()` or a raw `T*` to an object someone else can reset**, and never return one from a virtual.
+6. **Zero cost on small-memory targets.** Small means the tiny and low tiers, i.e. `!FL_PLATFORM_HAS_LARGE_MEMORY`: AVR Uno/Nano, ATtiny, ESP8266, Teensy LC/3.x, STM32F1 and similar.
+   - Put the `shared_ptr` storage, the per-use reference and any virtual accessor behind a feature gate that is off there. The colour pipeline's gate is `FL_COLOR_PIPELINE_SHARED` (`src/fl/channels/options.h`).
+   - Those tiers have no async show, so they keep single ownership (`unique_ptr`) with sync-only readers (rule 4) and pay neither RAM nor flash: no vtable slot, no control block.
+   - Verify with `bash compile uno --examples Blink`: flash and RAM must match master byte for byte.
+
+**Example (#4440):**
+```cpp
+// Owner (large-memory tiers; small tiers keep unique_ptr + sync-only readers)
+using ColorPipelineStorage = fl::shared_ptr<StreamingPipelineQ16>;   // was unique_ptr
+mPipeline = fl::make_shared<StreamingPipelineQ16>(pipeline);          // reconcile replaces it
+
+// Reader: holds its own reference for the whole encode
+const ColorPipelineStorage pipeline_ref = mPipeline;
+encode(pipeline_ref.get());   // OK: raw pointer below a live shared_ptr (rule 4)
+
+// Accessor: callers own what they get; compiled out on small tiers
+#if FL_COLOR_PIPELINE_SHARED
+virtual fl::shared_ptr<StreamingPipelineQ16> colorPipeline() const FL_NO_EXCEPT;
+#endif
+```
+
+**Why**: before #4440, `Channel` owned its colour pipeline through a `unique_ptr`. It handed raw `.get()` pointers to the frame encode and the power estimate, and `reconcileColorProfile()` began with `mPipeline.reset()`. Any reconfiguration while a reader was in flight freed the pipeline underneath it. A reader holding a raw pointer has no way to keep its target alive; a reader holding a `shared_ptr` does by construction.
+
+**Check Process**:
+1. For every new member, static, or queued field of pointer type, ask who can free the target. If it is anyone but the holder, it must be `fl::shared_ptr`.
+2. For every `.get()` whose result outlives the statement, confirm that a `shared_ptr` owned by the same scope is alive for the whole use.
+3. For every accessor or virtual returning `T*` to a heap object, change it to return `fl::shared_ptr<T>` unless rule 4 provably applies to every caller.
+
 ## In-Place Profile Mutation Bumps a Version (Cache Invalidation Contract)
 
 **Core Principle**: If `set_X(T* obj, ...)` writes into the fields of a caller-owned `*obj`, and any subsystem caches values *derived from* `*obj` keyed only on `(obj_ptr, ...)`, then the setter MUST bump `obj->mCacheVersion` (or call `obj->invalidate()`) and the cache key MUST include that version. Otherwise the cache returns stale data the next time the same pointer is passed in.
@@ -316,14 +541,14 @@ class CFastLED {
 1. ❌ **NEVER mutate a profile field in place without bumping a version counter** when a cache exists keyed on the profile pointer.
    - ❌ Bad:
      ```cpp
-     void set_input_gamut(DiodeProfile* p, InputGamut g) FL_NOEXCEPT {
+     void set_input_gamut(DiodeProfile* p, InputGamut g) FL_NO_EXCEPT {
          apply_gamut(p, g);  // rewrites p->input_xy_*
          // …no version bump; ProfileCache keyed on (p, cct) still returns stale M_src
      }
      ```
    - ✅ Good:
      ```cpp
-     void set_input_gamut(DiodeProfile* p, InputGamut g) FL_NOEXCEPT {
+     void set_input_gamut(DiodeProfile* p, InputGamut g) FL_NO_EXCEPT {
          apply_gamut(p, g);
          ++p->mCacheVersion;  // forces any derived-value cache to rebuild
      }
@@ -368,11 +593,21 @@ class CFastLED {
    - ❌ Bad: `void set_input_gamut(DiodeProfile* p, InputGamut g, const float white_xy[2]);`
    - ✅ Good: `void set_input_gamut(DiodeProfile* p, InputGamut g, fl::span<const float, 2> white_xy);`
    - ✅ Good (alternative — by-value pair): `void set_white_point(DiodeProfile* p, fl::vec2f white_xy);`
-3. ✅ **For RGBW / RGBWW multi-channel output**, prefer a `fl::span<u8, 4>` (or `5`) over five separate `u8*` parameters.
+3. ❌ **NEVER use function parameter array spelling (`T value[N]` or `T value[]`).**
+   - C++ adjusts these to `T* value`; the extent is not part of the function type and is not enforced.
+   - ❌ Bad: `void cct_to_xy(int cct, float out[2]);`
+   - ❌ Bad: `void encode(fl::u8 output[4]);`
+   - ✅ Good for normal APIs: `void cct_to_xy(int cct, fl::span<float, 2> out);`
+   - ✅ Good for ISR / `FL_IRAM` APIs: `void encode(fl::u8 (&output)[4]);`
+   - ✅ Good where a wrapper type would obscure the domain: `void set_white_point(DiodeProfile* p, fl::vec2f white_xy);`
+   - Suppress only intentional C ABI or platform compatibility cases with `// ok array parameter`.
+4. ⚠️ **For ISR / `FL_IRAM` callgraphs, prefer array references over `fl::span<T, N>`.**
+   - `fl::span<T, N>` is the right general API shape, but current span accessors are not explicitly `FASTLED_FORCE_INLINE` / `FL_IRAM`. Until an explicitly ISR-safe span exists, ISR-facing fixed-size output buffers should use `T (&value)[N]`.
+5. ✅ **For RGBW / RGBWW multi-channel output**, prefer a `fl::span<u8, 4>` (or `5`) over five separate `u8*` parameters, except inside ISR / `FL_IRAM` callgraphs where `u8 (&out)[4]` / `[5]` is preferred.
 
 **Scoped exception — deferred legacy migrations**: A `(ptr, size)` callback typedef MAY be temporarily retained in a legacy layer when migrating it would force a synchronized rewrite of every caller and the migration is being deferred to a follow-up PR. The exception requires (a) a comment at the typedef site referencing the migration plan / tracking issue, (b) naming the legacy location (current example: `src/fl/stl/cstdio.h` retains raw pointer+length handler signatures intentionally), and (c) the exception is timeboxed — it must be revisited at the next layer-wide migration window. Permanent divergence is not permitted; the goal is "all-or-nothing per-layer sweep when the engineering budget allows."
 
-**Rationale**: The base span rule prevents most of the pattern but CodeRabbit caught these two shapes in #2560, #2683, #2711. Just adding the two shapes to the canonical examples will close most remaining gaps. The scoped exception accommodates the real-world case where touching every caller in one PR isn't tractable; without it the rule pushes engineers toward unprincipled mixed APIs.
+**Rationale**: The base span rule prevents most of the pattern but CodeRabbit caught these two shapes in #2560, #2683, #2711. Issue #3233 adds clang-query lint coverage for source-spelled array parameters because `T value[N]` is especially misleading: it looks fixed-size but compiles as a pointer. The scoped exception accommodates the real-world case where touching every caller in one PR isn't tractable; without it the rule pushes engineers toward unprincipled mixed APIs.
 
 ## ISR-Shared State: `fl::atomic` or Critical Section, Never Bare `volatile`
 

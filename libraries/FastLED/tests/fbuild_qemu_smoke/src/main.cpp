@@ -4,15 +4,15 @@
 // Must print FBUILD-QEMU-TEST-OK once early init completes so the QEMU
 // runner's halt-on-success matcher can exit the emulator cleanly.
 //
-// Extension: .cpp (not .ino). PlatformIO handles both identically for
-// src/ files. The .cpp extension keeps this test fixture out of
+// Extension: .cpp (not .ino). fbuild accepts both in a project's src/
+// directory. The .cpp extension keeps this test fixture out of
 // arduino-lint-action's "Sketch(es) found outside examples and extras
 // folders" check (rule LD003), which fires on .ino files anywhere in
 // the library tree.
 //
 // `// ok standalone` above suppresses FastLED's TestPathStructureChecker
 // and HeadersExistChecker: this file is a *fixture* compiled inside the
-// standalone `tests/fbuild_qemu_smoke/` PlatformIO project (see
+// standalone `tests/fbuild_qemu_smoke/` fbuild project (see
 // `ci/tests/test_fbuild_qemu.py`), NOT a unit-test that mirrors a `src/`
 // header — there is no `src/fbuild_qemu_smoke/...` for it to pair with.
 
@@ -30,9 +30,16 @@ void setup() {
 
     FastLED.addLeds<WS2812, PIN_DATA, GRB>(leds, NUM_LEDS);
     leds[0] = CRGB::Red;
-    FastLED.show();
 
+    // Print the marker before show(). Espressif QEMU does not model the LED
+    // peripherals' transmit-done interrupts, so show() never returns there
+    // (FastLED#4840; same reason qemu_template.yml's legs assert registration,
+    // not a completed frame). Reaching this line proves the build boots and the
+    // controller registers, which is what this smoke test is for.
     Serial.println("FBUILD-QEMU-TEST-OK");
+    Serial.flush();
+
+    FastLED.show();
 }
 
 void loop() {

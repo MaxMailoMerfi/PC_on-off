@@ -14,12 +14,12 @@ struct WriteResult {
     bool ok;                ///< True if write succeeded, false if error
     fl::string error;       ///< Error message (empty if ok == true)
 
-    WriteResult() FL_NOEXCEPT : ok(true) {}
-    explicit WriteResult(const char* err) : ok(false), error(err) {}
-    explicit WriteResult(const fl::string& err) : ok(false), error(err) {}
+    WriteResult() FL_NO_EXCEPT : ok(true) {}
+    explicit WriteResult(const char* err) FL_NO_EXCEPT : ok(false), error(err) {}
+    explicit WriteResult(const fl::string& err) FL_NO_EXCEPT : ok(false), error(err) {}
 
     /// @brief Implicit conversion to bool for easy checking
-    operator bool() const { return ok; }
+    operator bool() const FL_NO_EXCEPT { return ok; }
 };
 
 } // namespace fl

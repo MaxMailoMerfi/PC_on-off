@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from running_process import RunningProcess
 
 from ci.rpc_client import RpcClient, RpcCrashError, RpcTimeoutError
 from ci.util.global_interrupt_handler import handle_keyboard_interrupt
@@ -211,9 +212,8 @@ async def run_sweep(
         )
     print()
 
-    # Connect to device using pyserial (avoids fbuild daemon port locking issues)
     print(f"Connecting to {port}...")
-    iface = create_serial_interface(port, use_pyserial=True)
+    iface = create_serial_interface(port)
     client = RpcClient(
         port,
         timeout=timeout,
@@ -227,7 +227,7 @@ async def run_sweep(
 
         # Ping to verify device is alive
         try:
-            ping_response = await client.send("ping", timeout=10.0)
+            ping_response = await client.send("ping", {}, timeout=10.0)
             print(f"Device alive: {ping_response.data}")
         except KeyboardInterrupt as ki:
             handle_keyboard_interrupt(ki)
@@ -538,7 +538,7 @@ def main() -> int:
             "AutoResearch",
         ]
         print(f"Running: {' '.join(compile_cmd)}")
-        compile_result = subprocess.run(compile_cmd, cwd=str(PROJECT_ROOT))
+        compile_result = RunningProcess.run(compile_cmd, cwd=str(PROJECT_ROOT))
         if compile_result.returncode != 0:
             print(f"ERROR: Compile failed with exit code {compile_result.returncode}")
             return 1

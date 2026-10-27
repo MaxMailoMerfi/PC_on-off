@@ -22,7 +22,7 @@
 #include "fl/stl/cstring.h"
 #include "fl/task/executor.h"
 #include "fl/channels/wave8.h"
-#include "fl/channels/detail/wave8.hpp"
+#include "fl/channels/detail/wave8.h"
 #include "fl/stl/noexcept.h"
 
 // Include ESP implementation only on real hardware
@@ -51,7 +51,7 @@ namespace fl {
 // Constructor / Destructor
 //=============================================================================
 
-ChannelEngineI2S::ChannelEngineI2S(fl::shared_ptr<detail::II2sLcdCamPeripheral> peripheral) FL_NOEXCEPT
+ChannelEngineI2S::ChannelEngineI2S(fl::shared_ptr<detail::II2sLcdCamPeripheral> peripheral) FL_NO_EXCEPT
     : mPeripheral(fl::move(peripheral)),
       mInitialized(false),
       mConfig(),
@@ -105,7 +105,7 @@ ChannelEngineI2S::~ChannelEngineI2S() {
 // IChannelDriver Interface
 //=============================================================================
 
-bool ChannelEngineI2S::canHandle(const ChannelDataPtr& data) const FL_NOEXCEPT {
+bool ChannelEngineI2S::canHandle(const ChannelDataPtr& data) const FL_NO_EXCEPT {
     if (!data) {
         return false;
     }
@@ -114,11 +114,11 @@ bool ChannelEngineI2S::canHandle(const ChannelDataPtr& data) const FL_NOEXCEPT {
 }
 
 
-void ChannelEngineI2S::enqueue(ChannelDataPtr channelData) FL_NOEXCEPT {
+void ChannelEngineI2S::enqueue(ChannelDataPtr channelData) FL_NO_EXCEPT {
     mEnqueuedChannels.push_back(fl::move(channelData));
 }
 
-void ChannelEngineI2S::show() FL_NOEXCEPT {
+void ChannelEngineI2S::show() FL_NO_EXCEPT {
     if (mEnqueuedChannels.empty()) {
         return;
     }
@@ -162,7 +162,7 @@ void ChannelEngineI2S::show() FL_NOEXCEPT {
     }
 }
 
-IChannelDriver::DriverState ChannelEngineI2S::poll() FL_NOEXCEPT {
+IChannelDriver::DriverState ChannelEngineI2S::poll() FL_NO_EXCEPT {
     if (mTransmittingChannels.empty()) {
         return DriverState::READY;
     }
@@ -198,13 +198,13 @@ IChannelDriver::DriverState ChannelEngineI2S::poll() FL_NOEXCEPT {
     return mBusy.load(fl::memory_order_acquire) ? DriverState::DRAINING : DriverState::READY;
 }
 
-void ChannelEngineI2S::setPollNeededCallback(PollNeededCallback callback) FL_NOEXCEPT {
+void ChannelEngineI2S::setPollNeededCallback(PollNeededCallback callback) FL_NO_EXCEPT {
     mPollNeededCallback.set(callback);
 }
 
 bool FL_IRAM ChannelEngineI2S::isrTransmitDone(void* panel_io,
                                                const void* edata,
-                                               void* user_ctx) FL_NOEXCEPT {
+                                               void* user_ctx) FL_NO_EXCEPT {
     (void)panel_io;
     (void)edata;
     auto* self = static_cast<ChannelEngineI2S*>(user_ctx);
@@ -219,7 +219,7 @@ bool FL_IRAM ChannelEngineI2S::isrTransmitDone(void* panel_io,
 // Transpose Implementation (from Yves driver)
 //=============================================================================
 
-void ChannelEngineI2S::transpose16x1(const u8* A, u16* B) FL_NOEXCEPT {
+void ChannelEngineI2S::transpose16x1(const u8* A, u16* B) FL_NO_EXCEPT {
     u32 x, y, x1, y1, t;
 
     // Load the array - handle up to 16 strips
@@ -283,7 +283,7 @@ void ChannelEngineI2S::transpose16x1(const u8* A, u16* B) FL_NOEXCEPT {
 // Transmission Implementation
 //=============================================================================
 
-bool ChannelEngineI2S::beginTransmission(fl::span<const ChannelDataPtr> channelData) FL_NOEXCEPT {
+bool ChannelEngineI2S::beginTransmission(fl::span<const ChannelDataPtr> channelData) FL_NO_EXCEPT {
     if (channelData.empty() || !mPeripheral) {
         return false;
     }
@@ -324,8 +324,7 @@ bool ChannelEngineI2S::beginTransmission(fl::span<const ChannelDataPtr> channelD
         u32 clock_hz = calculateI2sClockHz(ct);
         mConfig.pclk_hz = clock_hz;
 
-        FL_DBG("ChannelEngineI2S: Built Wave8 LUT for timing T1=" << timing.t1_ns
-               << "ns, T2=" << timing.t2_ns << "ns, T3=" << timing.t3_ns << "ns");
+        FL_DBG("ChannelEngineI2S: Built Wave8 LUT for timing T1=" << timing.t1_ns << "ns, T2=" << timing.t2_ns << "ns, T3=" << timing.t3_ns << "ns");
         FL_DBG("ChannelEngineI2S: I2S clock set to " << clock_hz << " Hz");
     }
 
@@ -340,7 +339,7 @@ bool ChannelEngineI2S::beginTransmission(fl::span<const ChannelDataPtr> channelD
         // since we need to free/reallocate buffers that DMA may be reading.
         while (mPeripheral->isBusy()) {
             // Wait for in-flight DMA to complete before touching buffers
-            task::run(250, task::ExecFlags::SYSTEM);
+            task::yield_system(250);
         }
         mBusy.store(false, fl::memory_order_release);
 
@@ -381,21 +380,31 @@ bool ChannelEngineI2S::beginTransmission(fl::span<const ChannelDataPtr> channelD
         // Each byte = 64 bits of output (8 Wave8Bit × 8 bits each)
         // Each bit output as one 16-bit word
         // Buffer size = numLeds * 3 * 64 * 2 bytes = numLeds * 384 bytes
-        // Plus padding for reset signal
-        size_t reset_words = 64;  // ~50µs reset at typical clock
-        size_t data_words = static_cast<size_t>(mNumLeds) * mNumComponents * 64;
-        size_t total_words = data_words + reset_words;
-        size_t data_size = total_words * sizeof(u16);
+        // Append a LOW tail long enough for this chipset's reset/latch time.
+        // One uint16_t output word is presented per LCD_CAM pixel clock.
+        const u64 data_words =
+            static_cast<u64>(mNumLeds) * mNumComponents * 64u;
+        size_t data_size = 0;
+        if (!detail::calculateI2sBufferSize(
+                data_words, timing.reset_us, mConfig.pclk_hz, data_size)) {
+            FL_WARN("ChannelEngineI2S: DMA buffer size overflow");
+            return false;
+        }
+        const size_t total_words = data_size / sizeof(u16);
         pconfig.max_transfer_bytes = data_size;
         mBufferSize = data_size;
 
-        FL_DBG("ChannelEngineI2S: Wave8 buffer size = " << data_size << " bytes ("
-               << total_words << " words) for " << mNumLeds << " LEDs");
+        FL_DBG("ChannelEngineI2S: Wave8 buffer size = " << data_size << " bytes (" << total_words << " words) for " << mNumLeds << " LEDs");
 #else
         // Legacy transpose encoding
-        size_t offset_start = 0;
-        size_t offset_end = 24 * 3 * 2 * 2 * 2 + 2;
-        size_t data_size = mNumComponents * mNumLeds * 8 * 3 * 2 + offset_start + offset_end;
+        const u64 data_words =
+            static_cast<u64>(mNumComponents) * mNumLeds * 8u * 3u;
+        size_t data_size = 0;
+        if (!detail::calculateI2sBufferSize(
+                data_words, timing.reset_us, mConfig.pclk_hz, data_size)) {
+            FL_WARN("ChannelEngineI2S: DMA buffer size overflow");
+            return false;
+        }
         pconfig.max_transfer_bytes = data_size;
         mBufferSize = data_size;
 #endif
@@ -456,7 +465,7 @@ bool ChannelEngineI2S::beginTransmission(fl::span<const ChannelDataPtr> channelD
     // Encoding has already been done above, so this wait is the only blocking time.
     while (mPeripheral->isBusy()) {
         // Wait for previous DMA to finish
-        task::run(250, task::ExecFlags::SYSTEM);
+        task::yield_system(250);
     }
     mBusy.store(false, fl::memory_order_release);
 
@@ -479,7 +488,7 @@ bool ChannelEngineI2S::beginTransmission(fl::span<const ChannelDataPtr> channelD
 }
 
 void ChannelEngineI2S::prepareScratchBuffer(fl::span<const ChannelDataPtr> channelData,
-                                            size_t maxChannelSize) FL_NOEXCEPT {
+                                            size_t maxChannelSize) FL_NO_EXCEPT {
     // Resize scratch buffer to hold all channel data
     size_t totalSize = channelData.size() * maxChannelSize;
     mScratchBuffer.resize(totalSize);
@@ -499,7 +508,7 @@ void ChannelEngineI2S::prepareScratchBuffer(fl::span<const ChannelDataPtr> chann
     }
 }
 
-void ChannelEngineI2S::encodeFrame() FL_NOEXCEPT {
+void ChannelEngineI2S::encodeFrame() FL_NO_EXCEPT {
     int backBuffer = 1 - mFrontBuffer;
     u16* output = mBuffers[backBuffer];
 
@@ -594,38 +603,38 @@ void ChannelEngineI2S::encodeFrame() FL_NOEXCEPT {
 /// the singleton manages its own lifetime.
 class I2sLcdCamPeripheralSingletonWrapper : public detail::II2sLcdCamPeripheral {
 public:
-    I2sLcdCamPeripheralSingletonWrapper(detail::II2sLcdCamPeripheral& impl) FL_NOEXCEPT : mImpl(impl) {}
+    I2sLcdCamPeripheralSingletonWrapper(detail::II2sLcdCamPeripheral& impl) FL_NO_EXCEPT : mImpl(impl) {}
 
-    bool initialize(const detail::I2sLcdCamConfig& config) FL_NOEXCEPT override {
+    bool initialize(const detail::I2sLcdCamConfig& config) FL_NO_EXCEPT override {
         return mImpl.initialize(config);
     }
-    void deinitialize() FL_NOEXCEPT override { mImpl.deinitialize(); }
-    bool isInitialized() const FL_NOEXCEPT override { return mImpl.isInitialized(); }
-    u16* allocateBuffer(size_t size_bytes) FL_NOEXCEPT override {
+    void deinitialize() FL_NO_EXCEPT override { mImpl.deinitialize(); }
+    bool isInitialized() const FL_NO_EXCEPT override { return mImpl.isInitialized(); }
+    u16* allocateBuffer(size_t size_bytes) FL_NO_EXCEPT override {
         return mImpl.allocateBuffer(size_bytes);
     }
-    void freeBuffer(u16* buffer) FL_NOEXCEPT override { mImpl.freeBuffer(buffer); }
-    bool transmit(const u16* buffer, size_t size_bytes) FL_NOEXCEPT override {
+    void freeBuffer(u16* buffer) FL_NO_EXCEPT override { mImpl.freeBuffer(buffer); }
+    bool transmit(const u16* buffer, size_t size_bytes) FL_NO_EXCEPT override {
         return mImpl.transmit(buffer, size_bytes);
     }
-    bool waitTransmitDone(u32 timeout_ms) FL_NOEXCEPT override {
+    bool waitTransmitDone(u32 timeout_ms) FL_NO_EXCEPT override {
         return mImpl.waitTransmitDone(timeout_ms);
     }
-    bool isBusy() const FL_NOEXCEPT override { return mImpl.isBusy(); }
-    bool registerTransmitCallback(void* callback, void* user_ctx) FL_NOEXCEPT override {
+    bool isBusy() const FL_NO_EXCEPT override { return mImpl.isBusy(); }
+    bool registerTransmitCallback(void* callback, void* user_ctx) FL_NO_EXCEPT override {
         return mImpl.registerTransmitCallback(callback, user_ctx);
     }
-    const detail::I2sLcdCamConfig& getConfig() const FL_NOEXCEPT override {
+    const detail::I2sLcdCamConfig& getConfig() const FL_NO_EXCEPT override {
         return mImpl.getConfig();
     }
-    u64 getMicroseconds() FL_NOEXCEPT override { return mImpl.getMicroseconds(); }
-    void delay(u32 ms) FL_NOEXCEPT override { mImpl.delay(ms); }
+    u64 getMicroseconds() FL_NO_EXCEPT override { return mImpl.getMicroseconds(); }
+    void delay(u32 ms) FL_NO_EXCEPT override { mImpl.delay(ms); }
 
 private:
     detail::II2sLcdCamPeripheral& mImpl;
 };
 
-fl::shared_ptr<IChannelDriver> createI2sEngine() FL_NOEXCEPT {
+fl::shared_ptr<IChannelDriver> createI2sEngine() FL_NO_EXCEPT {
 #if defined(FL_IS_ESP_32S3)
     // Wrap singleton in shared_ptr (singleton manages its own lifetime)
     auto wrapper = fl::make_shared<I2sLcdCamPeripheralSingletonWrapper>(

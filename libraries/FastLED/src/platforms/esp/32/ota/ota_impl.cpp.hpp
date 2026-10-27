@@ -3,13 +3,14 @@
 /// @file platforms/esp/32/ota/ota_impl.cpp
 /// ESP32-specific OTA implementation
 
+#include "fl/stl/charconv.h"  // fl::to_hex
 #include "platforms/esp/is_esp.h"
 
 #if defined(FL_IS_ESP32)
 
 #include "platforms/ota.h"
 #include "platforms/esp/esp_version.h"
-#include "fl/net/ota.h"  // For OTAService enum
+#include "fl/net/ota/ota.h"  // For OTAService enum
 
 // OTA support detection flag
 // OTA requires IDF 4.0+ for HTTP server and OTA APIs
@@ -433,19 +434,18 @@ bool validateESP32Firmware(const u8* data, size_t len) {
 
     // Check ESP32 magic byte (0xE9)
     if (data[0] != 0xE9) {
-        FL_WARN("Firmware validation: invalid magic byte 0x"
-                << (int)data[0] << " (expected 0xE9)");
+        FL_WARN("Firmware validation: invalid magic byte 0x" << fl::to_hex(static_cast<fl::u32>(data[0])) << " (expected 0xE9)");
         return false;
     }
 
     // Check segment count is reasonable (1-16)
     u8 segments = data[1];
     if (segments == 0 || segments > 16) {
-        FL_WARN("Firmware validation: invalid segment count " << (int)segments);
+        FL_WARN("Firmware validation: invalid segment count " << ((int)segments));
         return false;
     }
 
-    FL_DBG("Firmware validation passed: magic=0xE9, segments=" << (int)segments);
+    FL_DBG("Firmware validation passed: magic=0xE9, segments=" << ((int)segments));
     return true;
 }
 
@@ -654,7 +654,7 @@ public:
     }
 
     bool beginWiFi(const char* hostname, const char* password,
-                   const char* ssid, const char* wifi_pass) override {
+                   const char* ssid, const char* wifi_pass) FL_NO_EXCEPT override {
         // Stop any existing HTTP server to prevent leaks
         stopHttpServer();
 
@@ -694,7 +694,7 @@ public:
         return true;
     }
 
-    bool begin(const char* hostname, const char* password) override {
+    bool begin(const char* hostname, const char* password) FL_NO_EXCEPT override {
         // Stop any existing HTTP server to prevent leaks
         stopHttpServer();
 
@@ -728,7 +728,7 @@ public:
         return true;
     }
 
-    bool enableApFallback(const char* ap_ssid, const char* ap_pass) override {
+    bool enableApFallback(const char* ap_ssid, const char* ap_pass) FL_NO_EXCEPT override {
         // Validate SSID
         if (!ap_ssid || strlen(ap_ssid) == 0) {
             FL_WARN("AP SSID cannot be empty");
@@ -747,33 +747,33 @@ public:
         return true;
     }
 
-    void onProgress(fl::function<void(size_t, size_t)> callback) override {
+    void onProgress(fl::function<void(size_t, size_t)> callback) FL_NO_EXCEPT override {
         mProgressCb = callback;
     }
 
-    void onError(fl::function<void(const char*)> callback) override {
+    void onError(fl::function<void(const char*)> callback) FL_NO_EXCEPT override {
         mErrorCb = callback;
     }
 
-    void onState(fl::function<void(u8)> callback) override {
+    void onState(fl::function<void(u8)> callback) FL_NO_EXCEPT override {
         mStateCb = callback;
     }
 
-    void onBeforeReboot(void (*callback)()) override {
+    void onBeforeReboot(void (*callback)()) FL_NO_EXCEPT override {
         mBeforeRebootCb = callback;
     }
 
-    void poll() override {
+    void poll() FL_NO_EXCEPT override {
         // Custom OTA server runs in separate FreeRTOS task (zero polling overhead)
         // HTTP server also runs in separate FreeRTOS task
         // Nothing to poll
     }
 
-    bool isConnected() const override {
+    bool isConnected() const FL_NO_EXCEPT override {
         return mWifiConnected;
     }
 
-    u8 getFailedServices() const override {
+    u8 getFailedServices() const FL_NO_EXCEPT override {
         return mFailedServices;
     }
 
@@ -801,7 +801,7 @@ private:
                 // differ across IDF versions; route through void* to avoid
                 // reinterpret_cast (project lint forbids it).
                 const void* ip_ptr = &event->ip_info.ip;
-                FL_DBG("WiFi: Got IP address: " << ip4addr_ntoa(static_cast<const ip4_addr_t*>(ip_ptr)));
+                FL_DBG("WiFi: Got IP address: " << (ip4addr_ntoa(static_cast<const ip4_addr_t*>(ip_ptr))));
                 self->mWifiConnected = true;
             }
         }
@@ -1429,8 +1429,15 @@ private:
 // Strong Override - ESP32 Factory
 // ============================================================================
 
-fl::shared_ptr<IOTA> platform_create_ota() {
+fl::shared_ptr<IOTA> platform_create_ota() FL_NO_EXCEPT {
     return fl::make_shared<ESP32OTA>();
+}
+
+// Defined here rather than in platforms/ota.cpp.hpp so the only strong
+// reference into this translation unit comes from fl::net::OTA: a sketch
+// that never uses OTA does not link the WiFi stack (FastLED #4726).
+fl::shared_ptr<IOTA> IOTA::create() FL_NO_EXCEPT {
+    return platform_create_ota();
 }
 
 }  // namespace platforms

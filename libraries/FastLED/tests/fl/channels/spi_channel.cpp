@@ -290,7 +290,7 @@ FL_TEST_CASE("SPI chipset - mock driver integration") {
 
     // Verify data was transmitted
     FL_CHECK_GT(mockEngine->mTransmitCount, 0);
-    FL_CHECK_GT(mockEngine->mLastTransmittedData.size(), 0);
+    FL_CHECK_GT(mockEngine->mLastTransmittedData.size(), 0u);
 
     // APA102 format: 4-byte start frame + (4 bytes per LED) + end frame
     size_t minExpectedSize = 4 + (4 * NUM_LEDS);
@@ -350,7 +350,7 @@ FL_TEST_CASE("SPI chipset - APA102HD mock driver integration") {
     FL_CHECK_GT(mockEngine->mTransmitCount, 0);
 
     const auto& data = mockEngine->mLastTransmittedData;
-    FL_CHECK_GT(data.size(), 0);
+    FL_CHECK_GT(data.size(), 0u);
 
     // APA102 wire format: 4-byte start frame + (4 bytes per LED) [+ optional end frame]
     // Start frame: 0x00 0x00 0x00 0x00
@@ -565,6 +565,10 @@ FL_TEST_CASE("spiEncoderForChipset returns correct defaults") {
     enc = SpiEncoder::spiEncoderForChipset(SpiChipset::SM16716);
     FL_CHECK_EQ(enc.chipset, SpiChipset::SM16716);
     FL_CHECK_EQ(enc.clock_hz, 16000000u);
+
+    enc = SpiEncoder::spiEncoderForChipset(SpiChipset::MY9221);
+    FL_CHECK_EQ(enc.chipset, SpiChipset::MY9221);
+    FL_CHECK_EQ(enc.clock_hz, 1000000u);
 }
 
 FL_TEST_CASE("spiEncoderForChipset speed override") {
@@ -878,6 +882,10 @@ FL_TEST_CASE("SPI factory methods produce correct chipset and speed") {
     e = SpiEncoder::sm16716();
     FL_CHECK_EQ(e.chipset, SpiChipset::SM16716);
     FL_CHECK_EQ(e.clock_hz, 16000000u);
+
+    e = SpiEncoder::my9221();
+    FL_CHECK_EQ(e.chipset, SpiChipset::MY9221);
+    FL_CHECK_EQ(e.clock_hz, 1000000u);
 }
 
 FL_TEST_CASE("SPI factory methods accept custom clock speed") {
@@ -909,6 +917,20 @@ FL_TEST_CASE("DOTSTAR aliases match APA102 defaults") {
     // But chipset enum values differ (they are separate enum entries)
     FL_CHECK_NE(dot.chipset, apa.chipset);
     FL_CHECK_NE(dotHD.chipset, apaHD.chipset);
+}
+
+FL_TEST_CASE("HD107S aliases the HD107 40 MHz protocol") {
+    FL_CHECK_EQ(static_cast<int>(SpiChipset::HD107S),
+                static_cast<int>(SpiChipset::HD107));
+    FL_CHECK_EQ(static_cast<int>(HD107S), static_cast<int>(HD107));
+
+    const auto encoder = SpiEncoder::spiEncoderForChipset(SpiChipset::HD107S);
+    FL_CHECK_EQ(encoder.chipset, SpiChipset::HD107);
+    FL_CHECK_EQ(encoder.clock_hz, 40000000u);
+
+    using LegacyAlias = CFastLED::ClockedChipsetHelper<HD107S, 2, 3>;
+    FL_STATIC_ASSERT(LegacyAlias::IS_VALID,
+                     "HD107S must select the HD107 controller mapping");
 }
 
 FL_TEST_CASE("P9813 channel routes with flag byte encoding") {

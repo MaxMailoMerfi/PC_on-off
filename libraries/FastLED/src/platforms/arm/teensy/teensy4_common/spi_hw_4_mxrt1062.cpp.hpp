@@ -32,7 +32,10 @@
 #include "fl/log/log.h"
 #include "fl/stl/limits.h"
 // IWYU pragma: begin_keep
-#include <SPI.h>
+// Local LPSPI fork -- see lpspi/lpspi_hardware.h. The Arduino SPI
+// library is deliberately NOT used: fbuild never linked it (#3775)
+// and its three global SPIClass objects are unstrippable (#3777).
+#include "platforms/arm/teensy/teensy4_common/lpspi/lpspi_bus.h"
 #include <imxrt.h>
 // IWYU pragma: end_keep
 #include "platforms/shared/spi_manager.h"  // For DMABuffer, TransmitMode, SPIError
@@ -66,7 +69,7 @@ private:
 
     int mBusId;
     const char* mName;
-    SPIClass* mSPI;
+    fl::platforms::teensy::LpspiBus* mSPI;
     bool mTransactionActive;
     bool mInitialized;
     u32 mClockSpeed;
@@ -139,7 +142,7 @@ bool SpiHw4MXRT1062::begin(const SpiHw4::Config& config) {
 
     // Validate bus_num against mBusId if driver has pre-assigned ID
     if (mBusId != -1 && config.bus_num != static_cast<u8>(mBusId)) {
-        FL_LOG_SPI("SpiHw4MXRT1062: Bus mismatch - expected " << mBusId << ", got " << static_cast<int>(config.bus_num));
+        FL_LOG_SPI("SpiHw4MXRT1062: Bus mismatch - expected " << mBusId << ", got " << (static_cast<int>(config.bus_num)));
         return false;
     }
 
@@ -147,19 +150,19 @@ bool SpiHw4MXRT1062::begin(const SpiHw4::Config& config) {
     u8 bus_num = (mBusId != -1) ? static_cast<u8>(mBusId) : config.bus_num;
     switch (bus_num) {
         case 0:
-            mSPI = &SPI;
+            mSPI = &fl::platforms::teensy::LpspiBus::get(0);
             mBusId = 0;
             break;
         case 1:
-            mSPI = &SPI1;
+            mSPI = &fl::platforms::teensy::LpspiBus::get(1);
             mBusId = 1;
             break;
         case 2:
-            mSPI = &SPI2;
+            mSPI = &fl::platforms::teensy::LpspiBus::get(2);
             mBusId = 2;
             break;
         default:
-            FL_LOG_SPI("SpiHw4MXRT1062: Invalid bus number " << static_cast<int>(bus_num));
+            FL_LOG_SPI("SpiHw4MXRT1062: Invalid bus number " << (static_cast<int>(bus_num)));
             return false;
     }
 
@@ -204,14 +207,7 @@ bool SpiHw4MXRT1062::begin(const SpiHw4::Config& config) {
     // Initialize the SPI peripheral
     mSPI->begin();
 
-    FL_LOG_SPI("SpiHw4MXRT1062: Initialized on bus " << mBusId
-            << " clock=" << mClockSpeed << "Hz"
-            << " lanes=" << static_cast<int>(mActiveLanes)
-            << " pins: CLK=" << (int)mClockPin
-            << " D0=" << (int)mData0Pin
-            << " D1=" << (int)mData1Pin
-            << " D2=" << (int)mData2Pin
-            << " D3=" << (int)mData3Pin);
+    FL_LOG_SPI("SpiHw4MXRT1062: Initialized on bus " << mBusId << " clock=" << mClockSpeed << "Hz lanes=" << (static_cast<int>(mActiveLanes)) << " pins: CLK=" << ((int)mClockPin) << " D0=" << ((int)mData0Pin) << " D1=" << ((int)mData1Pin) << " D2=" << ((int)mData2Pin) << " D3=" << ((int)mData3Pin));
 
     mInitialized = true;
     mTransactionActive = false;
@@ -270,11 +266,10 @@ bool SpiHw4MXRT1062::transmit(TransmitMode mode) {
         return true;  // Nothing to transmit
     }
 
-    FL_LOG_SPI("SpiHw4MXRT1062: Transmitting " << mCurrentTotalSize << " bytes via LPSPI bus " << mBusId
-            << " with " << static_cast<int>(mActiveLanes) << " lanes");
+    FL_LOG_SPI("SpiHw4MXRT1062: Transmitting " << mCurrentTotalSize << " bytes via LPSPI bus " << mBusId << " with " << (static_cast<int>(mActiveLanes)) << " lanes");
 
     // Begin SPI transaction with configured clock speed
-    mSPI->beginTransaction(SPISettings(mClockSpeed, MSBFIRST, SPI_MODE0));
+    mSPI->beginTransaction(fl::platforms::teensy::LpspiSettings(mClockSpeed, MSBFIRST, SPI_MODE0));
 
     IMXRT_LPSPI_t* port = getPort();
     if (!port) {

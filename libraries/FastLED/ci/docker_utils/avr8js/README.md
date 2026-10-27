@@ -33,7 +33,7 @@ See `FINDINGS.md` in the project root for complete root cause analysis.
 
 ```
 Test.ino (Arduino sketch)
-  ↓ Compile with PlatformIO
+  ↓ Compile with fbuild
 firmware.hex
   ↓ Docker volume mount
 AVR8JS Emulator (Node.js/TypeScript)
@@ -57,10 +57,7 @@ from ci.docker_utils.avr8js_docker import DockerAVR8jsRunner
 
 runner = DockerAVR8jsRunner()
 exit_code = runner.run(
-    elf_path=Path("firmware.elf"),
-    mcu="atmega328p",
-    frequency=16000000,
-    timeout=30
+    elf_path=Path("firmware.elf"), mcu="atmega328p", frequency=16000000, timeout=30
 )
 ```
 

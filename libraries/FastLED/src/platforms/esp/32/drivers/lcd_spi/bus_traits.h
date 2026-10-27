@@ -3,7 +3,7 @@
 // IWYU pragma: private
 
 /// @file bus_traits.h
-/// @brief BusTraits<Bus::LCD_SPI> + BusTraits<Bus::LCD_CLOCKLESS> for ESP32-S3.
+/// @brief BusTraits<Bus::FLEX_IO, 0> for ESP32-S3 LCD_CAM.
 ///
 /// Both buses share the LCD_CAM I80 peripheral on ESP32-S3 — LCD_SPI drives
 /// true SPI chipsets (APA102 etc.) and LCD_CLOCKLESS drives clockless chipsets
@@ -35,39 +35,80 @@ namespace fl {
 // createLcdSpiEngine() and createLcdClocklessEngine() are declared in the
 // driver headers included above.
 
-template<> struct BusTraits<Bus::LCD_SPI> {
-    using Driver = IChannelDriver;
+namespace detail {
+/// Factory for the LCD_CAM clockless driver. Null until a clockless channel
+/// is created (platforms::enableClocklessEncoders() -> enableLcdClockless()),
+/// so SPI-only programs never name createLcdClocklessEngine() and the
+/// clockless pipeline is dropped at link time (#4793).
+using LcdClocklessFactory = fl::shared_ptr<IChannelDriver> (*)();
 
-    static fl::shared_ptr<Driver> instancePtr() FL_NOEXCEPT {
-        static fl::shared_ptr<Driver> gHolder = createLcdSpiEngine();
-        return gHolder;
-    }
+inline LcdClocklessFactory& lcd_clockless_factory() FL_NO_EXCEPT {
+    static LcdClocklessFactory gFactory = nullptr;
+    return gFactory;
+}
 
-    static Driver& instance() FL_NOEXCEPT { return *instancePtr(); }
+inline void enableLcdClockless() FL_NO_EXCEPT {
+    lcd_clockless_factory() = &createLcdClocklessEngine;
+}
 
-    static void registerWithManager() FL_NOEXCEPT {
-        ChannelManager::instance().addDriver(default_bus_priority(Bus::LCD_SPI), instancePtr());
+struct LcdCamBusHolder {
+    fl::shared_ptr<IChannelDriver> spi;
+    fl::shared_ptr<IChannelDriver> clockless;
+
+    LcdCamBusHolder() FL_NO_EXCEPT : spi(createLcdSpiEngine()) {}
+
+    /// Lazily create the clockless driver once it has been enabled.
+    const fl::shared_ptr<IChannelDriver>& clocklessPtr() FL_NO_EXCEPT {
+        if (!clockless && lcd_clockless_factory()) {
+            clockless = lcd_clockless_factory()();
+        }
+        return clockless;
     }
 };
 
-template<> struct BusSupports<Bus::LCD_SPI, SpiChipsetConfig> : fl::true_type {};
+inline detail::LcdCamBusHolder& lcd_cam_bus_holder() FL_NO_EXCEPT {
+    static detail::LcdCamBusHolder gHolder;
+    return gHolder;
+}
+}  // namespace detail
 
-template<> struct BusTraits<Bus::LCD_CLOCKLESS> {
+template<> struct BusTraits<Bus::FLEX_IO, 0> {
     using Driver = IChannelDriver;
 
-    static fl::shared_ptr<Driver> instancePtr() FL_NOEXCEPT {
-        static fl::shared_ptr<Driver> gHolder = createLcdClocklessEngine();
-        return gHolder;
+    static fl::shared_ptr<Driver> instancePtr() FL_NO_EXCEPT {
+        auto& holder = detail::lcd_cam_bus_holder();
+        const auto& clockless = holder.clocklessPtr();
+        return clockless ? clockless : holder.spi;
     }
 
-    static Driver& instance() FL_NOEXCEPT { return *instancePtr(); }
+    static Driver& instance() FL_NO_EXCEPT { return *instancePtr(); }
 
-    static void registerWithManager() FL_NOEXCEPT {
-        ChannelManager::instance().addDriver(default_bus_priority(Bus::LCD_CLOCKLESS), instancePtr());
+    /// Clockless channels may route here: create and register the LCD_CAM
+    /// clockless driver on demand (#4793). Registering here, not only in
+    /// registerWithManager(), keeps it independent of construction order
+    /// (an SPI controller may have registered this bus first).
+    static void enableClockless() FL_NO_EXCEPT {
+        detail::enableLcdClockless();
+        const auto& clockless = detail::lcd_cam_bus_holder().clocklessPtr();
+        auto& registry = ChannelManager::registry();
+        // Register only when absent: addDriver() replaces a same-name entry,
+        // which would discard a platform/forced priority set earlier.
+        if (clockless && !registry.findDriverByName(clockless->getName())) {
+            registry.addDriver(default_bus_priority(Bus::FLEX_IO, 0), clockless);
+        }
+    }
+
+    static void registerWithManager() FL_NO_EXCEPT {
+        auto& holder = detail::lcd_cam_bus_holder();
+        ChannelManager::registry().addDriver(default_bus_priority(Bus::FLEX_IO, 0), holder.spi);
+        if (const auto& clockless = holder.clocklessPtr()) {
+            ChannelManager::registry().addDriver(default_bus_priority(Bus::FLEX_IO, 0), clockless);
+        }
     }
 };
 
-template<> struct BusSupports<Bus::LCD_CLOCKLESS, ClocklessChipset> : fl::true_type {};
+template<> struct BusSupports<Bus::FLEX_IO, SpiChipsetConfig, 0> : fl::true_type {};
+template<> struct BusSupports<Bus::FLEX_IO, ClocklessChipset, 0> : fl::true_type {};
 
 }  // namespace fl
 

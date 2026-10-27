@@ -1,10 +1,11 @@
-// IWYU pragma: private
+﻿// IWYU pragma: private
 
 /// @file bitbang_channel_driver.cpp.hpp
 /// @brief Implementation of BitBangChannelDriver
 
 #include "platforms/shared/bitbang/bitbang_channel_driver.h"
 #include "fl/system/delay.h"
+#include "platforms/cpu_frequency.h"
 #include "fl/log/log.h"
 #include "fl/system/pin.h"
 #include "fl/stl/algorithm.h"
@@ -14,7 +15,7 @@
 namespace fl {
 
 BitBangChannelDriver::BitBangChannelDriver()
- FL_NOEXCEPT : mNumActiveSlots(0), mActiveSlotMask(0) {
+ FL_NO_EXCEPT : mNumActiveSlots(0), mActiveSlotMask(0) {
     for (int i = 0; i < 256; ++i) {
         mSlotForPin[i] = -1;
     }
@@ -25,31 +26,31 @@ BitBangChannelDriver::BitBangChannelDriver()
 
 BitBangChannelDriver::~BitBangChannelDriver() = default;
 
-bool BitBangChannelDriver::canHandle(const ChannelDataPtr& /*data*/) const FL_NOEXCEPT {
+bool BitBangChannelDriver::canHandle(const ChannelDataPtr& /*data*/) const FL_NO_EXCEPT {
     return true;
 }
 
-void BitBangChannelDriver::enqueue(ChannelDataPtr channelData) FL_NOEXCEPT {
+void BitBangChannelDriver::enqueue(ChannelDataPtr channelData) FL_NO_EXCEPT {
     if (channelData) {
         mEnqueuedChannels.push_back(fl::move(channelData));
     }
 }
 
-IChannelDriver::DriverState BitBangChannelDriver::poll() FL_NOEXCEPT {
+IChannelDriver::DriverState BitBangChannelDriver::poll() FL_NO_EXCEPT {
     return DriverState(DriverState::READY);
 }
 
-fl::string BitBangChannelDriver::getName() const FL_NOEXCEPT {
+fl::string BitBangChannelDriver::getName() const FL_NO_EXCEPT {
     // Matches the `fl::Bus::BIT_BANG` enumerator spelling.
     return fl::string::from_literal("BIT_BANG");
 }
 
-IChannelDriver::Capabilities BitBangChannelDriver::getCapabilities() const FL_NOEXCEPT {
+IChannelDriver::Capabilities BitBangChannelDriver::getCapabilities() const FL_NO_EXCEPT {
     return Capabilities(true, true);
 }
 
 void BitBangChannelDriver::rebuildPinConfig(
-    fl::span<const ChannelDataPtr> channels) FL_NOEXCEPT {
+    fl::span<const ChannelDataPtr> channels) FL_NO_EXCEPT {
     // Clear previous mapping
     for (int i = 0; i < 256; ++i) {
         mSlotForPin[i] = -1;
@@ -76,8 +77,7 @@ void BitBangChannelDriver::rebuildPinConfig(
         }
 
         if (mNumActiveSlots >= 8) {
-            FL_WARN("BitBangChannelDriver: more than 8 unique data pins, "
-                     "pin " << pin << " will be skipped");
+            FL_WARN("BitBangChannelDriver: more than 8 unique data pins, pin " << pin << " will be skipped");
             continue;
         }
 
@@ -110,30 +110,43 @@ void BitBangChannelDriver::rebuildPinConfig(
 }
 
 void BitBangChannelDriver::transmitClocklessBit(u8 onesMask, u32 t1_ns,
-                                                  u32 t2_ns, u32 t3_ns) FL_NOEXCEPT {
+                                                  u32 t2_ns, u32 t3_ns,
+                                                  u32 hz) FL_NO_EXCEPT {
+    // `hz` is passed in rather than looked up here. The one-argument
+    // `delayNanoseconds(ns)` re-derives the CPU frequency on every call, and
+    // on ESP32 that is an ESP-IDF call -- three of them per bit, in the
+    // hottest loop this driver has (FastLED#4203).
+    //
     // Phase 1: ALL active lines HIGH
     mMultiWriter.writeByte(mActiveSlotMask);
 
     // Phase 2: After T1, '0'-bit lanes go LOW (only '1' lanes stay HIGH)
-    fl::delayNanoseconds(t1_ns);
+    fl::delayNanoseconds(t1_ns, hz);
     mMultiWriter.writeByte(onesMask);
 
     // Phase 3: After T2, ALL lines go LOW
-    fl::delayNanoseconds(t2_ns);
+    fl::delayNanoseconds(t2_ns, hz);
     mMultiWriter.writeByte(0x00);
 
     // Phase 4: Low tail
-    fl::delayNanoseconds(t3_ns);
+    fl::delayNanoseconds(t3_ns, hz);
 }
 
 void BitBangChannelDriver::transmitClockless(
-    fl::span<const ChannelDataPtr> channels) FL_NOEXCEPT {
+    fl::span<const ChannelDataPtr> channels) FL_NO_EXCEPT {
     if (channels.empty()) return;
 
     // Group channels by timing config.
     // For simplicity, process one timing group at a time by iterating and
     // collecting channels that share the same timing.
     fl::vector<bool> processed(channels.size(), false);
+
+    // Once for the whole transmission -- outside the timing-group loop as
+    // well as the per-bit one. A strip with two timing configurations is
+    // still one transmission, and querying per group would put an ESP-IDF
+    // call back on a path that is meant not to have one. See
+    // `transmitClocklessBit`.
+    const u32 hz = fl::cpuFrequencyHz();
 
     for (fl::size i = 0; i < channels.size(); ++i) {
         if (processed[i] || !channels[i] || !channels[i]->isClockless()) continue;
@@ -196,7 +209,7 @@ void BitBangChannelDriver::transmitClockless(
                         onesMask |= (1 << slot);
                     }
                 }
-                transmitClocklessBit(onesMask, t1, t2, t3);
+                transmitClocklessBit(onesMask, t1, t2, t3, hz);
             }
         }
 
@@ -214,7 +227,7 @@ void BitBangChannelDriver::transmitClockless(
 }
 
 void BitBangChannelDriver::transmitSpi(
-    fl::span<const ChannelDataPtr> channels) FL_NOEXCEPT {
+    fl::span<const ChannelDataPtr> channels) FL_NO_EXCEPT {
     if (channels.empty()) return;
 
     // Group channels by clock pin
@@ -291,7 +304,7 @@ void BitBangChannelDriver::transmitSpi(
     }
 }
 
-void BitBangChannelDriver::show() FL_NOEXCEPT {
+void BitBangChannelDriver::show() FL_NO_EXCEPT {
     if (mEnqueuedChannels.empty()) return;
 
     // Move enqueued to transmitting
@@ -333,7 +346,7 @@ void BitBangChannelDriver::show() FL_NOEXCEPT {
         transmitSpi(spi);
     }
 
-    // Done — clear in-use flags
+    // Done â€” clear in-use flags
     for (fl::size i = 0; i < mTransmittingChannels.size(); ++i) {
         if (mTransmittingChannels[i]) {
             mTransmittingChannels[i]->setInUse(false);

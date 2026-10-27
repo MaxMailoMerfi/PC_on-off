@@ -3,7 +3,7 @@ from ci.util.global_interrupt_handler import handle_keyboard_interrupt
 
 #!/usr/bin/env python3
 """
-WARNING: sys.stdout.flush() causes blocking issues on Windows with QEMU/subprocess processes!
+WARNING: sys.stdout.flush() causes blocking issues on Windows with QEMU/child processes!
 Use conditional flushing: `if os.name != 'nt': sys.stdout.flush()` to avoid Windows blocking
 while maintaining real-time output visibility on Unix systems.
 """
@@ -20,7 +20,6 @@ if os.name == "nt":
 
 import queue
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -30,7 +29,8 @@ from queue import Queue
 # Import for type annotation only
 from typing import TYPE_CHECKING, Callable, Optional
 
-from running_process import RunningProcess
+from running_process import CalledProcessError, RunningProcess, TimeoutExpired
+from running_process.command_render import list2cmdline
 
 
 if TYPE_CHECKING:
@@ -45,6 +45,7 @@ from ci.util.color_output import print_cache_hit
 
 
 if TYPE_CHECKING:
+    from ci.meson.test_execution import MesonTestResult
     from ci.util.fingerprint import FingerprintManager
 from ci.util.output_formatter import TimestampFormatter
 from ci.util.test_exceptions import (
@@ -58,6 +59,7 @@ from ci.util.test_types import (
     TestResult,
     TestResultType,
     TestSuiteResult,
+    describe_test_counts,
     determine_test_categories,
 )
 from ci.util.timestamp_print import ts_print
@@ -72,9 +74,12 @@ class TestCounts:
 
 _IS_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
 _TIMEOUT = 600 if _IS_GITHUB_ACTIONS else 240
-_GLOBAL_TIMEOUT = (
-    600 if _IS_GITHUB_ACTIONS else 600
-)  # Increased to 600s for local uno compilation
+# The default Python suite includes the native fbuild QEMU smoke test. Its
+# bounded child process may run for 1,860 seconds on a cold cache, so the
+# parent pytest worker must leave additional time to return that result.
+_PYTHON_TEST_TIMEOUT = 35 * 60
+_GLOBAL_TIMEOUT = max(600, _PYTHON_TEST_TIMEOUT)
+_TOP_LEVEL_TEST_TIMEOUT = _PYTHON_TEST_TIMEOUT + 2 * 60
 
 # Abort threshold for total failures across all processes (unit + examples)
 MAX_FAILURES_BEFORE_ABORT = 3
@@ -114,7 +119,7 @@ def get_test_counts() -> TestCounts:
         except KeyboardInterrupt as ki:
             handle_keyboard_interrupt(ki)
             raise
-        except (subprocess.SubprocessError, RuntimeError):
+        except (CalledProcessError, TimeoutExpired, TimeoutError, RuntimeError):
             # If counting fails, use 0 as fallback
             python_count = 0
 
@@ -563,7 +568,7 @@ def create_unit_test_process(
     if args.debug:
         compile_cmd.append("--debug")
 
-    # subprocess.run(compile_cmd, check=True)
+    # RunningProcess.run(compile_cmd, check=True)
 
     # Then run the tests using our new test runner
     test_cmd = ["uv", "run", "python", "-m", "ci.run_tests"]
@@ -592,6 +597,8 @@ def create_examples_test_process(
     # Add example names if specified
     if args.examples is not None:
         cmd.extend(args.examples)
+    if args.example_group is not None:
+        cmd.extend(["--example-group", args.example_group])
 
     # Map command-line arguments to meson_example_runner.py
     if args.clean:
@@ -647,12 +654,12 @@ def create_python_test_process(
     if run_slow:
         cmd.append("--runslow")
 
-    cmd_str = subprocess.list2cmdline(cmd)
+    cmd_str = list2cmdline(cmd)
 
     return RunningProcess(
         cmd_str,
         auto_run=False,  # Don't auto-start - will be started in parallel later
-        timeout=_TIMEOUT,  # 2 minute timeout for Python tests
+        timeout=_PYTHON_TEST_TIMEOUT,
         output_formatter=TimestampFormatter(),
     )
 
@@ -818,6 +825,24 @@ def _create_skipped_timing(
     return ProcessTiming(name=display_name, duration=0.0, command=command, skipped=True)
 
 
+def _describe_cpp_counts(result: "MesonTestResult") -> str:
+    """Label a C++ result row with the populations its counts cover.
+
+    The summary table carried the same anonymous denominator as the headline,
+    so a unit-only row and a unit+examples row were indistinguishable (#3779).
+    A result from a path that cannot attribute its counts says so rather than
+    implying coverage it never verified.
+    """
+    breakdown = describe_test_counts(
+        num_passed=result.num_tests_passed,
+        num_run=result.num_tests_run,
+        num_examples_passed=result.num_examples_passed,
+        num_examples_run=result.num_examples_run,
+        examples_included=result.examples_included,
+    )
+    return breakdown.describe(" passed")
+
+
 def _format_cache_hit_message(
     fingerprint_manager: Optional["FingerprintManager"],
     fingerprint_name: str,
@@ -904,6 +929,20 @@ def _get_friendly_test_name(command: str | list[str]) -> str:
         return _extract_test_name(command)
 
 
+def failed_fingerprint_scopes(failures: list[TestFailureInfo]) -> set[str]:
+    """Identify cache scopes whose child process failed or was interrupted."""
+    scopes: set[str] = set()
+    for failure in failures:
+        command = failure.command
+        if "meson_example_runner.py" in command:
+            scopes.add("examples")
+        elif "pytest" in command and "ci/tests" in command:
+            scopes.add("python_test")
+        elif "wasm_compile.py" in command:
+            scopes.add("wasm")
+    return scopes
+
+
 @dataclass
 class FailedTestEntry:
     """A test that failed during a test run."""
@@ -918,15 +957,40 @@ class FailedTestEntry:
 
     @property
     def rerun_cmd(self) -> str:
+        if self.category == "python":
+            return "bash test --py"
+        if self.category == "integration":
+            return "bash test --full"
         if self.category == "example":
             return f"bash test {self.clean_name} --examples"
         return f"bash test {self.clean_name} --cpp"
 
     @property
     def debug_cmd(self) -> str:
+        if self.category == "python":
+            return "bash test --py --verbose"
+        if self.category == "integration":
+            return "bash test --full --verbose"
         if self.category == "example":
             return f"bash test {self.clean_name} --examples --debug"
         return f"bash test {self.clean_name} --debug"
+
+
+def _failed_test_entry(failure: TestFailureInfo) -> FailedTestEntry:
+    """Map a process or test-case failure to actionable rerun guidance."""
+    command = failure.command
+    command_text = " ".join(command) if isinstance(command, list) else command
+    normalized_command = command_text.replace("\\", "/").lower()
+
+    if "pytest" in normalized_command and "ci/tests" in normalized_command:
+        return FailedTestEntry(name=_get_friendly_test_name(command), category="python")
+    if "pytest" in normalized_command and "ci/test_integration" in normalized_command:
+        return FailedTestEntry(
+            name=_get_friendly_test_name(command), category="integration"
+        )
+
+    category = "example" if "example" in failure.test_name.lower() else "unit"
+    return FailedTestEntry(name=failure.test_name, category=category)
 
 
 def _format_failure_summary(
@@ -970,15 +1034,23 @@ def _format_failure_summary(
 
     # Loud banner for debug re-run — this is critical for AI agents to notice
     max_debug_show = 3
+    has_cpp_failure = any(ft.category in ("unit", "example") for ft in failed_tests)
     lines.append("\033[93m" + "!" * 60 + "\033[0m")
-    lines.append(
-        "\033[93m!!  AGENT ACTION REQUIRED: RE-RUN FAILED TESTS IN DEBUG  !!\033[0m"
-    )
+    if has_cpp_failure:
+        lines.append(
+            "\033[93m!!  AGENT ACTION REQUIRED: RE-RUN FAILED TESTS IN DEBUG  !!\033[0m"
+        )
+    else:
+        lines.append(
+            "\033[93m!!  AGENT ACTION REQUIRED: RE-RUN FAILED PROCESS VERBOSE !!\033[0m"
+        )
     lines.append("\033[93m" + "!" * 60 + "\033[0m")
     lines.append("")
-    lines.append("Quick mode does NOT enable sanitizers (ASAN/LSAN/UBSAN).")
-    lines.append("You MUST re-run each failed test in --debug mode to get")
-    lines.append("full diagnostics (stack traces, memory errors, UB detection).")
+    if has_cpp_failure:
+        lines.append("Quick mode does NOT enable sanitizers (ASAN/LSAN/UBSAN).")
+        lines.append("Re-run C++ failures in --debug mode for sanitizer diagnostics.")
+    else:
+        lines.append("Re-run the failed process with verbose output for diagnostics.")
     lines.append("")
     lines.append("\033[93mRun these commands NOW:\033[0m")
     for ft in failed_tests[:max_debug_show]:
@@ -1134,7 +1206,7 @@ def _handle_process_completion(
     proc = proc_state.process
     cmd = proc_state.command
     if isinstance(cmd, list):
-        cmd = subprocess.list2cmdline(cmd)
+        cmd = list2cmdline(cmd)
 
     try:
         returncode = proc.wait()
@@ -1362,7 +1434,7 @@ def _handle_stuck_processes(
             proc.kill()  # This now kills the entire process tree
 
             # Track this as a failure
-            failed_processes.append(subprocess.list2cmdline(proc.command))
+            failed_processes.append(list2cmdline(proc.command))
 
             active_processes.remove(proc)
             monitor.stop_monitoring(proc)
@@ -1472,24 +1544,24 @@ def run_test_processes(
 
 def runner(
     args: TestArgs,
-    src_code_change: bool = True,
     cpp_test_change: bool = True,
     examples_change: bool = True,
     python_test_change: bool = True,
     wasm_change: bool = True,
     fingerprint_manager: Optional["FingerprintManager"] = None,
-) -> None:
+    failed_scopes: Optional[set[str]] = None,
+) -> set[str]:
     """
     Main test runner function that determines what to run and executes tests
 
     Args:
         args: Parsed command line arguments
-        src_code_change: Whether source code has changed since last run
         cpp_test_change: Whether C++ test-related files (src/ or tests/) have changed
         examples_change: Whether example-related files have changed
         python_test_change: Whether Python test-related files have changed
         wasm_change: Whether WASM-related files have changed
         fingerprint_manager: Optional fingerprint manager for test metadata
+        failed_scopes: Receives scopes that failed after execution began
     """
     # Debug logging - only shown in verbose mode to reduce UI clutter
     if args.verbose:
@@ -1518,13 +1590,41 @@ def runner(
         if active_flags:
             ts_print(f"Active flags: {', '.join(active_flags)}")
 
-    # Clear zccache stats at start to show only metrics from this build
-    from ci.util.zccache_config import clear_zccache_stats
-
-    clear_zccache_stats()
+    # Per-build zccache metrics are provided via the session mechanism in
+    # ci/meson/runner_helpers.py::_start_zccache_session (sets ZCCACHE_SESSION_ID),
+    # then surfaced by show_zccache_stats() at teardown. zccache 1.12.7 has no
+    # global "zero-stats" command, so there is nothing to clear at start.
 
     # Determine test categories first to check if we should use meson
     test_categories = determine_test_categories(args)
+    completed_scopes: set[str] = set()
+
+    # Snapshot the tree BEFORE building/running, for whichever unit-test branch
+    # runs below. Capturing after the run would absorb any file added meanwhile
+    # into the watermark, caching a pass over code that was never compiled or
+    # executed.
+    #
+    # An unreadable build file must not take down the test run: fall back to
+    # None, which makes save_full_run_result skip persisting. Worst case is one
+    # lost fast path, never a stale green.
+    #
+    # Captured out here rather than inside a branch. Only the mixed branch
+    # feeds save_full_run_result, but the capture used to live in the
+    # unit-only branch -- which returns first and never consumed it. So the
+    # value was computed where it was useless and unbound where it was needed:
+    # every `bash test --cpp` raised NameError into a swallowing
+    # `except Exception: pass`, .full_run_cache.json was never written, and the
+    # fast path it gates could never fire (#3783). Binding at function scope
+    # means no branch can omit it again.
+    _watermarks: Optional[dict[str, float | str]] = None
+    if test_categories.unit and not test_categories.unit_only and cpp_test_change:
+        from ci.meson.cache_utils import capture_source_watermarks
+        from ci.util.paths import PROJECT_ROOT
+
+        try:
+            _watermarks = capture_source_watermarks(PROJECT_ROOT)
+        except OSError:
+            _watermarks = None
 
     # Always use Meson build system for unit tests (Python build system has been removed)
     # Only return early if unit tests are the ONLY thing running (unit_only mode)
@@ -1560,6 +1660,8 @@ def runner(
             )
 
             if not result.success:
+                if failed_scopes is not None:
+                    failed_scopes.add("cpp_test")
                 if result.failed_test_names:
                     summary = _format_failure_summary(
                         [
@@ -1570,7 +1672,10 @@ def runner(
                     print(summary)
                 sys.exit(1)
 
-            # Update fingerprint metadata for cache display on next run
+            # Update fingerprint metadata for cache display on next run.
+            # Record whether this run covered the whole suite: the counts are
+            # replayed verbatim on later cache hits, so a filtered run's number
+            # must never be presentable as a full-suite pass (#3763).
             if fingerprint_manager is not None:
                 fingerprint_manager.update_test_metadata(
                     "cpp_test",
@@ -1578,7 +1683,13 @@ def runner(
                     num_tests_passed=result.num_tests_passed,
                     duration_seconds=result.duration,
                     test_name="cpp_unit_tests",
+                    scope="partial" if (test_name or test_file_filter) else "full",
+                    num_examples_run=result.num_examples_run,
+                    num_examples_passed=result.num_examples_passed,
+                    examples_included=result.examples_included,
                 )
+            if result.num_tests_run > 0 and not args.check:
+                completed_scopes.add("cpp_test")
 
             # Print timing summary table for unit-only mode
             # Skip zccache stats when test result came from cache (no compilation occurred)
@@ -1587,7 +1698,7 @@ def runner(
 
                 show_zccache_stats()
             unit_timing = ProcessTiming(
-                name=f"cpp_unit_tests ({result.num_tests_passed}/{result.num_tests_run} passed)",
+                name=f"cpp_unit_tests ({_describe_cpp_counts(result)})",
                 duration=result.duration,
                 command="meson test",
                 skipped=False,
@@ -1611,7 +1722,7 @@ def runner(
             )
             print_cache_hit(cache_msg)
 
-        return
+        return completed_scopes
 
     # For mixed test modes (unit + examples, etc.), run unit tests via Meson but continue to other tests
     # Skip if fingerprint cache indicates no changes
@@ -1647,7 +1758,7 @@ def runner(
 
             # Create timing entry for summary
             meson_test_timing = ProcessTiming(
-                name=f"cpp_unit_tests ({result.num_tests_passed}/{result.num_tests_run} passed)",
+                name=f"cpp_unit_tests ({_describe_cpp_counts(result)})",
                 duration=result.duration,
                 command="meson test",
                 skipped=False,
@@ -1661,7 +1772,10 @@ def runner(
                 compile_test_link_time=result.compile_test_link_time,
             )
 
-            # Update fingerprint metadata for cache display on next run
+            # Update fingerprint metadata for cache display on next run.
+            # Record whether this run covered the whole suite: the counts are
+            # replayed verbatim on later cache hits, so a filtered run's number
+            # must never be presentable as a full-suite pass (#3763).
             if fingerprint_manager is not None:
                 fingerprint_manager.update_test_metadata(
                     "cpp_test",
@@ -1669,9 +1783,17 @@ def runner(
                     num_tests_passed=result.num_tests_passed,
                     duration_seconds=result.duration,
                     test_name="cpp_unit_tests",
+                    scope="partial" if (test_name or test_file_filter) else "full",
+                    num_examples_run=result.num_examples_run,
+                    num_examples_passed=result.num_examples_passed,
+                    examples_included=result.examples_included,
                 )
 
             if not result.success:
+                if failed_scopes is not None:
+                    failed_scopes.add("cpp_test")
+                    if test_categories.examples:
+                        failed_scopes.add("examples")
                 if result.failed_test_names:
                     summary = _format_failure_summary(
                         [
@@ -1681,10 +1803,27 @@ def runner(
                     )
                     print(summary)
                 sys.exit(1)
+            if result.num_tests_run > 0 and not args.check:
+                completed_scopes.add("cpp_test")
+            if result.num_examples_run and not args.check:
+                completed_scopes.add("examples")
 
-            # Save full-run cache after successful complete test suite run
-            # so the CASE 2 ultra-early exit can fire on next invocation.
-            if result.num_tests_run and result.num_tests_run == result.num_tests_passed:
+            # Save full-run cache after a successful COMPLETE suite run so the
+            # CASE 2 ultra-early exit can fire on the next invocation.
+            #
+            # A narrowed run must never be persisted here. This entry is
+            # replayed as an unconditional green for the whole suite, and its
+            # watermarks cover the entire tree -- so caching `bash test Foo`
+            # would let the next `bash test --cpp` exit 0 having compiled and
+            # run nothing. That is the stale-green #3763 was filed over, in its
+            # most dangerous form. Same condition the fingerprint writer above
+            # uses to stamp scope="partial" (#3783).
+            _full_scope_save = not (test_name or test_file_filter)
+            if (
+                _full_scope_save
+                and result.num_tests_run
+                and result.num_tests_run == result.num_tests_passed
+            ):
                 try:
                     from ci.meson.cache_utils import save_full_run_result
                     from ci.util.paths import PROJECT_ROOT
@@ -1700,11 +1839,21 @@ def runner(
                         result.num_tests_passed,
                         result.num_tests_run,
                         result.duration,
+                        watermarks=_watermarks,
+                        num_examples_passed=result.num_examples_passed,
+                        num_examples_run=result.num_examples_run,
+                        examples_included=result.examples_included,
                     )
                 except KeyboardInterrupt as ki:
                     handle_keyboard_interrupt(ki)
-                except Exception:
-                    pass  # Non-critical
+                except Exception as e:  # noqa: BLE001 - best-effort, see below
+                    # Persisting the fast-path cache is best-effort: a failure
+                    # costs one slower run, never correctness, so it must not
+                    # fail the suite. But it must not be SILENT either -- a
+                    # NameError sat in this exact handler undetected for the
+                    # life of #3783, disabling the fast path entirely with no
+                    # signal. Stay tolerant, become loud.
+                    ts_print(f"[cache] full-run cache not saved: {e!r}")
         else:
             # Fingerprint cache hit - skip unit tests
             cache_msg = _format_cache_hit_message(
@@ -1754,11 +1903,10 @@ def runner(
         # Skip the separate examples process when run_meson_build_and_test()
         # already compiled and executed examples in a single Ninja invocation
         # (mixed mode: unit + examples with cpp_test_change).
-        examples_already_handled = (
-            test_categories.unit and not test_categories.unit_only and cpp_test_change
-        )
+        examples_already_handled = "examples" in completed_scopes
         should_compile_examples = (
             examples_change
+            and (test_categories.examples or test_categories.examples_only)
             and not test_categories.py_only
             and not examples_already_handled
         )
@@ -1848,6 +1996,12 @@ def runner(
             parallel=will_run_parallel,
             verbose=args.verbose,
         )
+        if should_compile_examples:
+            completed_scopes.add("examples")
+        if (test_categories.py or test_categories.py_only) and python_test_change:
+            completed_scopes.add("python_test")
+        if (test_categories.wasm or test_categories.wasm_only) and wasm_change:
+            completed_scopes.add("wasm")
 
         # Display timing summary
         all_timings = timings + skipped_timings
@@ -1856,7 +2010,7 @@ def runner(
             all_timings.insert(0, meson_test_timing)  # Put unit tests first
         if all_timings:
             # Show zccache statistics only when actual compilation occurred.
-            # Skip when all tests were fingerprint-cached (no subprocess compilation ran).
+            # Skip when all tests were fingerprint-cached (no compilation process ran).
             # timings is non-empty when at least one process (examples, python, wasm) ran.
             # meson_test_timing.skipped=False when meson tests actually compiled+ran.
             _did_compile = bool(timings) or (
@@ -1891,32 +2045,64 @@ def runner(
                         if _cache_file_tr.exists():
                             _saved_tr = _json.loads(_cache_file_tr.read_text())
                             if _saved_tr.get("result") == "pass":
-                                save_full_run_result(
-                                    _build_dir_tr,
-                                    _saved_tr.get("num_passed", 0),
-                                    _saved_tr.get("num_tests", 0),
-                                    _saved_tr.get("duration", 0.0),
+                                # Refresh ONLY build_ninja_mtime. Carry the
+                                # original watermarks forward untouched -- this
+                                # path runs when tests were SKIPPED, so
+                                # rescanning here would fold any file added
+                                # since that run into the watermark and mark it
+                                # as covered by a pass it never took part in.
+                                _keys = (
+                                    "src_max_file_mtime",
+                                    "tests_max_file_mtime",
+                                    "examples_max_file_mtime",
+                                    "meson_max_file_mtime",
+                                    "native_source_hash",
                                 )
+                                # Only refresh when the whole watermark set
+                                # survives. A partial carry (e.g. a cache file
+                                # written before watermarks existed) would
+                                # leave a directory ungated, so drop the
+                                # refresh instead -- the next run just re-runs.
+                                if all(_k in _saved_tr for _k in _keys):
+                                    save_full_run_result(
+                                        _build_dir_tr,
+                                        _saved_tr.get("num_passed", 0),
+                                        _saved_tr.get("num_tests", 0),
+                                        _saved_tr.get("duration", 0.0),
+                                        watermarks={_k: _saved_tr[_k] for _k in _keys},
+                                        # Carry the split with the counts it
+                                        # describes; dropping it here would
+                                        # relabel an attributed run as
+                                        # unattributable on every refresh.
+                                        num_examples_passed=_saved_tr.get(
+                                            "num_examples_passed"
+                                        ),
+                                        num_examples_run=_saved_tr.get(
+                                            "num_examples_run"
+                                        ),
+                                        examples_included=_saved_tr.get(
+                                            "examples_included"
+                                        ),
+                                    )
                     except KeyboardInterrupt as ki:
                         handle_keyboard_interrupt(ki)
-                    except Exception:
-                        pass  # Non-critical optimization; fail silently
+                    except Exception as e:  # noqa: BLE001 - best-effort, see below
+                        # Same bargain as the writer above: never fail a green
+                        # run over a cache refresh, never fail silently either
+                        # (#3783). A malformed entry can be any shape here --
+                        # json.loads happily returns a non-dict -- so the catch
+                        # stays broad and reports instead.
+                        ts_print(f"[cache] full-run cache not refreshed: {e!r}")
             summary = _format_timing_summary(all_timings)
             # Use print() instead of ts_print() to avoid orphan timestamps
             # before multi-line content (the summary starts with \n)
             print(summary)
     except (TestExecutionFailedException, TestTimeoutException) as e:
+        if failed_scopes is not None:
+            failed_scopes.update(failed_fingerprint_scopes(e.failures))
         # Print failure summary table from exception details
         if e.failures:
-            failed_tests: list[FailedTestEntry] = []
-            for failure in e.failures:
-                # Determine category from test name or command
-                category = (
-                    "example" if "example" in failure.test_name.lower() else "unit"
-                )
-                failed_tests.append(
-                    FailedTestEntry(name=failure.test_name, category=category)
-                )
+            failed_tests = [_failed_test_entry(failure) for failure in e.failures]
             if failed_tests:
                 summary = _format_failure_summary(failed_tests)
                 print(summary)
@@ -1934,3 +2120,4 @@ def runner(
         else:
             exit_code = 1
         sys.exit(exit_code)
+    return completed_scopes

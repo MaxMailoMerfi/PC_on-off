@@ -11,8 +11,11 @@
 #include "fl/stl/ratio.h"
 
 #ifdef FASTLED_TESTING
+#define FL_CHRONO_HAS_TEST_TIME_PROVIDER 1
 #include "fl/stl/function.h"
 #include "fl/stl/noexcept.h"
+#else
+#define FL_CHRONO_HAS_TEST_TIME_PROVIDER 0
 #endif
 
 namespace fl {
@@ -39,29 +42,29 @@ public:
     using period = Period;
 
     /// Default constructor - zero duration
-    constexpr duration() FL_NOEXCEPT : mCount(0) {}
+    constexpr duration() FL_NO_EXCEPT : mCount(0) {}
 
     /// Explicit constructor from tick count
     /// @param count Number of ticks
-    constexpr explicit duration(const Rep& count) FL_NOEXCEPT : mCount(count) {}
+    constexpr explicit duration(const Rep& count) FL_NO_EXCEPT : mCount(count) {}
 
     /// Implicit conversion constructor from compatible duration types
     /// @tparam Rep2 Source tick type
     /// @tparam Period2 Source tick period
     template<typename Rep2, typename Period2>
-    constexpr duration(const duration<Rep2, Period2>& d) FL_NOEXCEPT
+    constexpr duration(const duration<Rep2, Period2>& d) FL_NO_EXCEPT
         : mCount(duration_cast_impl<Rep, Period, Rep2, Period2>(d.count())) {}
 
     /// Get the tick count
     /// @return Number of ticks stored in this duration
-    constexpr Rep count() const FL_NOEXCEPT { return mCount; }
+    constexpr Rep count() const FL_NO_EXCEPT { return mCount; }
 
 private:
     Rep mCount;
 
     /// Internal duration_cast implementation
     template<typename ToRep, typename ToPeriod, typename FromRep, typename FromPeriod>
-    static constexpr ToRep duration_cast_impl(FromRep count) FL_NOEXCEPT {
+    static constexpr ToRep duration_cast_impl(FromRep count) FL_NO_EXCEPT {
         // Convert from source period to destination period
         // target_count = source_count * (FromPeriod / ToPeriod)
         // Using: target = source * FromPeriod::num * ToPeriod::den / (FromPeriod::den * ToPeriod::num)
@@ -86,7 +89,7 @@ private:
 /// // ms.count() == 1000
 /// @endcode
 template<typename ToDuration, typename Rep, typename Period>
-constexpr ToDuration duration_cast(const duration<Rep, Period>& d) FL_NOEXCEPT {
+constexpr ToDuration duration_cast(const duration<Rep, Period>& d) FL_NO_EXCEPT {
     return ToDuration(d);
 }
 
@@ -128,46 +131,46 @@ public:
     using period = typename Duration::period;
 
     /// Default constructor - epoch time point
-    constexpr time_point() FL_NOEXCEPT : mDuration() {}
+    constexpr time_point() FL_NO_EXCEPT : mDuration() {}
 
     /// Construct from a duration since epoch
-    constexpr explicit time_point(const Duration& d) FL_NOEXCEPT : mDuration(d) {}
+    constexpr explicit time_point(const Duration& d) FL_NO_EXCEPT : mDuration(d) {}
 
     /// Get the duration since epoch
-    constexpr Duration time_since_epoch() const FL_NOEXCEPT { return mDuration; }
+    constexpr Duration time_since_epoch() const FL_NO_EXCEPT { return mDuration; }
 
     // Comparison operators
-    constexpr bool operator<=(const time_point& rhs) const FL_NOEXCEPT {
+    constexpr bool operator<=(const time_point& rhs) const FL_NO_EXCEPT {
         return mDuration.count() <= rhs.mDuration.count();
     }
-    constexpr bool operator<(const time_point& rhs) const FL_NOEXCEPT {
+    constexpr bool operator<(const time_point& rhs) const FL_NO_EXCEPT {
         return mDuration.count() < rhs.mDuration.count();
     }
-    constexpr bool operator>=(const time_point& rhs) const FL_NOEXCEPT {
+    constexpr bool operator>=(const time_point& rhs) const FL_NO_EXCEPT {
         return mDuration.count() >= rhs.mDuration.count();
     }
-    constexpr bool operator>(const time_point& rhs) const FL_NOEXCEPT {
+    constexpr bool operator>(const time_point& rhs) const FL_NO_EXCEPT {
         return mDuration.count() > rhs.mDuration.count();
     }
-    constexpr bool operator==(const time_point& rhs) const FL_NOEXCEPT {
+    constexpr bool operator==(const time_point& rhs) const FL_NO_EXCEPT {
         return mDuration.count() == rhs.mDuration.count();
     }
-    constexpr bool operator!=(const time_point& rhs) const FL_NOEXCEPT {
+    constexpr bool operator!=(const time_point& rhs) const FL_NO_EXCEPT {
         return mDuration.count() != rhs.mDuration.count();
     }
 
     /// Subtract two time_points to get a duration
-    constexpr Duration operator-(const time_point& rhs) const FL_NOEXCEPT {
+    constexpr Duration operator-(const time_point& rhs) const FL_NO_EXCEPT {
         return Duration(mDuration.count() - rhs.mDuration.count());
     }
 
     /// Add a duration to a time_point
-    constexpr time_point operator+(const Duration& d) const FL_NOEXCEPT {
+    constexpr time_point operator+(const Duration& d) const FL_NO_EXCEPT {
         return time_point(Duration(mDuration.count() + d.count()));
     }
 
     /// Subtract a duration from a time_point
-    constexpr time_point operator-(const Duration& d) const FL_NOEXCEPT {
+    constexpr time_point operator-(const Duration& d) const FL_NO_EXCEPT {
         return time_point(Duration(mDuration.count() - d.count()));
     }
 
@@ -175,13 +178,13 @@ private:
     Duration mDuration;
 };
 
-// Forward declarations for clock types (now() implemented after fl::micros() declaration)
+// Forward declarations for clock types (now() is implemented in chrono.cpp.hpp)
 struct steady_clock;  // IWYU pragma: keep
 struct system_clock;  // IWYU pragma: keep
 
 /// @brief Monotonic clock that never goes backwards
 ///
-/// Uses fl::micros() as the underlying time source, providing microsecond
+/// Uses fl::micros64() as the underlying time source, providing microsecond
 /// resolution across all FastLED platforms.
 struct steady_clock {
     using duration = microseconds;
@@ -190,14 +193,14 @@ struct steady_clock {
     using time_point = fl::chrono::time_point<steady_clock>;
     static constexpr bool is_steady = true;
 
-    /// Returns the current time point (implemented after fl::micros() declaration)
-    static time_point now() FL_NOEXCEPT;
+    /// Returns the current time point.
+    static time_point now() FL_NO_EXCEPT;
 };
 
 /// @brief Wall clock (may not be monotonic)
 ///
 /// On embedded platforms this behaves identically to steady_clock since
-/// there is no real-time clock available. Uses fl::micros() as the
+/// there is no real-time clock available. Uses fl::micros64() as the
 /// underlying time source.
 struct system_clock {
     using duration = microseconds;
@@ -206,8 +209,8 @@ struct system_clock {
     using time_point = fl::chrono::time_point<system_clock>;
     static constexpr bool is_steady = false;
 
-    /// Returns the current time point (implemented after fl::micros() declaration)
-    static time_point now() FL_NOEXCEPT;
+    /// Returns the current time point.
+    static time_point now() FL_NO_EXCEPT;
 };
 
 } // namespace chrono
@@ -256,7 +259,7 @@ struct system_clock {
 ///     process_step();
 /// }
 /// @endcode
-fl::u32 millis() FL_NOEXCEPT;
+fl::u32 millis() FL_NO_EXCEPT;
 
 /// Universal microsecond timer - returns microseconds since system startup
 ///
@@ -292,16 +295,13 @@ fl::u32 millis() FL_NOEXCEPT;
 ///     // Busy wait
 /// }
 /// @endcode
-fl::u32 micros() FL_NOEXCEPT;
+fl::u32 micros() FL_NO_EXCEPT;
 
-// Now that fl::micros() is declared, implement clock::now() methods
-inline chrono::steady_clock::time_point chrono::steady_clock::now() FL_NOEXCEPT {
-    return time_point(duration(static_cast<fl::i64>(fl::micros())));
-}
-
-inline chrono::system_clock::time_point chrono::system_clock::now() FL_NOEXCEPT {
-    return time_point(duration(static_cast<fl::i64>(fl::micros())));
-}
+/// 64-bit monotonic microsecond timer.
+///
+/// Extends the platform's 32-bit microsecond counter using unsigned elapsed
+/// deltas, so the returned value never wraps in practical use.
+fl::u64 micros64() FL_NO_EXCEPT;
 
 /// 64-bit millisecond timer - returns milliseconds since system startup without wraparound
 ///
@@ -333,7 +333,7 @@ inline chrono::system_clock::time_point chrono::system_clock::now() FL_NOEXCEPT 
 /// fl::u64 event_time = fl::millis64();
 /// log_event("operation_complete", event_time);
 /// @endcode
-fl::u64 millis64() FL_NOEXCEPT;
+fl::u64 millis64() FL_NO_EXCEPT;
 
 /// Alias for millis64() - returns 64-bit millisecond time
 ///
@@ -343,7 +343,7 @@ fl::u64 millis64() FL_NOEXCEPT;
 /// @return Number of milliseconds since system startup as a 64-bit value
 /// @note Inline function - zero overhead
 /// @see millis64() for full documentation
-inline fl::u64 time() FL_NOEXCEPT {
+inline fl::u64 time() FL_NO_EXCEPT {
     return fl::millis64();
 }
 
@@ -354,9 +354,9 @@ using time_provider_t = fl::function<fl::u32()>;
 
 /// Inject a custom time provider for testing
 ///
-/// This function allows unit tests to control the timing returned by fl::millis().
-/// Once injected, all calls to fl::millis() will use the provided function instead
-/// of the platform's native timing.
+/// This function allows unit tests to control the timing returned by fl::millis(),
+/// fl::micros(), and the FastLED chrono clocks. Once injected, all time views use
+/// the provided millisecond value instead of the platform's native timing.
 ///
 /// @param provider Function that returns the current time in milliseconds
 /// @note Only available in testing builds (when FASTLED_TESTING is defined)
@@ -374,7 +374,7 @@ using time_provider_t = fl::function<fl::u32()>;
 ///
 /// fl::clear_time_provider(); // Restore normal timing
 /// @endcode
-void inject_time_provider(const time_provider_t& provider) FL_NOEXCEPT;
+void inject_time_provider(const time_provider_t& provider) FL_NO_EXCEPT;
 
 /// Clear the injected time provider and restore platform default timing
 ///
@@ -384,7 +384,10 @@ void inject_time_provider(const time_provider_t& provider) FL_NOEXCEPT;
 /// @note Only available in testing builds (when FASTLED_TESTING is defined)
 /// @note Thread-safe: Uses appropriate locking in multi-threaded environments
 /// @note Safe to call multiple times or when no provider is injected
-void clear_time_provider() FL_NOEXCEPT;
+void clear_time_provider() FL_NO_EXCEPT;
+
+/// Reset the micros64() rollover extender for deterministic clock tests.
+void micros64_reset() FL_NO_EXCEPT;
 
 /// Reset the millis64() internal state for testing
 ///
@@ -394,7 +397,7 @@ void clear_time_provider() FL_NOEXCEPT;
 ///
 /// @note Only available in testing builds (when FASTLED_TESTING is defined)
 /// @note Thread-safe: Uses appropriate locking in multi-threaded environments
-void millis64_reset() FL_NOEXCEPT;
+void millis64_reset() FL_NO_EXCEPT;
 
 /// Mock time provider for controlled testing
 ///
@@ -421,23 +424,23 @@ class MockTimeProvider {
 public:
     /// Constructor with initial time value
     /// @param initial_time Starting time in milliseconds (default: 0)
-    explicit MockTimeProvider(fl::u32 initial_time = 0) FL_NOEXCEPT;
+    explicit MockTimeProvider(fl::u32 initial_time = 0) FL_NO_EXCEPT;
 
     /// Advance the mock time by the specified amount
     /// @param milliseconds Number of milliseconds to advance
-    void advance(fl::u32 milliseconds) FL_NOEXCEPT;
+    void advance(fl::u32 milliseconds) FL_NO_EXCEPT;
 
     /// Set the mock time to a specific value
     /// @param milliseconds New time value in milliseconds
-    void set_time(fl::u32 milliseconds) FL_NOEXCEPT;
+    void set_time(fl::u32 milliseconds) FL_NO_EXCEPT;
 
     /// Get the current mock time
     /// @return Current time in milliseconds
-    fl::u32 current_time() const FL_NOEXCEPT;
+    fl::u32 current_time() const FL_NO_EXCEPT;
 
     /// Function call operator for use with inject_time_provider()
     /// @return Current time in milliseconds
-    fl::u32 operator()() const FL_NOEXCEPT;
+    fl::u32 operator()() const FL_NO_EXCEPT;
 
 private:
     fl::u32 mCurrentTime;

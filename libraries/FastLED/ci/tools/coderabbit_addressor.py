@@ -23,10 +23,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Any, Optional, cast
+
+from running_process import PIPE, CalledProcessError, RunningProcess
 
 
 CODERABBIT_LOGINS = {"coderabbitai", "coderabbitai[bot]"}
@@ -34,7 +35,12 @@ CODERABBIT_LOGINS = {"coderabbitai", "coderabbitai[bot]"}
 SECURITY_KEYWORDS = [
     "security",
     "cve",
-    " auth",
+    # Spelled out rather than a bare "auth" so that "author"/"authored" -- which
+    # CodeRabbit uses routinely in ordinary prose -- does not read as security.
+    "authentication",
+    "authorization",
+    "authn",
+    "authz",
     "credential",
     "secret",
     "rce",
@@ -46,6 +52,41 @@ SECURITY_KEYWORDS = [
     "buffer overflow",
     "out-of-bounds",
 ]
+
+# Anchored at the start of a word, open-ended at the end.
+#
+# The leading \b is the fix: plain substring matching made "rce" fire inside
+# "Sou(rce)" -- and every guideline-sourced CodeRabbit comment ends with
+# "_Source: Coding guidelines_" -- as well as inside "enfo(rce)s" and
+# "resou(rce)s". That routed ordinary maintainability nits into security-flag,
+# where the skill forbids auto-fixing and --check counts them as permanently
+# unresolved, blocking merge forever.
+#
+# The trailing \w* is equally load-bearing: a closing \b would drop the plurals
+# and inflections these findings actually use -- "leaks secrets", "hardcoded
+# credentials", "breaks authentication". Those must stay in security-flag, so
+# match the keyword as a word *prefix*, not as a whole word.
+_SECURITY_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(kw) for kw in SECURITY_KEYWORDS) + r")\w*"
+)
+
+# A bare "auth" on its own is still worth flagging; "author" is not.
+_BARE_AUTH_RE = re.compile(r"\bauth\b")
+
+# CodeRabbit appends boilerplate to every comment: HTML marker comments, a
+# collapsed "Prompt for AI Agents" / "Committable suggestion" <details> block,
+# and quoted coding-guideline text. None of it describes the finding, but it is
+# full of trigger words, so classification looks at the prose only.
+_BOILERPLATE_RE = re.compile(
+    r"<!--.*?-->|<details>.*?</details>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _classifiable_text(body: str) -> str:
+    """Strip CodeRabbit boilerplate so keywords match the finding, not the footer."""
+    return _BOILERPLATE_RE.sub(" ", body)
+
 
 STYLE_KEYWORDS = [
     "nit:",
@@ -70,17 +111,16 @@ class Comment:
 
     @property
     def classification(self) -> str:
-        body_lower = self.body.lower()
-        for kw in SECURITY_KEYWORDS:
-            if kw in body_lower:
-                return "security-flag"
+        prose_lower = _classifiable_text(self.body).lower()
+        if _SECURITY_RE.search(prose_lower) or _BARE_AUTH_RE.search(prose_lower):
+            return "security-flag"
         if re.search(r"```suggestion", self.body):
             return "valid-fix"
         for kw in STYLE_KEYWORDS:
-            if kw in body_lower:
+            if kw in prose_lower:
                 return "style"
         if any(
-            tok in body_lower
+            tok in prose_lower
             for tok in (
                 "should be",
                 "bug:",
@@ -94,10 +134,18 @@ class Comment:
         return "false-positive"
 
 
+# Repo slug to operate on, when the caller targets a repository other than
+# the checkout we are running inside (e.g. the merge hook inspecting a
+# `gh pr merge --repo OWNER/NAME` for a sibling project). None means
+# "resolve from the current checkout".
+_REPO_OVERRIDE: Optional[str] = None
+
+
 def _run_gh(args: list[str]) -> str:
-    result = subprocess.run(
+    result = RunningProcess.run(
         ["gh"] + args,
-        capture_output=True,
+        stdout=PIPE,
+        stderr=PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -109,12 +157,14 @@ def _run_gh(args: list[str]) -> str:
 def _current_pr() -> Optional[int]:
     try:
         out = _run_gh(["pr", "view", "--json", "number"])
-    except subprocess.CalledProcessError:
+    except CalledProcessError:
         return None
     return int(json.loads(out)["number"])
 
 
 def _repo_slug() -> str:
+    if _REPO_OVERRIDE:
+        return _REPO_OVERRIDE
     out = _run_gh(["repo", "view", "--json", "nameWithOwner"])
     return json.loads(out)["nameWithOwner"]
 
@@ -223,11 +273,30 @@ def main() -> int:
     ap.add_argument(
         "pr", nargs="?", type=int, help="PR number (default: current branch)"
     )
+    ap.add_argument(
+        "--repo",
+        metavar="OWNER/NAME",
+        help=(
+            "Repository to inspect, when it is not the current checkout "
+            "(e.g. a sibling project). Requires an explicit PR number, since "
+            "'the PR for the current branch' is meaningless across repos."
+        ),
+    )
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--plan", action="store_true")
     group.add_argument("--reply", nargs=2, metavar=("COMMENT_ID", "MESSAGE"))
     group.add_argument("--check", action="store_true")
     args = ap.parse_args()
+
+    if args.repo:
+        if args.pr is None:
+            print(
+                "[address-reviews] --repo requires an explicit PR number",
+                file=sys.stderr,
+            )
+            return 2
+        global _REPO_OVERRIDE
+        _REPO_OVERRIDE = args.repo
 
     pr = args.pr or _current_pr()
     if pr is None:
@@ -246,4 +315,27 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt as ki:
+        import _thread  # noqa: PLC0415
+
+        _thread.interrupt_main()
+        raise ki
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the exit code is the point
+        # Exit 2, not the 1 an unhandled traceback would produce. The merge
+        # hook reads 1 as "this PR has unresolved review comments" and blocks
+        # on it; a crash in here is not that. Letting the traceback out made
+        # every internal failure — a `gh` error, a network blip, a PR number
+        # that does not exist in this repo — indistinguishable from a real
+        # verdict, and it blocked the merge either way.
+        import traceback
+
+        traceback.print_exc()
+        print(
+            "[address-reviews] internal error (above); not a review verdict",
+            file=sys.stderr,
+        )
+        sys.exit(2)

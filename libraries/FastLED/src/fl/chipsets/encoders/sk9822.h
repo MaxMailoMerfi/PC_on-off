@@ -4,13 +4,12 @@
 /// @brief SK9822 SPI chipset encoder
 ///
 /// Free function encoder for SK9822 chipsets.
-/// SK9822 is nearly identical to APA102, with one key difference:
-/// end frame uses 0x00 instead of 0xFF.
+/// SK9822 uses the APA102-style all-ones end clock frame.
 ///
 /// Protocol:
 /// - Start frame: 4 bytes of 0x00
 /// - LED data: [0xE0|brightness][B][G][R] (4 bytes per LED)
-/// - End frame: ⌈num_leds/32⌉ DWords of 0x00 (differs from APA102)
+/// - End frame: (num_leds / 32) + 1 DWords of 0xFF
 ///
 /// Brightness modes:
 /// - Global: All LEDs use same 5-bit brightness
@@ -36,7 +35,7 @@ namespace fl {
 /// @note SK9822 uses BGR wire order: pixel[0]=Blue, pixel[1]=Green, pixel[2]=Red
 template <typename InputIterator, typename OutputIterator>
 void encodeSK9822(InputIterator first, InputIterator last, OutputIterator out,
-                  u8 global_brightness = 31) FL_NOEXCEPT {
+                  u8 global_brightness = 31) FL_NO_EXCEPT {
     // Clamp brightness to 5-bit range
     global_brightness = global_brightness & 0x1F;
 
@@ -58,10 +57,12 @@ void encodeSK9822(InputIterator first, InputIterator last, OutputIterator out,
         ++num_leds;
     }
 
-    // SK9822 difference: end frame uses 0x00 instead of 0xFF
+    // The vendor datasheet requires all ones for the end clocks. These clocks
+    // shift the final LED frame through a long cascade; a zero frame is not a
+    // substitute because it is itself a valid start-frame pattern.
     size_t end_dwords = (num_leds / 32) + 1;
     for (size_t i = 0; i < end_dwords * 4; i++) {
-        *out++ = 0x00;
+        *out++ = 0xFF;
     }
 }
 
@@ -76,7 +77,7 @@ void encodeSK9822(InputIterator first, InputIterator last, OutputIterator out,
 /// @note SK9822 uses BGR wire order: pixel[0]=Blue, pixel[1]=Green, pixel[2]=Red
 template <typename InputIterator, typename BrightnessIterator, typename OutputIterator>
 void encodeSK9822_HD(InputIterator first, InputIterator last,
-                     BrightnessIterator brightness_first, OutputIterator out) FL_NOEXCEPT {
+                     BrightnessIterator brightness_first, OutputIterator out) FL_NO_EXCEPT {
     // Start frame: 4 bytes of 0x00
     *out++ = 0x00;
     *out++ = 0x00;
@@ -100,10 +101,10 @@ void encodeSK9822_HD(InputIterator first, InputIterator last,
         ++num_leds;
     }
 
-    // SK9822 difference: end frame uses 0x00
+    // See encodeSK9822(): the end clocks are all ones.
     size_t end_dwords = (num_leds / 32) + 1;
     for (size_t i = 0; i < end_dwords * 4; i++) {
-        *out++ = 0x00;
+        *out++ = 0xFF;
     }
 }
 
@@ -119,10 +120,11 @@ void encodeSK9822_HD(InputIterator first, InputIterator last,
 template <typename InputIterator, typename OutputIterator>
 FL_NO_INLINE_IF_AVR
 void encodeSK9822_AutoBrightness(InputIterator first, InputIterator last,
-                                 OutputIterator out) FL_NOEXCEPT {
+                                 OutputIterator out) FL_NO_EXCEPT {
     if (first == last) {
-        // Empty range - just write start frame
+        // Keep zero LEDs as a full frame, matching the non-auto encoder.
         *out++ = 0x00; *out++ = 0x00; *out++ = 0x00; *out++ = 0x00;
+        *out++ = 0xFF; *out++ = 0xFF; *out++ = 0xFF; *out++ = 0xFF;
         return;
     }
 
@@ -164,10 +166,10 @@ void encodeSK9822_AutoBrightness(InputIterator first, InputIterator last,
         ++num_leds;
     }
 
-    // End frame (SK9822 uses 0x00)
+    // End frame: all ones clock the final data through the cascade.
     size_t end_dwords = (num_leds / 32) + 1;
     for (size_t i = 0; i < end_dwords * 4; i++) {
-        *out++ = 0x00;
+        *out++ = 0xFF;
     }
 }
 

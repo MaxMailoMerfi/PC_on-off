@@ -12,8 +12,11 @@
 
 #ifdef FL_IS_ESP32
 // IWYU pragma: begin_keep
+#include "platforms/esp/32/drivers/i2s_rx/i2s_rx_sampler.h"  // ok platform headers
+#include "platforms/esp/32/drivers/parlio_rx/parlio_rx_sampler.h"  // ok platform headers
 #include "platforms/esp/32/drivers/rmt_rx/rmt_rx_channel.h" // ok platform headers
 #include "platforms/esp/32/drivers/gpio_isr_rx/gpio_isr_rx.h" // ok platform headers
+#include "platforms/esp/32/feature_flags/enabled.h" // ok platform headers
 #endif
 // IWYU pragma: end_keep
 
@@ -37,10 +40,28 @@
 // IWYU pragma: end_keep
 #endif
 
+#ifdef FL_IS_RP
+// IWYU pragma: begin_keep
+#include "platforms/arm/rp/rpcommon/rx_pio_channel.h"  // ok platform headers
+// IWYU pragma: end_keep
+#endif
+
 namespace fl {
 
+template <>
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PIO>(int pin) FL_NO_EXCEPT {
+#ifdef FL_IS_RP
+    return RpPioRxDevice::create(pin);
+#elif defined(FL_IS_STUB)
+    return NativeRxDevice::create(pin);
+#else
+    (void)pin;
+    return createDummy();
+#endif
+}
+
 // Private static helper - creates dummy device (singleton pattern)
-fl::shared_ptr<RxDevice> RxDevice::createDummy() FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::createDummy() FL_NO_EXCEPT {
     static fl::shared_ptr<RxDevice> dummy = fl::make_shared<DummyRxDevice>( // okay static in header
         "RX devices not supported on this platform"
     );
@@ -49,7 +70,7 @@ fl::shared_ptr<RxDevice> RxDevice::createDummy() FL_NOEXCEPT {
 
 // Implementation of make4PhaseTiming function
 ChipsetTiming4Phase make4PhaseTiming(const ChipsetTiming& timing_3phase,
-                                      u32 tolerance_ns) FL_NOEXCEPT {
+                                      u32 tolerance_ns) FL_NO_EXCEPT {
     // Calculate derived values from 3-phase timing
     // The encoder uses:
     //   Bit 0: T1 high + (T2+T3) low
@@ -90,19 +111,35 @@ namespace fl {
 
 #ifdef FL_IS_ESP32
 
-// RMT device specialization for ESP32
+// RMT device specialization for ESP32.
+//
+// The `RmtRxChannel::create` impl only exists on chips that actually have RMT
+// silicon: the IDF 4.x impl in `rmt_rx_4/` gates on
+// `FASTLED_ESP32_HAS_RMT && !FASTLED_ESP32_RMT5_ONLY_PLATFORM && !FASTLED_RMT5`
+// and the IDF 5.x impl in `rmt_rx_5/` gates on `FASTLED_RMT5`. On ESP32-C2
+// the SoC has no RMT peripheral (`SOC_RMT_SUPPORTED == 0`, so
+// `FASTLED_ESP32_HAS_RMT == 0`), and the workflow forces
+// `FASTLED_RMT5 = 0` for that chip — so both impls skip and the specialisation
+// link-fails with `undefined reference to fl::RmtRxChannel::create(int)`.
+// Mirror the exact gates the impls use here so the specialisation collapses
+// to a DummyRxDevice on RMT-less chips.
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NO_EXCEPT {
+#if (FASTLED_ESP32_HAS_RMT && !FASTLED_ESP32_RMT5_ONLY_PLATFORM && !FASTLED_RMT5) || FASTLED_RMT5
     auto device = RmtRxChannel::create(pin);
     if (!device) {
         return fl::make_shared<DummyRxDevice>("RMT RX channel creation failed");
     }
     return device;
+#else
+    (void)pin;
+    return fl::make_shared<DummyRxDevice>("RMT RX not supported on this ESP32 SoC");
+#endif
 }
 
 // ISR device specialization for ESP32
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NO_EXCEPT {
     auto device = GpioIsrRx::create(pin);
     if (!device) {
         return fl::make_shared<DummyRxDevice>("GPIO ISR RX creation failed");
@@ -112,28 +149,51 @@ fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NOEXCEP
 
 // FLEXPWM not available on ESP32
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NO_EXCEPT {
     (void)pin;
     return fl::make_shared<DummyRxDevice>("FLEXPWM RX not supported on ESP32");
 }
 
 // FLEXIO not available on ESP32 (Teensy 4.x peripheral). See FastLED#2764.
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NO_EXCEPT {
     (void)pin;
     return fl::make_shared<DummyRxDevice>("FLEXIO RX not supported on ESP32");
 }
 
 // LPC_SCT_CAPTURE not available on ESP32 (LPC8xx peripheral). See FastLED#3015.
+// FastLED#3576 Phase 3 — I2S-RX oversampling backend (classic ESP32).
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::I2S_RX>(int pin) FL_NO_EXCEPT {
+#if FASTLED_ESP32_HAS_I2S
+    auto device = createI2sRxSampler(pin);
+    if (device) {
+        return device;
+    }
+#endif
+    (void)pin;
+    return fl::make_shared<DummyRxDevice>("I2S_RX not supported on this chip");
+}
+
+// FastLED#3586 — PARLIO-RX oversampling backend (ESP32-C6 et al).
+template <>
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PARLIO_RX>(int pin) FL_NO_EXCEPT {
+    auto device = createParlioRxSampler(pin);
+    if (device) {
+        return device;
+    }
+    return fl::make_shared<DummyRxDevice>("PARLIO_RX not supported on this chip");
+}
+
+template <>
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NO_EXCEPT {
     (void)pin;
     return fl::make_shared<DummyRxDevice>("LPC_SCT_CAPTURE RX not supported on ESP32");
 }
 
 // DEFAULT maps to RMT on ESP32
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NO_EXCEPT {
     return RxDevice::create<RxDeviceType::RMT>(pin);
 }
 
@@ -141,7 +201,7 @@ fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pi
 
 // FLEXPWM device specialization for Teensy 4.x
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NO_EXCEPT {
     auto device = FlexPwmRxChannel::create(pin);
     if (!device) {
         return fl::make_shared<DummyRxDevice>("FlexPWM RX channel creation failed");
@@ -153,7 +213,7 @@ fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NOE
 // Returns a real FlexIoRxChannel object whose methods report inactive until
 // Phase 1B lands the FLEXIO1 register programming.
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NO_EXCEPT {
     auto device = FlexIoRxChannel::create(pin);
     if (!device) {
         return fl::make_shared<DummyRxDevice>("FlexIO RX channel creation failed");
@@ -163,21 +223,33 @@ fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NOEX
 
 // RMT not available on Teensy
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NO_EXCEPT {
     (void)pin;
     return fl::make_shared<DummyRxDevice>("RMT RX not supported on Teensy");
 }
 
 // ISR not available on Teensy
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NO_EXCEPT {
     (void)pin;
     return fl::make_shared<DummyRxDevice>("ISR RX not supported on Teensy");
 }
 
 // LPC_SCT_CAPTURE not available on Teensy (LPC8xx peripheral). See FastLED#3015.
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::I2S_RX>(int pin) FL_NO_EXCEPT {
+    (void)pin;
+    return fl::make_shared<DummyRxDevice>("I2S_RX not supported on this platform");
+}
+
+template <>
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PARLIO_RX>(int pin) FL_NO_EXCEPT {
+    (void)pin;
+    return fl::make_shared<DummyRxDevice>("PARLIO_RX not supported on this platform");
+}
+
+template <>
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NO_EXCEPT {
     (void)pin;
     return fl::make_shared<DummyRxDevice>("LPC_SCT_CAPTURE RX not supported on Teensy");
 }
@@ -185,7 +257,7 @@ fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin
 // DEFAULT maps to FLEXPWM on Teensy 4.x (intentionally NOT switched to FLEXIO yet
 // — that ships in a separate PR after Phase 3 verification per FastLED#2764).
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NO_EXCEPT {
     return RxDevice::create<RxDeviceType::FLEXPWM>(pin);
 }
 
@@ -193,7 +265,19 @@ fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pi
 
 // LPC8xx SCT input-capture + DMA receiver. See FastLED#3015.
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::I2S_RX>(int pin) FL_NO_EXCEPT {
+    (void)pin;
+    return fl::make_shared<DummyRxDevice>("I2S_RX not supported on this platform");
+}
+
+template <>
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PARLIO_RX>(int pin) FL_NO_EXCEPT {
+    (void)pin;
+    return fl::make_shared<DummyRxDevice>("PARLIO_RX not supported on this platform");
+}
+
+template <>
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NO_EXCEPT {
     auto device = LpcSctRxChannel::create(pin);
     if (!device) {
         return fl::make_shared<DummyRxDevice>("LPC SCT-capture RX channel creation failed");
@@ -203,35 +287,35 @@ fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin
 
 // RMT not available on LPC
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NO_EXCEPT {
     (void)pin;
     return fl::make_shared<DummyRxDevice>("RMT RX not supported on LPC");
 }
 
 // ISR not available on LPC (Cortex-M0+ ISR latency cannot decode 800 kHz). See #3015.
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NO_EXCEPT {
     (void)pin;
     return fl::make_shared<DummyRxDevice>("ISR RX not feasible on LPC Cortex-M0+ (use LPC_SCT_CAPTURE)");
 }
 
 // FLEXPWM not available on LPC
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NO_EXCEPT {
     (void)pin;
     return fl::make_shared<DummyRxDevice>("FLEXPWM RX not supported on LPC");
 }
 
 // FLEXIO not available on LPC
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NO_EXCEPT {
     (void)pin;
     return fl::make_shared<DummyRxDevice>("FLEXIO RX not supported on LPC");
 }
 
 // DEFAULT maps to LPC_SCT_CAPTURE on LPC.
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NO_EXCEPT {
     return RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(pin);
 }
 
@@ -239,19 +323,19 @@ fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pi
 
 // RMT device specialization (native stub for host/desktop testing)
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NO_EXCEPT {
     return NativeRxDevice::create(pin);
 }
 
 // ISR device specialization (native stub for host/desktop testing)
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NO_EXCEPT {
     return NativeRxDevice::create(pin);
 }
 
 // FLEXPWM device specialization (native stub for host/desktop testing)
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NO_EXCEPT {
     return NativeRxDevice::create(pin);
 }
 
@@ -259,7 +343,7 @@ fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NOE
 // NativeRxDevice fallback as the other backends so host-stub tests can exercise
 // `RxBackend::FLEXIO` against the synthetic capture buffer.
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NO_EXCEPT {
     return NativeRxDevice::create(pin);
 }
 
@@ -267,13 +351,25 @@ fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NOEX
 // fallback so host-stub tests can exercise `RxBackend::LPC_SCT_CAPTURE`
 // against the synthetic capture buffer.
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::I2S_RX>(int pin) FL_NO_EXCEPT {
+    (void)pin;
+    return fl::make_shared<DummyRxDevice>("I2S_RX not supported on this platform");
+}
+
+template <>
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PARLIO_RX>(int pin) FL_NO_EXCEPT {
+    (void)pin;
+    return fl::make_shared<DummyRxDevice>("PARLIO_RX not supported on this platform");
+}
+
+template <>
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NO_EXCEPT {
     return NativeRxDevice::create(pin);
 }
 
 // DEFAULT maps to RMT on stub (same as ESP32 default)
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NO_EXCEPT {
     return RxDevice::create<RxDeviceType::RMT>(pin);
 }
 
@@ -281,43 +377,59 @@ fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pi
 
 // RMT device specialization (dummy for non-ESP32, non-stub)
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::RMT>(int pin) FL_NO_EXCEPT {
     (void)pin;  // Suppress unused parameter warning
     return RxDevice::createDummy();
 }
 
 // ISR device specialization (dummy for non-ESP32, non-stub)
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::ISR>(int pin) FL_NO_EXCEPT {
     (void)pin;  // Suppress unused parameter warning
     return RxDevice::createDummy();
 }
 
 // FLEXPWM device specialization (dummy for unsupported platforms)
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXPWM>(int pin) FL_NO_EXCEPT {
     (void)pin;  // Suppress unused parameter warning
     return RxDevice::createDummy();
 }
 
 // FLEXIO device specialization (dummy for unsupported platforms)
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::FLEXIO>(int pin) FL_NO_EXCEPT {
     (void)pin;  // Suppress unused parameter warning
     return RxDevice::createDummy();
 }
 
 // LPC_SCT_CAPTURE device specialization (dummy for unsupported platforms)
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::I2S_RX>(int pin) FL_NO_EXCEPT {
+    (void)pin;
+    return fl::make_shared<DummyRxDevice>("I2S_RX not supported on this platform");
+}
+
+template <>
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PARLIO_RX>(int pin) FL_NO_EXCEPT {
+    (void)pin;
+    return fl::make_shared<DummyRxDevice>("PARLIO_RX not supported on this platform");
+}
+
+template <>
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::LPC_SCT_CAPTURE>(int pin) FL_NO_EXCEPT {
     (void)pin;  // Suppress unused parameter warning
     return RxDevice::createDummy();
 }
 
-// DEFAULT maps to RMT on unsupported platforms (returns dummy)
+// DEFAULT maps to PIO on RP and RMT elsewhere (returns dummy if unsupported).
 template <>
-fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NOEXCEPT {
+fl::shared_ptr<RxDevice> RxDevice::create<RxDeviceType::PLATFORM_DEFAULT>(int pin) FL_NO_EXCEPT {
+#ifdef FL_IS_RP
+    return RxDevice::create<RxDeviceType::PIO>(pin);
+#else
     return RxDevice::create<RxDeviceType::RMT>(pin);
+#endif
 }
 
 #endif // FL_IS_ESP32 / FL_IS_TEENSY_4X / FL_IS_ARM_LPC / FL_IS_STUB

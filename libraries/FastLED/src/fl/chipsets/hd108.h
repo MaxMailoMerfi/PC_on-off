@@ -43,12 +43,18 @@ class HD108Controller : public CPixelLEDController<RGB_ORDER> {
 	SPI mSPI;
 
 public:
-	HD108Controller() FL_NOEXCEPT {}
+	HD108Controller() FL_NO_EXCEPT {}
+	#if defined(FL_IS_ESP32)
+	CLEDController &setSpiBus(fl::Esp32SpiBus bus) FL_NO_EXCEPT override {
+		mSPI.setBus(bus);
+		return *this;
+	}
+	#endif
 
-	void init() override { mSPI.init(); }
+	void init() FL_NO_EXCEPT override { mSPI.init(); }
 
 protected:
-void showPixels(PixelController<RGB_ORDER> &pixels) override {
+void showPixels(PixelController<RGB_ORDER> &pixels) FL_NO_EXCEPT override {
     mSPI.select();
 
     // ---- Start frame: 64 bits of 0 ----

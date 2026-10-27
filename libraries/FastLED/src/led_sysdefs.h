@@ -43,12 +43,14 @@
 #elif defined(__SAM3X8E__)
 // Include sam/due headers
 #include "platforms/arm/sam/led_sysdefs_arm_sam.h"  // ok platform headers
-#elif defined(STM32F10X_MD) || defined(__STM32F1__) || defined(STM32F1) || defined(STM32F1xx) || defined(STM32F2XX) || defined(STM32F4) || defined(STM32U5) || defined(STM32U5xx) || defined(STM32U585xx) || defined(STM32U585XX) || defined(ARDUINO_UNO_Q) || defined(CONFIG_BOARD_ARDUINO_UNO_Q) || defined(CONFIG_SOC_STM32U585XX)
+#elif defined(STM32F10X_MD) || defined(__STM32F1__) || defined(STM32F1) || defined(STM32F1xx) || defined(STM32F2XX) || defined(STM32F4) || defined(STM32U5) || defined(STM32U5xx) || defined(STM32U585xx) || defined(STM32U585XX) || defined(ARDUINO_UNO_Q) || defined(CONFIG_BOARD_ARDUINO_UNO_Q) || defined(CONFIG_SOC_STM32U585XX) || defined(STM32G0) || defined(STM32G0xx)
 #include "platforms/arm/stm32/led_sysdefs_arm_stm32.h"  // ok platform headers
 #elif defined(__SAMD21G18A__) || defined(__SAMD21J18A__) || defined(__SAMD21E17A__) || defined(__SAMD21E18A__)
 #include "platforms/arm/d21/led_sysdefs_arm_d21.h"  // ok platform headers
 #elif defined(__SAMD51G19A__) || defined(__SAMD51J19A__) || defined(__SAME51J19A__) || defined(__SAMD51P19A__) || defined(__SAMD51P20A__)
 #include "platforms/arm/d51/led_sysdefs_arm_d51.h"  // ok platform headers
+#elif defined(FL_IS_SAME53)
+#include "platforms/arm/same53/led_sysdefs_arm_same53.h"  // ok platform headers
 #elif defined(ARDUINO_ARCH_RP2350) || defined(PICO_RP2350)
 #include "platforms/arm/rp/rp2350/led_sysdefs_arm_rp2350.h"  // ok platform headers
 #elif defined(ARDUINO_ARCH_RP2040) // not sure a pico-sdk define for this
@@ -58,6 +60,8 @@
 #include "platforms/esp/8266/led_sysdefs_esp8266.h"  // ok platform headers
 #elif defined(ESP32)
 #include "platforms/esp/32/core/led_sysdefs_esp32.h"  // ok platform headers
+#elif defined(ARDUINO_ARCH_CI13XX)
+#include "platforms/ci13xx/led_sysdefs_ci13xx.h"  // ok platform headers
 #elif defined(__AVR__) || defined(__AVR_ATmega4809__)
 // AVR platforms
 #include "platforms/avr/led_sysdefs_avr.h"  // ok platform headers

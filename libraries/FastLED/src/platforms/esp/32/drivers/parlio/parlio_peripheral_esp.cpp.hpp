@@ -24,6 +24,7 @@
 // Include ESP-IDF headers ONLY in .cpp file
 FL_EXTERN_C_BEGIN
 // IWYU pragma: begin_keep
+#include "driver/gpio.h"
 #include "driver/gptimer.h"
 // IWYU pragma: end_keep
 // IWYU pragma: begin_keep
@@ -64,33 +65,36 @@ public:
     ~ParlioPeripheralESPImpl() override;
 
     // IParlioPeripheral Interface Implementation
-    bool initialize(const ParlioPeripheralConfig& config) FL_NOEXCEPT override;
-    bool deinitialize() FL_NOEXCEPT override;
-    bool enable() FL_NOEXCEPT override;
-    bool disable() FL_NOEXCEPT override;
-    bool isInitialized() const FL_NOEXCEPT override;
-    bool transmit(const u8* buffer, size_t bit_count, u16 idle_value) FL_NOEXCEPT override;
-    bool waitAllDone(u32 timeout_ms) FL_NOEXCEPT override;
-    bool registerTxDoneCallback(void* callback, void* user_ctx) FL_NOEXCEPT override;
-    u8* allocateDmaBuffer(size_t size) FL_NOEXCEPT override;
-    void freeDmaBuffer(u8* buffer) FL_NOEXCEPT override;
-    void delay(u32 ms) FL_NOEXCEPT override;
-    void delayMicroseconds(u32 us) FL_NOEXCEPT override;
-    u32 millis() FL_NOEXCEPT override;
-    u64 getMicroseconds() FL_NOEXCEPT override;
-    void freeDmaBuffer(void* ptr) FL_NOEXCEPT override;
+    bool initialize(const ParlioPeripheralConfig& config) FL_NO_EXCEPT override;
+    bool deinitialize() FL_NO_EXCEPT override;
+    bool enable() FL_NO_EXCEPT override;
+    bool disable() FL_NO_EXCEPT override;
+    bool isInitialized() const FL_NO_EXCEPT override;
+    bool transmit(const u8* buffer, size_t bit_count, u16 idle_value) FL_NO_EXCEPT override;
+    bool waitAllDone(u32 timeout_ms) FL_NO_EXCEPT override;
+    bool registerTxDoneCallback(void* callback, void* user_ctx) FL_NO_EXCEPT override;
+    u8* allocateDmaBuffer(size_t size) FL_NO_EXCEPT override;
+    void freeDmaBuffer(u8* buffer) FL_NO_EXCEPT override;
+    void delay(u32 ms) FL_NO_EXCEPT override;
+    void delayMicroseconds(u32 us) FL_NO_EXCEPT override;
+    u32 millis() FL_NO_EXCEPT override;
+    u64 getMicroseconds() FL_NO_EXCEPT override;
+    void freeDmaBuffer(void* ptr) FL_NO_EXCEPT override;
 
 private:
+    bool deleteTxUnitKeepingPinsDriven() FL_NO_EXCEPT;
+
     ::parlio_tx_unit_handle_t mTxUnit;  ///< ESP-IDF TX unit handle
     bool mEnabled;                       ///< Track enable state (for cleanup)
     bool mPreferPsram;                   ///< Prefer PSRAM for DMA buffers
+    int mDataPins[16];                   ///< Data GPIOs of mTxUnit (-1 = unused)
 };
 
 //=============================================================================
 // Singleton Instance
 //=============================================================================
 
-ParlioPeripheralESP& ParlioPeripheralESP::instance() FL_NOEXCEPT {
+ParlioPeripheralESP& ParlioPeripheralESP::instance() FL_NO_EXCEPT {
     return Singleton<ParlioPeripheralESPImpl>::instance();
 }
 
@@ -110,6 +114,9 @@ ParlioPeripheralESPImpl::ParlioPeripheralESPImpl()
     : mTxUnit(nullptr),
       mEnabled(false),
       mPreferPsram(true) {
+    for (int& pin : mDataPins) {
+        pin = -1;
+    }
 }
 
 ParlioPeripheralESPImpl::~ParlioPeripheralESPImpl() {
@@ -130,13 +137,9 @@ ParlioPeripheralESPImpl::~ParlioPeripheralESPImpl() {
             mEnabled = false;
         }
 
-        // Delete TX unit
-        err = parlio_del_tx_unit(mTxUnit);
-        if (err != ESP_OK) {
-            FL_LOG_PARLIO("ParlioPeripheralESP: Failed to delete TX unit: " << err);
+        if (!deleteTxUnitKeepingPinsDriven()) {
+            mTxUnit = nullptr;
         }
-
-        mTxUnit = nullptr;
     }
 }
 
@@ -144,7 +147,7 @@ ParlioPeripheralESPImpl::~ParlioPeripheralESPImpl() {
 // Lifecycle Methods
 //=============================================================================
 
-bool ParlioPeripheralESPImpl::initialize(const ParlioPeripheralConfig& config) FL_NOEXCEPT {
+bool ParlioPeripheralESPImpl::initialize(const ParlioPeripheralConfig& config) FL_NO_EXCEPT {
     FL_LOG_PARLIO("PARLIO_PERIPH: initialize() called - data_width=" << config.data_width << " clock=" << config.clock_freq_hz);
 
     // ⚠️ ESP32-C6 KNOWN HARDWARE LIMITATION:
@@ -195,32 +198,28 @@ bool ParlioPeripheralESPImpl::initialize(const ParlioPeripheralConfig& config) F
     esp_config.valid_gpio_num = static_cast<gpio_num_t>(-1);
 
     // Log heap availability before allocation attempts (visible with FL_LOG_PARLIO_ENABLED)
-    FL_LOG_PARLIO("PARLIO_PERIPH: DMA heap - free: "
-           << heap_caps_get_free_size(MALLOC_CAP_DMA)
-           << ", largest block: " << heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
-    FL_LOG_PARLIO("PARLIO_PERIPH: PSRAM heap - free: "
-           << heap_caps_get_free_size(MALLOC_CAP_SPIRAM)
-           << ", largest block: " << heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    FL_LOG_PARLIO("PARLIO_PERIPH: DMA heap - free: " << heap_caps_get_free_size(MALLOC_CAP_DMA) << ", largest block: " << heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    FL_LOG_PARLIO("PARLIO_PERIPH: PSRAM heap - free: " << heap_caps_get_free_size(MALLOC_CAP_SPIRAM) << ", largest block: " << heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 
     // Create TX unit (delegate to ESP-IDF)
     FL_LOG_PARLIO("PARLIO_PERIPH: Calling parlio_new_tx_unit()");
     esp_err_t err = parlio_new_tx_unit(&esp_config, &mTxUnit);
     if (err != ESP_OK) {
-        FL_WARN("ParlioPeripheralESP: parlio_new_tx_unit() failed: "
-                << esp_err_to_name(err) << " (" << err << ")"
-                << " data_width=" << config.data_width);
+        FL_WARN("ParlioPeripheralESP: parlio_new_tx_unit() failed: " << esp_err_to_name(err) << " (" << err << ") data_width=" << config.data_width);
         mTxUnit = nullptr;
         return false;
     }
-    FL_LOG_PARLIO("PARLIO_PERIPH: parlio_new_tx_unit() SUCCESS - handle=" << (void*)mTxUnit);
+    FL_LOG_PARLIO("PARLIO_PERIPH: parlio_new_tx_unit() SUCCESS - handle=" << ((void*)mTxUnit));
+    for (size_t i = 0; i < 16; i++) {
+        mDataPins[i] = (i < config.data_width) ? config.gpio_pins[i] : -1;
+    }
 
-    FL_LOG_PARLIO("PARLIO: Initialized (data_width=" << config.data_width
-                  << ", clock=" << config.clock_freq_hz << " Hz)");
+    FL_LOG_PARLIO("PARLIO: Initialized (data_width=" << config.data_width << ", clock=" << config.clock_freq_hz << " Hz)");
 
     return true;
 }
 
-bool ParlioPeripheralESPImpl::deinitialize() FL_NOEXCEPT {
+bool ParlioPeripheralESPImpl::deinitialize() FL_NO_EXCEPT {
     if (mTxUnit == nullptr) {
         return true; // Already deinitialized
     }
@@ -229,25 +228,58 @@ bool ParlioPeripheralESPImpl::deinitialize() FL_NOEXCEPT {
     if (mEnabled) {
         esp_err_t err = parlio_tx_unit_disable(mTxUnit);
         if (err != ESP_OK) {
-            FL_WARN("ParlioPeripheralESP: Failed to disable TX unit during deinitialize: "
-                    << esp_err_to_name(err) << " (" << err << ")");
+            FL_WARN("ParlioPeripheralESP: Failed to disable TX unit during deinitialize: " << esp_err_to_name(err) << " (" << err << ")");
         }
         mEnabled = false;
     }
 
-    // Delete TX unit to free hardware resources
-    esp_err_t err = parlio_del_tx_unit(mTxUnit);
-    if (err != ESP_OK) {
-        FL_WARN("ParlioPeripheralESP: Failed to delete TX unit during deinitialize: "
-                << esp_err_to_name(err) << " (" << err << ")");
-        return false;
+    return deleteTxUnitKeepingPinsDriven();
+}
+
+// parlio_del_tx_unit() calls gpio_output_disable() on every data pin and only
+// then tears the unit down (ISR, DMA, group), which takes ~350 us on an
+// ESP32-P4. The engine deletes and recreates the TX unit on every frame -- that
+// is what routes a pad another driver borrowed back to PARLIO -- so every
+// frame began with the data line floating for that long. A WS2812 DIN reads
+// whatever its pad pull makes of it; on the P4 loopback bench (RX pad pulled
+// up) RMT RX saw a rising edge, then >100 us of HIGH, hit its idle threshold
+// and ended before the frame started, so PARLIO looked like it emitted nothing
+// (FastLED#4669). Latch each pad across the delete so it keeps driving the
+// idle level, re-drive it low as a plain GPIO, then release the latch.
+// parlio_new_tx_unit() routes the pad back to PARLIO.
+bool ParlioPeripheralESPImpl::deleteTxUnitKeepingPinsDriven() FL_NO_EXCEPT {
+    for (int pin : mDataPins) {
+        if (pin >= 0) {
+            gpio_hold_en(static_cast<gpio_num_t>(pin));
+        }
     }
 
+    const esp_err_t err = parlio_del_tx_unit(mTxUnit);
+
+    for (int& pin : mDataPins) {
+        if (pin < 0) {
+            continue;
+        }
+        const gpio_num_t gpio = static_cast<gpio_num_t>(pin);
+        if (err == ESP_OK) {
+            gpio_set_level(gpio, 0);
+            gpio_set_direction(gpio, GPIO_MODE_OUTPUT);
+        }
+        gpio_hold_dis(gpio);
+    }
+
+    if (err != ESP_OK) {
+        FL_WARN("ParlioPeripheralESP: Failed to delete TX unit: " << esp_err_to_name(err) << " (" << err << ")");
+        return false;
+    }
     mTxUnit = nullptr;
+    for (int& pin : mDataPins) {
+        pin = -1;
+    }
     return true;
 }
 
-bool ParlioPeripheralESPImpl::enable() FL_NOEXCEPT {
+bool ParlioPeripheralESPImpl::enable() FL_NO_EXCEPT {
     FL_LOG_PARLIO("PARLIO_PERIPH: enable() called");
     if (mTxUnit == nullptr) {
         FL_LOG_PARLIO("PARLIO_PERIPH: FAILED enable - not initialized");
@@ -259,8 +291,7 @@ bool ParlioPeripheralESPImpl::enable() FL_NOEXCEPT {
     FL_LOG_PARLIO("PARLIO_PERIPH: Calling parlio_tx_unit_enable()");
     esp_err_t err = parlio_tx_unit_enable(mTxUnit);
     if (err != ESP_OK) {
-        FL_WARN("ParlioPeripheralESP: Failed to enable TX unit: "
-                << esp_err_to_name(err) << " (" << err << ")");
+        FL_WARN("ParlioPeripheralESP: Failed to enable TX unit: " << esp_err_to_name(err) << " (" << err << ")");
         return false;
     }
 
@@ -269,7 +300,7 @@ bool ParlioPeripheralESPImpl::enable() FL_NOEXCEPT {
     return true;
 }
 
-bool ParlioPeripheralESPImpl::disable() FL_NOEXCEPT {
+bool ParlioPeripheralESPImpl::disable() FL_NO_EXCEPT {
     if (mTxUnit == nullptr) {
         FL_WARN("ParlioPeripheralESP: Cannot disable - not initialized");
         return false;
@@ -286,7 +317,7 @@ bool ParlioPeripheralESPImpl::disable() FL_NOEXCEPT {
     return true;
 }
 
-bool ParlioPeripheralESPImpl::isInitialized() const FL_NOEXCEPT {
+bool ParlioPeripheralESPImpl::isInitialized() const FL_NO_EXCEPT {
     // Real hardware: initialized if TX unit handle is valid
     return mTxUnit != nullptr;
 }
@@ -295,7 +326,7 @@ bool ParlioPeripheralESPImpl::isInitialized() const FL_NOEXCEPT {
 // Transmission Methods
 //=============================================================================
 
-bool FL_IRAM ParlioPeripheralESPImpl::transmit(const u8* buffer, size_t bit_count, u16 idle_value) FL_NOEXCEPT {
+bool FL_IRAM ParlioPeripheralESPImpl::transmit(const u8* buffer, size_t bit_count, u16 idle_value) FL_NO_EXCEPT {
     // ⚠️  ISR CONTEXT - NO LOGGING ALLOWED ⚠️
     // This function is called from FL_IRAM txDoneCallback via virtual dispatch.
     if (mTxUnit == nullptr) {
@@ -331,7 +362,7 @@ bool FL_IRAM ParlioPeripheralESPImpl::transmit(const u8* buffer, size_t bit_coun
     return true;
 }
 
-bool ParlioPeripheralESPImpl::waitAllDone(u32 timeout_ms) FL_NOEXCEPT {
+bool ParlioPeripheralESPImpl::waitAllDone(u32 timeout_ms) FL_NO_EXCEPT {
     if (mTxUnit == nullptr) {
         FL_WARN("ParlioPeripheralESP: Cannot wait - not initialized");
         return false;
@@ -356,7 +387,7 @@ bool ParlioPeripheralESPImpl::waitAllDone(u32 timeout_ms) FL_NOEXCEPT {
 // ISR Callback Registration
 //=============================================================================
 
-bool ParlioPeripheralESPImpl::registerTxDoneCallback(void* callback, void* user_ctx) FL_NOEXCEPT {
+bool ParlioPeripheralESPImpl::registerTxDoneCallback(void* callback, void* user_ctx) FL_NO_EXCEPT {
     FL_LOG_PARLIO("PARLIO_PERIPH: registerTxDoneCallback() called");
     if (mTxUnit == nullptr) {
         FL_LOG_PARLIO("PARLIO_PERIPH: FAILED register callback - not initialized");
@@ -372,8 +403,7 @@ bool ParlioPeripheralESPImpl::registerTxDoneCallback(void* callback, void* user_
     FL_LOG_PARLIO("PARLIO_PERIPH: Calling parlio_tx_unit_register_event_callbacks()");
     esp_err_t err = parlio_tx_unit_register_event_callbacks(mTxUnit, &callbacks, user_ctx);
     if (err != ESP_OK) {
-        FL_WARN("ParlioPeripheralESP: Failed to register callbacks: "
-                << esp_err_to_name(err) << " (" << err << ")");
+        FL_WARN("ParlioPeripheralESP: Failed to register callbacks: " << esp_err_to_name(err) << " (" << err << ")");
         return false;
     }
 
@@ -385,7 +415,7 @@ bool ParlioPeripheralESPImpl::registerTxDoneCallback(void* callback, void* user_
 // DMA Memory Management
 //=============================================================================
 
-u8* ParlioPeripheralESPImpl::allocateDmaBuffer(size_t size) FL_NOEXCEPT {
+u8* ParlioPeripheralESPImpl::allocateDmaBuffer(size_t size) FL_NO_EXCEPT {
     // Round up to 64-byte multiple for cache line alignment
     size_t aligned_size = ((size + 63) / 64) * 64;
 
@@ -414,42 +444,40 @@ u8* ParlioPeripheralESPImpl::allocateDmaBuffer(size_t size) FL_NOEXCEPT {
     if (buffer == nullptr) {
         FL_WARN("ParlioPeripheralESP: Failed to allocate DMA buffer (" << aligned_size << " bytes)");
         // Detailed heap stats visible with FL_LOG_PARLIO_ENABLED
-        FL_LOG_PARLIO("  DMA heap: " << heap_caps_get_free_size(MALLOC_CAP_DMA)
-                << " free, " << heap_caps_get_largest_free_block(MALLOC_CAP_DMA) << " largest block");
+        FL_LOG_PARLIO("  DMA heap: " << heap_caps_get_free_size(MALLOC_CAP_DMA) << " free, " << heap_caps_get_largest_free_block(MALLOC_CAP_DMA) << " largest block");
         if (mPreferPsram) {
-            FL_LOG_PARLIO("  PSRAM heap: " << heap_caps_get_free_size(MALLOC_CAP_SPIRAM)
-                    << " free, " << heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) << " largest block");
+            FL_LOG_PARLIO("  PSRAM heap: " << heap_caps_get_free_size(MALLOC_CAP_SPIRAM) << " free, " << heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) << " largest block");
         }
     }
 
     return buffer;
 }
 
-void ParlioPeripheralESPImpl::freeDmaBuffer(u8* buffer) FL_NOEXCEPT {
+void ParlioPeripheralESPImpl::freeDmaBuffer(u8* buffer) FL_NO_EXCEPT {
     if (buffer != nullptr) {
         heap_caps_free(buffer);
     }
 }
 
-void ParlioPeripheralESPImpl::delay(u32 ms) FL_NOEXCEPT {
+void ParlioPeripheralESPImpl::delay(u32 ms) FL_NO_EXCEPT {
     // Map to FreeRTOS vTaskDelay
     // pdMS_TO_TICKS converts milliseconds to RTOS ticks
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
-void ParlioPeripheralESPImpl::delayMicroseconds(u32 us) FL_NOEXCEPT {
-    task::run(us, task::ExecFlags::SYSTEM);
+void ParlioPeripheralESPImpl::delayMicroseconds(u32 us) FL_NO_EXCEPT {
+    task::yield_system(us);
 }
 
-u32 ParlioPeripheralESPImpl::millis() FL_NOEXCEPT {
+u32 ParlioPeripheralESPImpl::millis() FL_NO_EXCEPT {
     return static_cast<u32>(esp_timer_get_time() / 1000);
 }
 
-u64 FL_IRAM ParlioPeripheralESPImpl::getMicroseconds() FL_NOEXCEPT {
+u64 FL_IRAM ParlioPeripheralESPImpl::getMicroseconds() FL_NO_EXCEPT {
     return esp_timer_get_time();
 }
 
-void ParlioPeripheralESPImpl::freeDmaBuffer(void* ptr) FL_NOEXCEPT {
+void ParlioPeripheralESPImpl::freeDmaBuffer(void* ptr) FL_NO_EXCEPT {
     if (ptr) {
         heap_caps_free(ptr);
     }

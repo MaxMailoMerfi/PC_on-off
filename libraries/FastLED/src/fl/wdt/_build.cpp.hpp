@@ -9,6 +9,7 @@
 #include "fl/system/delay.h"
 
 #include "fl/wdt/watchdog.cpp.hpp"
+#include "fl/stl/compiler_control.h"  // IWYU pragma: keep - FL_UNUSED
 
 namespace fl {
 namespace platforms {
@@ -16,12 +17,13 @@ namespace platforms {
 // Print-sink implementation used by ScopedWatchdog's first-init path. Defined
 // here (in the unity TU) rather than in watchdog.cpp.hpp so that public
 // headers don't pull in fl/log/log.h.
-void scopedWatchdogPrintLine(fl::string_view sv) FL_NOEXCEPT {
+void scopedWatchdogPrintLine(fl::string_view sv) FL_NO_EXCEPT {
+    FL_UNUSED(sv);  // only consumed by FL_WARN, a no-op on small platforms
     FL_WARN(sv);
 }
 
 // Wraps fl::delay() — portable across stub/WASM/embedded.
-void scopedWatchdogPause3s() FL_NOEXCEPT {
+void scopedWatchdogPause3s() FL_NO_EXCEPT {
     fl::delay(3000);
 }
 

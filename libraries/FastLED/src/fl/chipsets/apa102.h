@@ -33,17 +33,21 @@ template <
 	fl::u32 SPI_SPEED = DATA_RATE_MHZ(6),
 	fl::FiveBitGammaCorrectionMode GAMMA_CORRECTION_MODE = fl::FiveBitGammaCorrectionMode::kFiveBitGammaCorrectionMode_Null,
 	fl::u32 START_FRAME = 0x00000000,
-	fl::u32 END_FRAME = 0xFF000000
+	// The vendor datasheet requires all ones for the end clocks. These clocks
+	// shift the final LED frame through a long cascade; a zero (or partial)
+	// end frame is not a substitute because it can be misread as a start
+	// frame. Matches encodeAPA102()/encodeSK9822() in fl/chipsets/encoders/.
+	fl::u32 END_FRAME = 0xFFFFFFFF
 >
 class APA102Controller : public CPixelLEDController<RGB_ORDER> {
 	typedef fl::SPIOutput<DATA_PIN, CLOCK_PIN, SPI_SPEED> SPI;
 	SPI mSPI;
 
-	void startBoundary() {
+	void startBoundary() FL_NO_EXCEPT {
 		mSPI.writeWord(START_FRAME >> 16);
 		mSPI.writeWord(START_FRAME & 0xFFFF);
 	}
-	void endBoundary(int nLeds) {
+	void endBoundary(int nLeds) FL_NO_EXCEPT {
 		int nDWords = (nLeds/32);
 		const fl::u8 b0 = fl::u8(END_FRAME >> 24 & 0x000000ff);
 		const fl::u8 b1 = fl::u8(END_FRAME >> 16 & 0x000000ff);
@@ -57,7 +61,7 @@ class APA102Controller : public CPixelLEDController<RGB_ORDER> {
 		} while(nDWords--);
 	}
 
-	FASTLED_FORCE_INLINE void writeLed(fl::u8 brightness, fl::u8 b0, fl::u8 b1, fl::u8 b2) {
+	FASTLED_FORCE_INLINE void writeLed(fl::u8 brightness, fl::u8 b0, fl::u8 b1, fl::u8 b2) FL_NO_EXCEPT {
 #ifdef FASTLED_SPI_BYTE_ONLY
 		mSPI.writeByte(0xE0 | brightness);
 		mSPI.writeByte(b0);
@@ -72,7 +76,7 @@ class APA102Controller : public CPixelLEDController<RGB_ORDER> {
 #endif
 	}
 
-	FASTLED_FORCE_INLINE void write2Bytes(fl::u8 b1, fl::u8 b2) {
+	FASTLED_FORCE_INLINE void write2Bytes(fl::u8 b1, fl::u8 b2) FL_NO_EXCEPT {
 #ifdef FASTLED_SPI_BYTE_ONLY
 		mSPI.writeByte(b1);
 		mSPI.writeByte(b2);
@@ -82,15 +86,21 @@ class APA102Controller : public CPixelLEDController<RGB_ORDER> {
 	}
 
 public:
-	APA102Controller() FL_NOEXCEPT {}
+	APA102Controller() FL_NO_EXCEPT {}
+	#if defined(FL_IS_ESP32)
+	CLEDController &setSpiBus(fl::Esp32SpiBus bus) FL_NO_EXCEPT override {
+		mSPI.setBus(bus);
+		return *this;
+	}
+	#endif
 
-	virtual void init() override {
+	virtual void init() FL_NO_EXCEPT override {
 		mSPI.init();
 	}
 
 protected:
 	/// @copydoc CPixelLEDController::showPixels()
-	virtual void showPixels(PixelController<RGB_ORDER> & pixels) override {
+	virtual void showPixels(PixelController<RGB_ORDER> & pixels) FL_NO_EXCEPT override {
 		switch (GAMMA_CORRECTION_MODE) {
 			case fl::FiveBitGammaCorrectionMode::kFiveBitGammaCorrectionMode_Null: {
 				showPixelsDefault(pixels);
@@ -107,12 +117,12 @@ private:
 
 	static inline void getGlobalBrightnessAndScalingFactors(
 		    PixelController<RGB_ORDER> & pixels,
-		    fl::u8* out_s0, fl::u8* out_s1, fl::u8* out_s2, fl::u8* out_brightness) {
+		    fl::u8* out_s0, fl::u8* out_s1, fl::u8* out_s2, fl::u8* out_brightness) FL_NO_EXCEPT {
 #if FASTLED_HD_COLOR_MIXING
 		fl::u8 brightness;
 		pixels.loadRGBScaleAndBrightness(out_s0, out_s1, out_s2, &brightness);
 		struct Math {
-			static fl::u16 map(fl::u16 x, fl::u16 in_min, fl::u16 in_max, fl::u16 out_min, fl::u16 out_max) {  // okay static in header
+			static fl::u16 map(fl::u16 x, fl::u16 in_min, fl::u16 in_max, fl::u16 out_min, fl::u16 out_max) FL_NO_EXCEPT {  // okay static in header
 				const fl::u16 run = in_max - in_min;
 				const fl::u16 rise = out_max - out_min;
 				const fl::u16 delta = x - in_min;
@@ -151,7 +161,7 @@ private:
 	}
 
 	// Legacy showPixels implementation.
-	inline void showPixelsDefault(PixelController<RGB_ORDER> & pixels) {
+	inline void showPixelsDefault(PixelController<RGB_ORDER> & pixels) FL_NO_EXCEPT {
 		mSPI.select();
 		fl::u8 s0, s1, s2, global_brightness;
 		getGlobalBrightnessAndScalingFactors(pixels, &s0, &s1, &s2, &global_brightness);
@@ -171,7 +181,7 @@ private:
 		mSPI.finalizeTransmission();
 	}
 
-	inline void showPixelsGammaBitShift(PixelController<RGB_ORDER> & pixels) {
+	inline void showPixelsGammaBitShift(PixelController<RGB_ORDER> & pixels) FL_NO_EXCEPT {
 		static constexpr fl::u16 kBatchSize = 8;
 		const fl::u16 n = static_cast<fl::u16>(pixels.size());
 
@@ -230,13 +240,13 @@ public:
 	/// Used for quad-SPI lane padding when strips have different lengths
 	/// @returns 0xFF (end frame continuation byte)
 	/// @deprecated Use getPaddingLEDFrame() for synchronized latching
-	static constexpr fl::u8 getPaddingByte() { return 0xFF; }
+	static constexpr fl::u8 getPaddingByte() FL_NO_EXCEPT { return 0xFF; }
 
 	/// Get padding LED frame for synchronized latching in quad-SPI
 	/// Returns a black LED frame to prepend to shorter strips, ensuring
 	/// all strips finish transmitting simultaneously for synchronized updates
 	/// @returns Black LED frame (4 bytes: brightness=0, RGB=0,0,0)
-	static fl::span<const fl::u8> getPaddingLEDFrame() {  // okay static in header
+	static fl::span<const fl::u8> getPaddingLEDFrame() FL_NO_EXCEPT {  // okay static in header
 		// APA102 LED frame format: [111BBBBB][B][G][R]
 		// Black LED: 0xE0 (brightness=0), RGB=0,0,0
 		static const fl::u8 frame[] = {  // okay static in header
@@ -250,7 +260,7 @@ public:
 
 	/// Get size of padding LED frame in bytes
 	/// @returns 4 (APA102 uses 4 bytes per LED)
-	static constexpr size_t getPaddingLEDFrameSize() {
+	static constexpr size_t getPaddingLEDFrameSize() FL_NO_EXCEPT {
 		return 4;
 	}
 
@@ -258,13 +268,21 @@ public:
 	/// Used for quad-SPI buffer pre-allocation
 	/// @param num_leds Number of LEDs in the strip
 	/// @returns Total bytes needed (start frame + LED data + end frame)
-	static constexpr size_t calculateBytes(size_t num_leds) {
+	static constexpr size_t calculateBytes(size_t num_leds) FL_NO_EXCEPT {
 		// APA102 protocol:
 		// - Start frame: 4 bytes (0x00000000)
 		// - LED data: 4 bytes per LED (brightness + RGB)
 		// - End frame: (num_leds / 32) + 1 DWords = 4 * ((num_leds / 32) + 1) bytes
 		return 4 + (num_leds * 4) + (4 * ((num_leds / 32) + 1));
 	}
+
+	/// Get the configured start frame DWord.
+	/// @returns the raw START_FRAME template value
+	static constexpr fl::u32 getStartFrame() FL_NO_EXCEPT { return START_FRAME; }
+
+	/// Get the configured end frame DWord.
+	/// @returns the raw END_FRAME template value
+	static constexpr fl::u32 getEndFrame() FL_NO_EXCEPT { return END_FRAME; }
 };
 
 /// APA102 high definition controller class.
@@ -290,13 +308,13 @@ class APA102ControllerHD : public APA102Controller<
 	SPI_SPEED,
 	fl::FiveBitGammaCorrectionMode::kFiveBitGammaCorrectionMode_BitShift,
 	fl::u32(0x00000000),
-	fl::u32(0x00000000)> {
+	fl::u32(0xFFFFFFFF)> {
 public:
-  APA102ControllerHD() FL_NOEXCEPT = default;
-  APA102ControllerHD(const APA102ControllerHD&) FL_NOEXCEPT = delete;
+  APA102ControllerHD() FL_NO_EXCEPT = default;
+  APA102ControllerHD(const APA102ControllerHD&) FL_NO_EXCEPT = delete;
 };
 
-/// SK9822 controller class. It's exactly the same as the APA102Controller protocol but with a different END_FRAME and default SPI_SPEED.
+/// SK9822 controller class. It's exactly the same as the APA102Controller protocol but with a different default SPI_SPEED.
 /// @tparam DATA_PIN the data pin for these LEDs
 /// @tparam CLOCK_PIN the clock pin for these LEDs
 /// @tparam RGB_ORDER the RGB ordering for these LEDs
@@ -314,11 +332,11 @@ class SK9822Controller : public APA102Controller<
 	SPI_SPEED,
 	fl::FiveBitGammaCorrectionMode::kFiveBitGammaCorrectionMode_Null,
 	0x00000000,
-	0x00000000
+	0xFFFFFFFF
 > {
 };
 
-/// SK9822 controller class. It's exactly the same as the APA102Controller protocol but with a different END_FRAME and default SPI_SPEED.
+/// SK9822 controller class. It's exactly the same as the APA102Controller protocol but with a different default SPI_SPEED.
 /// @tparam DATA_PIN the data pin for these LEDs
 /// @tparam CLOCK_PIN the clock pin for these LEDs
 /// @tparam RGB_ORDER the RGB ordering for these LEDs
@@ -336,7 +354,7 @@ class SK9822ControllerHD : public APA102Controller<
 	SPI_SPEED,
 	fl::FiveBitGammaCorrectionMode::kFiveBitGammaCorrectionMode_BitShift,
 	0x00000000,
-	0x00000000
+	0xFFFFFFFF
 > {
 };
 
@@ -354,7 +372,7 @@ class HD107Controller : public APA102Controller<
 	SPI_SPEED,
 	fl::FiveBitGammaCorrectionMode::kFiveBitGammaCorrectionMode_Null,
 	0x00000000,
-	0x00000000
+	0xFFFFFFFF
 > {};
 
 /// HD107HD is just the APA102HD with a default 40Mhz clock rate.

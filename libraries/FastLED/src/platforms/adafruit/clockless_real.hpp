@@ -4,7 +4,7 @@
 /// Implementation of IAdafruitNeoPixelDriver
 /// 
 /// This file contains the actual Adafruit_NeoPixel integration, keeping the
-/// dependency isolated from header files to avoid PlatformIO LDF issues.
+/// dependency isolated from header files to avoid LDF issues.
 
 // IWYU pragma: begin_keep
 #include <Adafruit_NeoPixel.h>
@@ -32,14 +32,14 @@ public:
     
     ~AdafruitNeoPixelDriverImpl() override = default;
     
-    void init(int dataPin) FL_NOEXCEPT override {
+    void init(int dataPin) FL_NO_EXCEPT override {
         if (!mInitialized) {
             mDataPin = dataPin;
             mInitialized = true;
         }
     }
     
-    void showPixels(PixelIterator& pixelIterator) FL_NOEXCEPT override {
+    void showPixels(PixelIterator& pixelIterator) FL_NO_EXCEPT override {
         if (!mInitialized) {
             return;
         }
@@ -91,7 +91,7 @@ public:
 };
 
 // Static factory method implementation
-fl::unique_ptr<IAdafruitNeoPixelDriver> IAdafruitNeoPixelDriver::create() FL_NOEXCEPT {
+fl::unique_ptr<IAdafruitNeoPixelDriver> IAdafruitNeoPixelDriver::create() FL_NO_EXCEPT {
     return fl::make_unique<AdafruitNeoPixelDriverImpl>();
 }
 

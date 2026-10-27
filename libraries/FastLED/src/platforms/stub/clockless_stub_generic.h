@@ -25,12 +25,12 @@ public:
 	virtual void init() { }
 
 protected:
-	virtual void showPixels(PixelController<RGB_ORDER> & pixels) FL_NOEXCEPT {
+	virtual void showPixels(PixelController<RGB_ORDER> & pixels) FL_NO_EXCEPT {
 		// Capture LED data for simulation/testing
 		mRgb.clear();
 		PixelController<RGB> pixels_rgb = pixels; // Converts to RGB pixels
 		pixels_rgb.disableColorAdjustment();
-		auto iterator = pixels_rgb.as_iterator(RgbwInvalid());
+		auto iterator = pixels_rgb.as_iterator(this->getRgbw());
 		iterator.writeWS2812(&mRgb);
 		mTracker.update(mRgb);
 	}
@@ -48,12 +48,12 @@ struct ClocklessControllerAdapter : public CPixelLEDController<RGB_ORDER> {
 	virtual void init() { }
 
 protected:
-	virtual void showPixels(PixelController<RGB_ORDER> & pixels) FL_NOEXCEPT {
+	virtual void showPixels(PixelController<RGB_ORDER> & pixels) FL_NO_EXCEPT {
 		// Capture LED data for simulation/testing
 		mRgb.clear();
 		PixelController<RGB> pixels_rgb = pixels; // Converts to RGB pixels
 		pixels_rgb.disableColorAdjustment();
-		auto iterator = pixels_rgb.as_iterator(RgbwInvalid());
+		auto iterator = pixels_rgb.as_iterator(this->getRgbw());
 		iterator.writeWS2812(&mRgb);
 		mTracker.update(mRgb);
 	}
@@ -72,12 +72,12 @@ public:
 	virtual void init() { }
 
 protected:
-	virtual void showPixels(PixelController<RGB_ORDER> & pixels) FL_NOEXCEPT {
+	virtual void showPixels(PixelController<RGB_ORDER> & pixels) FL_NO_EXCEPT {
 		// Capture LED data for simulation/testing
 		mRgb.clear();
 		PixelController<RGB> pixels_rgb = pixels; // Converts to RGB pixels
 		pixels_rgb.disableColorAdjustment();
-		auto iterator = pixels_rgb.as_iterator(RgbwInvalid());
+		auto iterator = pixels_rgb.as_iterator(this->getRgbw());
 		iterator.writeWS2812(&mRgb);
 		mTracker.update(mRgb);
 	}

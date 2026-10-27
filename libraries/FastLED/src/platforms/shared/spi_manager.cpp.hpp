@@ -30,7 +30,7 @@ namespace fl {
 // SPIBusManager Implementation
 // ============================================================================
 
-SPIBusManager::SPIBusManager() FL_NOEXCEPT : mNumBuses(0), mInitialized(false) {
+SPIBusManager::SPIBusManager() FL_NO_EXCEPT : mNumBuses(0), mInitialized(false) {
     for (u8 i = 0; i < MAX_BUSES; i++) {
         mBuses[i] = SPIBusInfo{};
     }
@@ -46,22 +46,23 @@ SPIBusManager::~SPIBusManager() {
     // Device destructors already handle cleanup via unregisterDevice(), so this is safe.
 }
 
-SPIBusHandle SPIBusManager::registerDevice(u8 clock_pin, u8 data_pin, u32 requested_speed_hz, void* controller) FL_NOEXCEPT {
+SPIBusHandle SPIBusManager::registerDevice(u8 clock_pin, u8 data_pin, u32 requested_speed_hz, void* controller,
+                                           Esp32SpiBus requested_bus) FL_NO_EXCEPT {
     if (!controller) {
         FL_WARN("SPIBusManager: nullptr controller pointer");
         return SPIBusHandle();
     }
 
     // Find or create bus for this clock pin
-    SPIBusInfo* bus = getOrCreateBus(clock_pin);
+    SPIBusInfo* bus = getOrCreateBus(clock_pin, requested_bus);
     if (!bus) {
-        FL_WARN_FMT("SPIBusManager: Too many different clock pins (max " << MAX_BUSES << ")");
+        FL_WARN("SPIBusManager: Too many different clock pins (max " << (static_cast<int>(MAX_BUSES)) << ")");
         return SPIBusHandle();
     }
 
     // Check if we can add another device to this bus
     if (bus->num_devices >= 16) {
-        FL_WARN_FMT("SPIBusManager: Too many devices on clock pin " << clock_pin << " (max 16)");
+        FL_WARN("SPIBusManager: Too many devices on clock pin " << clock_pin << " (max 16)");
         return SPIBusHandle();
     }
 
@@ -81,7 +82,7 @@ SPIBusHandle SPIBusManager::registerDevice(u8 clock_pin, u8 data_pin, u32 reques
     return SPIBusHandle(bus_id, device_idx);
 }
 
-bool SPIBusManager::unregisterDevice(SPIBusHandle handle) FL_NOEXCEPT {
+bool SPIBusManager::unregisterDevice(SPIBusHandle handle) FL_NO_EXCEPT {
     if (!handle.is_valid || handle.bus_id >= mNumBuses) {
         return false;
     }
@@ -117,7 +118,7 @@ bool SPIBusManager::unregisterDevice(SPIBusHandle handle) FL_NOEXCEPT {
     return true;
 }
 
-bool SPIBusManager::initialize() FL_NOEXCEPT {
+bool SPIBusManager::initialize() FL_NO_EXCEPT {
     bool all_ok = true;
 
     // Initialize each bus that hasn't been initialized yet
@@ -133,7 +134,7 @@ bool SPIBusManager::initialize() FL_NOEXCEPT {
     return all_ok;
 }
 
-void SPIBusManager::transmit(SPIBusHandle handle, const u8* data, size_t length) FL_NOEXCEPT {
+void SPIBusManager::transmit(SPIBusHandle handle, const u8* data, size_t length) FL_NO_EXCEPT {
     if (!handle.is_valid || handle.bus_id >= mNumBuses) {
         return;
     }
@@ -203,7 +204,7 @@ void SPIBusManager::transmit(SPIBusHandle handle, const u8* data, size_t length)
     }
 }
 
-void SPIBusManager::waitComplete(SPIBusHandle handle) FL_NOEXCEPT {
+void SPIBusManager::waitComplete(SPIBusHandle handle) FL_NO_EXCEPT {
     if (!handle.is_valid || handle.bus_id >= mNumBuses) {
         return;
     }
@@ -219,7 +220,7 @@ void SPIBusManager::waitComplete(SPIBusHandle handle) FL_NOEXCEPT {
     }
 }
 
-void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NOEXCEPT {
+void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NO_EXCEPT {
     if (!handle.is_valid || handle.bus_id >= mNumBuses) {
         return;
     }
@@ -258,7 +259,7 @@ void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NOEXCEPT {
         // Acquire DMA buffer (zero-copy API) - use polymorphic interface
         DMABuffer result = bus.hw_controller->acquireDMABuffer(max_size);
         if (!result.ok()) {
-            FL_WARN_FMT("SPI Bus Manager: Failed to acquire DMA buffer for Dual-SPI: " << static_cast<int>(result.error()));
+            FL_WARN("SPI Bus Manager: Failed to acquire DMA buffer for Dual-SPI: " << (static_cast<int>(result.error())));
             // Clear buffers and bail
             for (auto& lane_buffer : bus.lane_buffers) {
                 lane_buffer.clear();
@@ -285,7 +286,7 @@ void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NOEXCEPT {
         // Transpose lanes directly into DMA buffer (zero-copy!)
         const char* error = nullptr;
         if (!SPITransposer::transpose2(lane0, lane1, dma_buf, &error)) {
-            FL_WARN_FMT("SPI Bus Manager: Dual transpose failed - " << (error ? error : "unknown error"));
+            FL_WARN("SPI Bus Manager: Dual transpose failed - " << ((error ? error : "unknown error")));
             // Clear buffers and bail
             for (auto& lane_buffer : bus.lane_buffers) {
                 lane_buffer.clear();
@@ -340,7 +341,7 @@ void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NOEXCEPT {
         SpiHw16* hexadeca = static_cast<SpiHw16*>(bus.hw_controller.get());
         result = hexadeca->acquireDMABuffer(max_size);
         if (!result.ok()) {
-            FL_WARN_FMT("SPI Bus Manager: Failed to acquire DMA buffer for Hexadeca-SPI: " << static_cast<int>(result.error()));
+            FL_WARN("SPI Bus Manager: Failed to acquire DMA buffer for Hexadeca-SPI: " << (static_cast<int>(result.error())));
             // Clear buffers and bail
             for (auto& lane_buffer : bus.lane_buffers) {
                 lane_buffer.clear();
@@ -352,7 +353,7 @@ void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NOEXCEPT {
         SpiHw8* octal = static_cast<SpiHw8*>(bus.hw_controller.get());
         result = octal->acquireDMABuffer(max_size);
         if (!result.ok()) {
-            FL_WARN_FMT("SPI Bus Manager: Failed to acquire DMA buffer for Octal-SPI: " << static_cast<int>(result.error()));
+            FL_WARN("SPI Bus Manager: Failed to acquire DMA buffer for Octal-SPI: " << (static_cast<int>(result.error())));
             // Clear buffers and bail
             for (auto& lane_buffer : bus.lane_buffers) {
                 lane_buffer.clear();
@@ -364,7 +365,7 @@ void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NOEXCEPT {
         SpiHw4* quad = static_cast<SpiHw4*>(bus.hw_controller.get());
         result = quad->acquireDMABuffer(max_size);
         if (!result.ok()) {
-            FL_WARN_FMT("SPI Bus Manager: Failed to acquire DMA buffer for Quad-SPI: " << static_cast<int>(result.error()));
+            FL_WARN("SPI Bus Manager: Failed to acquire DMA buffer for Quad-SPI: " << (static_cast<int>(result.error())));
             // Clear buffers and bail
             for (auto& lane_buffer : bus.lane_buffers) {
                 lane_buffer.clear();
@@ -389,7 +390,7 @@ void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NOEXCEPT {
 
         // Transpose lanes directly into DMA buffer (zero-copy!)
         if (!SPITransposer::transpose16(lanes, dma_buf, &error)) {
-            FL_WARN_FMT("SPI Bus Manager: Hexadeca transpose failed - " << (error ? error : "unknown error"));
+            FL_WARN("SPI Bus Manager: Hexadeca transpose failed - " << ((error ? error : "unknown error")));
             // Clear buffers and bail
             for (auto& lane_buffer : bus.lane_buffers) {
                 lane_buffer.clear();
@@ -423,7 +424,7 @@ void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NOEXCEPT {
 
         // Transpose lanes directly into DMA buffer (zero-copy!)
         if (!SPITransposer::transpose8(lanes, dma_buf, &error)) {
-            FL_WARN_FMT("SPI Bus Manager: Octal transpose failed - " << (error ? error : "unknown error"));
+            FL_WARN("SPI Bus Manager: Octal transpose failed - " << ((error ? error : "unknown error")));
             // Clear buffers and bail
             for (auto& lane_buffer : bus.lane_buffers) {
                 lane_buffer.clear();
@@ -457,7 +458,7 @@ void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NOEXCEPT {
 
         // Transpose lanes directly into DMA buffer (zero-copy!)
         if (!SPITransposer::transpose4(lanes[0], lanes[1], lanes[2], lanes[3], dma_buf, &error)) {
-            FL_WARN_FMT("SPI Bus Manager: Quad transpose failed - " << (error ? error : "unknown error"));
+            FL_WARN("SPI Bus Manager: Quad transpose failed - " << ((error ? error : "unknown error")));
             // Clear buffers and bail
             for (auto& lane_buffer : bus.lane_buffers) {
                 lane_buffer.clear();
@@ -492,7 +493,7 @@ void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NOEXCEPT {
     }
 
     if (!transmit_ok) {
-        FL_WARN_FMT("SPI Bus Manager: " << (is_hexadeca_mode ? "Hexadeca" : (is_octal_mode ? "Octal" : "Quad")) << "-SPI transmit failed");
+        FL_WARN("SPI Bus Manager: " << ((is_hexadeca_mode ? "Hexadeca" : (is_octal_mode ? "Octal" : "Quad"))) << "-SPI transmit failed");
     }
 
     // Clear lane buffers for next frame
@@ -501,7 +502,7 @@ void SPIBusManager::finalizeTransmission(SPIBusHandle handle) FL_NOEXCEPT {
     }
 }
 
-bool SPIBusManager::isDeviceEnabled(SPIBusHandle handle) const FL_NOEXCEPT {
+bool SPIBusManager::isDeviceEnabled(SPIBusHandle handle) const FL_NO_EXCEPT {
     if (!handle.is_valid || handle.bus_id >= mNumBuses) {
         return false;
     }
@@ -514,7 +515,7 @@ bool SPIBusManager::isDeviceEnabled(SPIBusHandle handle) const FL_NOEXCEPT {
     return bus.devices[handle.lane_id].is_enabled;
 }
 
-void SPIBusManager::reset() FL_NOEXCEPT {
+void SPIBusManager::reset() FL_NO_EXCEPT {
     FL_DBG("SPIBusManager: reset() called");
     // Save current mNumBuses before clearing
     u8 num_buses_to_clear = mNumBuses;
@@ -524,14 +525,14 @@ void SPIBusManager::reset() FL_NOEXCEPT {
 
     // Only iterate through buses that were actually used
     for (u8 i = 0; i < num_buses_to_clear; i++) {
-        FL_DBG("SPIBusManager: reset() checking bus " << static_cast<int>(i));
+        FL_DBG("SPIBusManager: reset() checking bus " << (static_cast<int>(i)));
         // Clean up hardware controllers if allocated
         if (mBuses[i].is_initialized) {
-            FL_DBG("SPIBusManager: reset() releasing bus " << static_cast<int>(i));
+            FL_DBG("SPIBusManager: reset() releasing bus " << (static_cast<int>(i)));
             releaseBusHardware(mBuses[i]);
-            FL_DBG("SPIBusManager: reset() released bus " << static_cast<int>(i));
+            FL_DBG("SPIBusManager: reset() released bus " << (static_cast<int>(i)));
         }
-        FL_DBG("SPIBusManager: reset() resetting bus info for bus " << static_cast<int>(i));
+        FL_DBG("SPIBusManager: reset() resetting bus info for bus " << (static_cast<int>(i)));
         // Explicitly clear vectors to avoid crashes during destruction
         FL_DBG("SPIBusManager: reset() clearing lane_buffers");
         mBuses[i].lane_buffers.clear();
@@ -543,6 +544,7 @@ void SPIBusManager::reset() FL_NOEXCEPT {
         mBuses[i].bus_type = SPIBusType::SOFT_SPI;
         mBuses[i].num_devices = 0;
         mBuses[i].spi_bus_num = 0xFF;
+        mBuses[i].requested_bus = Esp32SpiBus::AUTO;
         mBuses[i].hw_controller = nullptr;
         mBuses[i].is_initialized = false;
         mBuses[i].error_message = nullptr;
@@ -550,16 +552,16 @@ void SPIBusManager::reset() FL_NOEXCEPT {
         for (u8 j = 0; j < 16; j++) {
             mBuses[i].devices[j] = SPIDeviceInfo();
         }
-        FL_DBG("SPIBusManager: reset() done with bus " << static_cast<int>(i));
+        FL_DBG("SPIBusManager: reset() done with bus " << (static_cast<int>(i)));
     }
     FL_DBG("SPIBusManager: reset() complete");
 }
 
-u8 SPIBusManager::getNumBuses() const FL_NOEXCEPT {
+u8 SPIBusManager::getNumBuses() const FL_NO_EXCEPT {
     return mNumBuses;
 }
 
-const SPIBusInfo* SPIBusManager::getBusInfo(u8 bus_id) const FL_NOEXCEPT {
+const SPIBusInfo* SPIBusManager::getBusInfo(u8 bus_id) const FL_NO_EXCEPT {
     if (bus_id >= mNumBuses) {
         return nullptr;
     }
@@ -570,10 +572,10 @@ const SPIBusInfo* SPIBusManager::getBusInfo(u8 bus_id) const FL_NOEXCEPT {
 // Private Methods
 // ============================================================================
 
-SPIBusInfo* SPIBusManager::getOrCreateBus(u8 clock_pin) FL_NOEXCEPT {
+SPIBusInfo* SPIBusManager::getOrCreateBus(u8 clock_pin, Esp32SpiBus requested_bus) FL_NO_EXCEPT {
     // Search for existing bus with this clock pin
     for (u8 i = 0; i < mNumBuses; i++) {
-        if (mBuses[i].clock_pin == clock_pin) {
+        if (mBuses[i].clock_pin == clock_pin && mBuses[i].requested_bus == requested_bus) {
             return &mBuses[i];
         }
     }
@@ -584,12 +586,13 @@ SPIBusInfo* SPIBusManager::getOrCreateBus(u8 clock_pin) FL_NOEXCEPT {
     }
 
     mBuses[mNumBuses].clock_pin = clock_pin;
+    mBuses[mNumBuses].requested_bus = requested_bus;
     mBuses[mNumBuses].num_devices = 0;
     mBuses[mNumBuses].bus_type = SPIBusType::SOFT_SPI;
     return &mBuses[mNumBuses++];
 }
 
-bool SPIBusManager::initializeBus(SPIBusInfo& bus) FL_NOEXCEPT {
+bool SPIBusManager::initializeBus(SPIBusInfo& bus) FL_NO_EXCEPT {
     // No devices? Skip initialization (bus was released)
     if (bus.num_devices == 0) {
         return true;  // Not an error, just nothing to initialize
@@ -622,23 +625,23 @@ bool SPIBusManager::initializeBus(SPIBusInfo& bus) FL_NOEXCEPT {
                 default: break;
             }
             (void)type_name;  // Suppress unused variable warning when FL_WARN is a no-op
-            FL_WARN_FMT("SPI Manager: Promoted clock pin " << bus.clock_pin << " to " << type_name << " (" << bus.num_devices << " devices)");
+            FL_WARN("SPI Manager: Promoted clock pin " << bus.clock_pin << " to " << type_name << " (" << bus.num_devices << " devices)");
             return true;
         } else {
             // Promotion failed - disable conflicting devices
-            FL_WARN_FMT("SPI Manager: Cannot promote clock pin " << bus.clock_pin << " (platform limitation)");
+            FL_WARN("SPI Manager: Cannot promote clock pin " << bus.clock_pin << " (platform limitation)");
             disableConflictingDevices(bus);
             return false;
         }
     }
 
     // Too many devices (>16)
-    FL_WARN_FMT("SPI Manager: Too many devices on clock pin " << bus.clock_pin << " (" << bus.num_devices << " devices, max 16)");
+    FL_WARN("SPI Manager: Too many devices on clock pin " << bus.clock_pin << " (" << bus.num_devices << " devices, max 16)");
     disableConflictingDevices(bus);
     return false;
 }
 
-bool SPIBusManager::promoteToMultiSPI(SPIBusInfo& bus) FL_NOEXCEPT {
+bool SPIBusManager::promoteToMultiSPI(SPIBusInfo& bus) FL_NO_EXCEPT {
     SPIBusType max_type = getMaxSupportedSPIType();
 
     // Determine which multi-SPI type to use
@@ -655,7 +658,9 @@ bool SPIBusManager::promoteToMultiSPI(SPIBusInfo& bus) FL_NOEXCEPT {
         // Try each controller until we find one that works
         fl::shared_ptr<SpiHw2> dual_ctrl;
         for (const auto& ctrl : controllers) {
-            if (!ctrl->isInitialized()) {
+            const bool host_matches = bus.requested_bus == Esp32SpiBus::AUTO ||
+                ctrl->getBusId() == static_cast<int>(bus.requested_bus);
+            if (host_matches && !ctrl->isInitialized()) {
                 dual_ctrl = ctrl;
                 break;
             }
@@ -680,8 +685,7 @@ bool SPIBusManager::promoteToMultiSPI(SPIBusInfo& bus) FL_NOEXCEPT {
             return false;
         }
 
-        FL_DBG("SPI: Initialized Dual-SPI controller '" << dual_ctrl->getName()
-               << "' (bus " << config.bus_num << ") at " << config.clock_speed_hz << " Hz");
+        FL_DBG("SPI: Initialized Dual-SPI controller '" << dual_ctrl->getName() << "' (bus " << config.bus_num << ") at " << config.clock_speed_hz << " Hz");
 
         // Store controller pointer and SPI bus number
         bus.hw_controller = dual_ctrl;
@@ -707,7 +711,9 @@ bool SPIBusManager::promoteToMultiSPI(SPIBusInfo& bus) FL_NOEXCEPT {
         // Try each controller until we find one that works
         fl::shared_ptr<SpiHw4> quad_ctrl;
         for (const auto& ctrl : controllers) {
-            if (!ctrl->isInitialized()) {
+            const bool host_matches = bus.requested_bus == Esp32SpiBus::AUTO ||
+                ctrl->getBusId() == static_cast<int>(bus.requested_bus);
+            if (host_matches && !ctrl->isInitialized()) {
                 quad_ctrl = ctrl;
                 break;
             }
@@ -735,8 +741,7 @@ bool SPIBusManager::promoteToMultiSPI(SPIBusInfo& bus) FL_NOEXCEPT {
             return false;
         }
 
-        FL_DBG("SPI: Initialized Quad-SPI controller '" << quad_ctrl->getName()
-               << "' (bus " << config.bus_num << ") at " << config.clock_speed_hz << " Hz");
+        FL_DBG("SPI: Initialized Quad-SPI controller '" << quad_ctrl->getName() << "' (bus " << config.bus_num << ") at " << config.clock_speed_hz << " Hz");
 
         // Store controller pointer and SPI bus number
         bus.hw_controller = quad_ctrl;
@@ -763,7 +768,9 @@ bool SPIBusManager::promoteToMultiSPI(SPIBusInfo& bus) FL_NOEXCEPT {
         // Try each controller until we find one that works
         fl::shared_ptr<SpiHw8> octal_ctrl;
         for (const auto& ctrl : controllers) {
-            if (!ctrl->isInitialized()) {
+            const bool host_matches = bus.requested_bus == Esp32SpiBus::AUTO ||
+                ctrl->getBusId() == static_cast<int>(bus.requested_bus);
+            if (host_matches && !ctrl->isInitialized()) {
                 octal_ctrl = ctrl;
                 break;
             }
@@ -795,8 +802,7 @@ bool SPIBusManager::promoteToMultiSPI(SPIBusInfo& bus) FL_NOEXCEPT {
             return false;
         }
 
-        FL_DBG("SPI: Initialized Octal-SPI controller '" << octal_ctrl->getName()
-               << "' (bus " << config.bus_num << ") at " << config.clock_speed_hz << " Hz");
+        FL_DBG("SPI: Initialized Octal-SPI controller '" << octal_ctrl->getName() << "' (bus " << config.bus_num << ") at " << config.clock_speed_hz << " Hz");
 
         // Store controller pointer and SPI bus number
         bus.hw_controller = octal_ctrl;
@@ -823,7 +829,9 @@ bool SPIBusManager::promoteToMultiSPI(SPIBusInfo& bus) FL_NOEXCEPT {
         // Try each controller until we find one that works
         fl::shared_ptr<SpiHw16> hexadeca_ctrl;
         for (const auto& ctrl : controllers) {
-            if (!ctrl->isInitialized()) {
+            const bool host_matches = bus.requested_bus == Esp32SpiBus::AUTO ||
+                ctrl->getBusId() == static_cast<int>(bus.requested_bus);
+            if (host_matches && !ctrl->isInitialized()) {
                 hexadeca_ctrl = ctrl;
                 break;
             }
@@ -863,8 +871,7 @@ bool SPIBusManager::promoteToMultiSPI(SPIBusInfo& bus) FL_NOEXCEPT {
             return false;
         }
 
-        FL_DBG("SPI: Initialized Hexadeca-SPI controller '" << hexadeca_ctrl->getName()
-               << "' (bus " << config.bus_num << ") at " << config.clock_speed_hz << " Hz");
+        FL_DBG("SPI: Initialized Hexadeca-SPI controller '" << hexadeca_ctrl->getName() << "' (bus " << config.bus_num << ") at " << config.clock_speed_hz << " Hz");
 
         // Store controller pointer and SPI bus number
         bus.hw_controller = hexadeca_ctrl;
@@ -881,7 +888,7 @@ bool SPIBusManager::promoteToMultiSPI(SPIBusInfo& bus) FL_NOEXCEPT {
     return false;
 }
 
-bool SPIBusManager::createSingleSPI(SPIBusInfo& bus) FL_NOEXCEPT {
+bool SPIBusManager::createSingleSPI(SPIBusInfo& bus) FL_NO_EXCEPT {
     // Single SPI is the standard path - just mark as initialized
     // The existing SPI controller code will handle it
     FL_DBG("SPI: Using standard single-lane SPI (bus manager passthrough mode)");
@@ -889,11 +896,11 @@ bool SPIBusManager::createSingleSPI(SPIBusInfo& bus) FL_NOEXCEPT {
     return true;
 }
 
-void SPIBusManager::disableConflictingDevices(SPIBusInfo& bus) FL_NOEXCEPT {
+void SPIBusManager::disableConflictingDevices(SPIBusInfo& bus) FL_NO_EXCEPT {
     // Keep first device enabled, disable all others
     for (u8 i = 1; i < bus.num_devices; i++) {
         bus.devices[i].is_enabled = false;
-        FL_WARN_FMT("SPI Manager: Disabled device " << i << " on clock pin " << bus.clock_pin << " (conflict)");
+        FL_WARN("SPI Manager: Disabled device " << i << " on clock pin " << bus.clock_pin << " (conflict)");
     }
 
     // Initialize first device as single SPI
@@ -904,7 +911,7 @@ void SPIBusManager::disableConflictingDevices(SPIBusInfo& bus) FL_NOEXCEPT {
     }
 }
 
-u32 SPIBusManager::selectBusSpeed(const SPIBusInfo& bus) FL_NOEXCEPT {
+u32 SPIBusManager::selectBusSpeed(const SPIBusInfo& bus) FL_NO_EXCEPT {
     // Find the minimum (slowest) requested speed from all devices on this bus
     // This ensures all devices can handle the speed
     u32 min_speed = fl::numeric_limits<u32>::max();
@@ -925,21 +932,21 @@ u32 SPIBusManager::selectBusSpeed(const SPIBusInfo& bus) FL_NOEXCEPT {
     // Clamp to platform-specific maximum
     u32 platform_max = getPlatformMaxSpeed();
     if (min_speed > platform_max) {
-        FL_WARN_FMT("SPI: Requested speed " << min_speed << " Hz exceeds platform max "
-                << platform_max << " Hz, clamping to " << platform_max);
+        FL_WARN("SPI: Requested speed " << min_speed << " Hz exceeds platform max " << platform_max << " Hz, clamping to " << platform_max);
         min_speed = platform_max;
     }
 
     // Log selected speed in MHz with one decimal place
+#ifdef FASTLED_LOG_SPI_ENABLED
     u32 mhz_whole = min_speed / 1000000;
     u32 mhz_tenth = (min_speed / 100000) % 10;
-    FL_LOG_SPI("SPI: Selected bus speed " << mhz_whole << "." << mhz_tenth
-               << " MHz for clock pin " << static_cast<int>(bus.clock_pin));
+    FL_LOG_SPI("SPI: Selected bus speed " << mhz_whole << "." << mhz_tenth << " MHz for clock pin " << (static_cast<int>(bus.clock_pin)));
+#endif
 
     return min_speed;
 }
 
-u32 SPIBusManager::getPlatformDefaultSpeed() FL_NOEXCEPT {
+u32 SPIBusManager::getPlatformDefaultSpeed() FL_NO_EXCEPT {
     // Platform-specific defaults based on hardware capabilities
     #if defined(FL_IS_ESP32)
         return 40000000;  // ESP32: 40 MHz default (can do up to 80 MHz)
@@ -956,7 +963,7 @@ u32 SPIBusManager::getPlatformDefaultSpeed() FL_NOEXCEPT {
     #endif
 }
 
-u32 SPIBusManager::getPlatformMaxSpeed() FL_NOEXCEPT {
+u32 SPIBusManager::getPlatformMaxSpeed() FL_NO_EXCEPT {
     // Platform-specific maximums based on hardware datasheets
     #if defined(FL_IS_ESP32)
         return 80000000;  // ESP32: 80 MHz maximum with IO_MUX pins
@@ -973,14 +980,14 @@ u32 SPIBusManager::getPlatformMaxSpeed() FL_NOEXCEPT {
     #endif
 }
 
-void SPIBusManager::releaseBusHardware(SPIBusInfo& bus) FL_NOEXCEPT {
-    FL_DBG("SPIBusManager: releaseBusHardware() called, is_initialized=" << (bus.is_initialized ? "true" : "false"));
+void SPIBusManager::releaseBusHardware(SPIBusInfo& bus) FL_NO_EXCEPT {
+    FL_DBG("SPIBusManager: releaseBusHardware() called, is_initialized=" << ((bus.is_initialized ? "true" : "false")));
     if (!bus.is_initialized) {
         FL_DBG("SPIBusManager: releaseBusHardware() bus not initialized, returning");
         return;  // Nothing to release
     }
 
-    FL_DBG("SPIBusManager: releaseBusHardware() bus_type=" << static_cast<int>(bus.bus_type));
+    FL_DBG("SPIBusManager: releaseBusHardware() bus_type=" << (static_cast<int>(bus.bus_type)));
     // Release Single-SPI controller (runtime detection)
     if (bus.bus_type == SPIBusType::SINGLE_SPI && bus.hw_controller) {
         FL_DBG("SPIBusManager: releaseBusHardware() releasing SINGLE_SPI controller");
@@ -1029,7 +1036,7 @@ void SPIBusManager::releaseBusHardware(SPIBusInfo& bus) FL_NOEXCEPT {
     bus.num_devices = 0;  // Reset device count to prevent stale state
 }
 
-void SPIBusManager::softwareSPIWrite(u8 clock_pin, u8 data_pin, const u8* data, size_t length) FL_NOEXCEPT {
+void SPIBusManager::softwareSPIWrite(u8 clock_pin, u8 data_pin, const u8* data, size_t length) FL_NO_EXCEPT {
 #if !defined(FASTLED_STUB_IMPL) && !defined(FL_IS_WASM)
     // Real hardware implementation using Pin class for bit-banging
     // At this point in the header (after class definition), Pin should be available
@@ -1078,7 +1085,7 @@ void SPIBusManager::softwareSPIWrite(u8 clock_pin, u8 data_pin, const u8* data, 
 #endif
 }
 
-SPIBusType SPIBusManager::getMaxSupportedSPIType() const FL_NOEXCEPT {
+SPIBusType SPIBusManager::getMaxSupportedSPIType() const FL_NO_EXCEPT {
     // Check at runtime using getAll() - platforms provide via weak linkage
     if (!SpiHw16::getAll().empty()) {
         return SPIBusType::HEXADECA_SPI;  // 16-lane SPI
@@ -1099,7 +1106,7 @@ SPIBusType SPIBusManager::getMaxSupportedSPIType() const FL_NOEXCEPT {
 // Global instance
 // ============================================================================
 
-SPIBusManager& getSPIBusManager() FL_NOEXCEPT {
+SPIBusManager& getSPIBusManager() FL_NO_EXCEPT {
     static SPIBusManager instance;
     return instance;
 }

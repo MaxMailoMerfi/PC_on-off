@@ -11,6 +11,7 @@
 #include "fl/stl/new.h"
 #include "fl/system/yield.h"
 #include "platforms/coroutine_runtime.h"
+#include "fl/stl/noexcept.h"
 
 namespace fl {
 namespace task {
@@ -20,29 +21,29 @@ namespace detail {
 
 /// @brief Get reference to thread-local await recursion depth
 /// @return Reference to the thread-local await depth counter
-int& await_depth_tls() {
+int& await_depth_tls() FL_NO_EXCEPT {
     return SingletonThreadLocal<int>::instance();
 }
 } // namespace detail
 
-Executor& Executor::instance() {
+Executor& Executor::instance() FL_NO_EXCEPT {
     return fl::Singleton<Executor>::instance();
 }
 
-void Executor::register_runner(Runner* r) {
+void Executor::register_runner(Runner* r) FL_NO_EXCEPT {
     if (r && fl::find(mRunners.begin(), mRunners.end(), r) == mRunners.end()) {
         mRunners.push_back(r);
     }
 }
 
-void Executor::unregister_runner(Runner* r) {
+void Executor::unregister_runner(Runner* r) FL_NO_EXCEPT {
     auto it = fl::find(mRunners.begin(), mRunners.end(), r);
     if (it != mRunners.end()) {
         mRunners.erase(it);
     }
 }
 
-void Executor::update_all() {
+void Executor::update_all() FL_NO_EXCEPT {
     // Update all registered runners
     for (auto* r : mRunners) {
         if (r) {
@@ -51,7 +52,7 @@ void Executor::update_all() {
     }
 }
 
-bool Executor::has_active_tasks() const {
+bool Executor::has_active_tasks() const FL_NO_EXCEPT {
     for (const auto* r : mRunners) {
         if (r && r->has_active_tasks()) {
             return true;
@@ -60,7 +61,7 @@ bool Executor::has_active_tasks() const {
     return false;
 }
 
-size_t Executor::total_active_tasks() const {
+size_t Executor::total_active_tasks() const FL_NO_EXCEPT {
     size_t total = 0;
     for (const auto* r : mRunners) {
         if (r) {
@@ -72,7 +73,7 @@ size_t Executor::total_active_tasks() const {
 
 // Public API functions
 
-void run(fl::u32 microseconds, ExecFlags flags) {
+void run(fl::u32 microseconds, ExecFlags flags) FL_NO_EXCEPT {
     // Re-entrancy guard: detect if run is called from within run
     bool& running = SingletonThreadLocal<bool>::instance();
     if (running) {
@@ -132,9 +133,26 @@ void run(fl::u32 microseconds, ExecFlags flags) {
         // When microseconds == 0 the caller wants the cheapest possible
         // yield (we are between other pumped subsystems and will loop
         // again immediately), so we keep the lightweight fl::yield() path.
+        //
+        // The sleep is clamped to whatever is left of the caller's budget,
+        // mirroring the COROUTINES branch below. This used to be a hardcoded
+        // pumpCoroutines(1000) that ignored `microseconds` entirely, so a
+        // caller asking for run(250, SYSTEM) slept 1000 us and overshot its
+        // own deadline by 750 us on every platform where pumpCoroutines
+        // honors the requested duration (host/stub -- CoroutineRunner::run).
+        //
+        // ESP32 behavior is unchanged: pumpCoroutines() there converts us to
+        // FreeRTOS ticks and floors at one tick for ANY non-zero request
+        // (coroutine_esp32.impl.hpp, the `if (ticks == 0) ticks = 1` branch
+        // added for #2254), so 250 and 1000 both yield exactly one tick. The
+        // deep-yield guarantee #2254 depends on still holds.
         if (do_system) {
             if (microseconds > 0) {
-                fl::platforms::ICoroutineRuntime::instance().pumpCoroutines(1000);
+                const fl::u32 time_left = remaining();
+                if (time_left) {
+                    fl::platforms::ICoroutineRuntime::instance().pumpCoroutines(
+                        fl::min(1000u, time_left));
+                }
             } else {
                 fl::yield();
             }
@@ -151,11 +169,27 @@ void run(fl::u32 microseconds, ExecFlags flags) {
     } while (!expired());
 }
 
-size_t active_tasks() {
+void yield_system(fl::u32 microseconds) FL_NO_EXCEPT {
+    // Mirrors the SYSTEM branch of run() without naming Scheduler/Executor.
+    const fl::u32 begin_time = fl::micros();
+    do {
+        if (microseconds > 0) {
+            const fl::u32 e = fl::micros() - begin_time;
+            if (e < microseconds) {
+                fl::platforms::ICoroutineRuntime::instance().pumpCoroutines(
+                    fl::min(1000u, microseconds - e));
+            }
+        } else {
+            fl::yield();
+        }
+    } while (fl::micros() - begin_time < microseconds);
+}
+
+size_t active_tasks() FL_NO_EXCEPT {
     return Executor::instance().total_active_tasks();
 }
 
-bool has_tasks() {
+bool has_tasks() FL_NO_EXCEPT {
     return Executor::instance().has_active_tasks();
 }
 

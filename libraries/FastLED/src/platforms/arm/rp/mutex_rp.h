@@ -7,13 +7,14 @@
 /// @file platforms/arm/rp/mutex_rp.h
 /// @brief RP2040/RP2350 Pico SDK mutex implementation
 ///
-/// This header provides RP2040/RP2350-specific mutex implementations using Pico SDK spinlocks.
+/// This header provides RP2040/RP2350-specific mutex implementations using Pico SDK mutexes.
 /// For RP platforms, we use std::unique_lock for full compatibility with condition variables.
 
 #include "fl/stl/assert.h"
 // IWYU pragma: begin_keep
 #include <mutex>  // ok include - needed for std::unique_lock
 #include "fl/stl/noexcept.h"
+#include "pico/mutex.h"  // IWYU pragma: keep
 // IWYU pragma: end_keep
 
 namespace fl {
@@ -44,12 +45,10 @@ using std::adopt_lock;  // okay std namespace
 // RP2040/RP2350 Pico SDK mutex wrapper
 class MutexRP {
 private:
-    void* mSpinlock;      // spin_lock_t* (opaque pointer to avoid including Pico SDK headers)
-    u32 mOwnerCore;  // Core ID of the owner (for debug/assert purposes)
-    bool mLocked;         // Lock state
+    mutex_t mMutex;
 
 public:
-    MutexRP() FL_NOEXCEPT;
+    MutexRP() FL_NO_EXCEPT;
     ~MutexRP();
 
     // Non-copyable and non-movable
@@ -58,20 +57,18 @@ public:
     MutexRP(MutexRP&&) = delete;
     MutexRP& operator=(MutexRP&&) = delete;
 
-    void lock() FL_NOEXCEPT;
-    void unlock() FL_NOEXCEPT;
-    bool try_lock() FL_NOEXCEPT;
+    void lock() FL_NO_EXCEPT;
+    void unlock() FL_NO_EXCEPT;
+    bool try_lock() FL_NO_EXCEPT;
 };
 
 // RP2040/RP2350 Pico SDK recursive mutex wrapper
 class RecursiveMutexRP {
 private:
-    void* mSpinlock;      // spin_lock_t* (opaque pointer to avoid including Pico SDK headers)
-    u32 mOwnerCore;  // Core ID of the owner
-    u32 mLockCount;  // Recursion depth counter
+    recursive_mutex_t mMutex;
 
 public:
-    RecursiveMutexRP() FL_NOEXCEPT;
+    RecursiveMutexRP() FL_NO_EXCEPT;
     ~RecursiveMutexRP();
 
     // Non-copyable and non-movable
@@ -80,9 +77,9 @@ public:
     RecursiveMutexRP(RecursiveMutexRP&&) = delete;
     RecursiveMutexRP& operator=(RecursiveMutexRP&&) = delete;
 
-    void lock() FL_NOEXCEPT;
-    void unlock() FL_NOEXCEPT;
-    bool try_lock() FL_NOEXCEPT;
+    void lock() FL_NO_EXCEPT;
+    void unlock() FL_NO_EXCEPT;
+    bool try_lock() FL_NO_EXCEPT;
 };
 
 // Define FASTLED_MULTITHREADED for RP2040/RP2350 (has dual-core support)

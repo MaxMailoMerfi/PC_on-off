@@ -7,7 +7,7 @@
 // Check if STM32 HAL is available AND the user has explicitly opted into
 // hardware SPI. Pulling in Arduino's `<SPI.h>` unconditionally on HAL
 // detection breaks STM32H7 / Giga R1 builds where the Arduino mbed-os
-// core does NOT auto-resolve `<SPI.h>` from PlatformIO's lib finder
+// core does NOT auto-resolve `<SPI.h>` from the lib finder
 // (`fastspi_arm_stm32.h:11: fatal error: SPI.h: No such file or directory`).
 // Users who want STM32 hardware SPI define `FASTLED_ALL_PINS_HARDWARE_SPI`
 // and add `SPI` to their `lib_deps` — same pattern as ESP8266 (#2570).
@@ -30,6 +30,25 @@ FL_DISABLE_WARNING_PUSH
 FL_DISABLE_WARNING_DEPRECATED_REGISTER
 
 namespace fl {
+
+/*
+ * Why clocked SPI (APA102/SK9822) stays on this legacy SPIOutput path and is
+ * NOT routed through fl::SlimSpiBridgeController (#4594, see also the SAMD
+ * revert bdabb404fc):
+ *
+ *  - The only STM32 channel-API SPI engines are the SpiHw2/4/8 adapters in
+ *    drivers/spi_hw_{2,4,8}_stm32.cpp.hpp. They are Timer+DMA-stream GPIO
+ *    parallel emitters, not the SPI peripheral, and there is no SpiHw1.
+ *  - They are only registered when FL_STM32_HAS_SPI_HW_* is defined
+ *    (stm32_capabilities.h), i.e. on stream-DMA families (F2/F4/F7/H7/L4).
+ *    STM32F1/G4/U5 register no instances at all, so a single-lane APA102
+ *    strip would get no engine and produce no output.
+ *  - DATA_RATE_MHZ()/DATA_RATE_KHZ() on STM32 still encode a clock divider,
+ *    not Hz, which the channel API's SpiChipsetConfig would misinterpret.
+ *
+ * Until a real single-lane SPI-peripheral engine exists for every STM32
+ * family, FASTLED_SPI_USES_CHANNEL_API stays off for STM32.
+ */
 
 /*
  * STM32 Hardware SPI Driver
@@ -103,12 +122,12 @@ public:
 #endif
 
     // Set the object representing the selectable
-    void setSelect(Selectable* pSelect) FL_NOEXCEPT {
+    void setSelect(Selectable* pSelect) FL_NO_EXCEPT {
         mPSelect = pSelect;
     }
 
     // Initialize the SPI subsystem
-    void init() FL_NOEXCEPT {
+    void init() FL_NO_EXCEPT {
 #if FASTLED_STM32_USE_HAL
         if (!mInitialized) {
             // Initialize SPI with specified pins
@@ -140,38 +159,38 @@ public:
     }
 
     // Stop the SPI output
-    static void stop() FL_NOEXCEPT {
+    static void stop() FL_NO_EXCEPT {
         // NOP for now - could disable SPI peripheral if needed
     }
 
     // Wait until the SPI subsystem is ready for more data
-    static void wait() FL_NOEXCEPT __attribute__((always_inline)) {
+    static void wait() FL_NO_EXCEPT __attribute__((always_inline)) {
         // For basic implementation, this is a NOP
         // Could check SPI busy flag if needed
     }
 
-    static void waitFully() FL_NOEXCEPT __attribute__((always_inline)) {
+    static void waitFully() FL_NO_EXCEPT __attribute__((always_inline)) {
         wait();
     }
 
     // Write byte variants
-    void writeByteNoWait(u8 b) FL_NOEXCEPT __attribute__((always_inline)) {
+    void writeByteNoWait(u8 b) FL_NO_EXCEPT __attribute__((always_inline)) {
         writeByte(b);
     }
 
-    void writeBytePostWait(u8 b) FL_NOEXCEPT __attribute__((always_inline)) {
+    void writeBytePostWait(u8 b) FL_NO_EXCEPT __attribute__((always_inline)) {
         writeByte(b);
         wait();
     }
 
     // Write a 16-bit word
-    void writeWord(u16 w) FL_NOEXCEPT __attribute__((always_inline)) {
+    void writeWord(u16 w) FL_NO_EXCEPT __attribute__((always_inline)) {
         writeByte(static_cast<u8>(w >> 8));
         writeByte(static_cast<u8>(w & 0xFF));
     }
 
     // Write a single byte via SPI
-    void writeByte(u8 b) FL_NOEXCEPT {
+    void writeByte(u8 b) FL_NO_EXCEPT {
 #if FASTLED_STM32_USE_HAL
         #ifdef FL_IS_STM32_MBED
             if (mSpi) {
@@ -196,7 +215,7 @@ public:
     }
 
     // Select the SPI output (begin transaction)
-    void select() FL_NOEXCEPT {
+    void select() FL_NO_EXCEPT {
 #if FASTLED_STM32_USE_HAL
         // Calculate SPI settings based on SPI_SPEED
         // STM32 SPI can typically handle up to 18 MHz on APB1, 36 MHz on APB2
@@ -217,7 +236,7 @@ public:
     }
 
     // Release the SPI line (end transaction)
-    void release() FL_NOEXCEPT {
+    void release() FL_NO_EXCEPT {
         if (mPSelect != nullptr) {
             mPSelect->release();
         }
@@ -232,19 +251,19 @@ public:
 #endif
     }
 
-    void endTransaction() FL_NOEXCEPT {
+    void endTransaction() FL_NO_EXCEPT {
         waitFully();
         release();
     }
 
     // Write out len bytes of the given value
-    void writeBytesValue(u8 value, int len) FL_NOEXCEPT {
+    void writeBytesValue(u8 value, int len) FL_NO_EXCEPT {
         select();
         writeBytesValueRaw(value, len);
         release();
     }
 
-    void writeBytesValueRaw(u8 value, int len) FL_NOEXCEPT {
+    void writeBytesValueRaw(u8 value, int len) FL_NO_EXCEPT {
         while (len--) {
 #if FASTLED_STM32_USE_HAL
             #ifdef FL_IS_STM32_MBED
@@ -262,7 +281,7 @@ public:
 
     // Write a block of bytes with per-byte data modifier
     template <class D>
-    void writeBytes(FASTLED_REGISTER u8* data, int len) FL_NOEXCEPT {
+    void writeBytes(FASTLED_REGISTER u8* data, int len) FL_NO_EXCEPT {
         select();
         u8* end = data + len;
         while (data != end) {
@@ -273,7 +292,7 @@ public:
     }
 
     // Default version - write a block of data with no modifications
-    void writeBytes(FASTLED_REGISTER u8* data, int len) FL_NOEXCEPT {
+    void writeBytes(FASTLED_REGISTER u8* data, int len) FL_NO_EXCEPT {
         writeBytes<DATA_NOP>(data, len);
     }
 
@@ -284,7 +303,7 @@ public:
 
     // Write a single bit out
     template <u8 BIT>
-    inline void writeBit(u8 b) FL_NOEXCEPT {
+    inline void writeBit(u8 b) FL_NO_EXCEPT {
 #if FASTLED_STM32_USE_HAL
         // For single bit writes, we need to use GPIO directly
         // This is typically only used for specific LED chipsets
@@ -310,7 +329,7 @@ public:
     // Write pixels with color order and optional flags
     template <u8 FLAGS, class D, EOrder RGB_ORDER>
     FL_NO_INLINE
-    void writePixels(PixelController<RGB_ORDER> pixels, void* context = nullptr) FL_NOEXCEPT {
+    void writePixels(PixelController<RGB_ORDER> pixels, void* context = nullptr) FL_NO_EXCEPT {
         select();
         int len = pixels.mLen;
 

@@ -9,6 +9,8 @@
 
 // IWYU pragma: private
 
+#include "platforms/is_platform.h"
+
 #if defined(NRF51)
     #include "platforms/arm/nrf51/fastpin_arm_nrf51.h"
 #elif defined(NRF52_SERIES)
@@ -28,7 +30,7 @@
 #elif defined(__SAM3X8E__)
     // Arduino Due (SAM3X8E)
     #include "platforms/arm/sam/fastpin_arm_sam.h"
-#elif defined(STM32F10X_MD) || defined(__STM32F1__) || defined(STM32F1) || defined(STM32F1xx) || defined(STM32F2XX) || defined(STM32F4) || defined(STM32U5) || defined(STM32U5xx) || defined(STM32U585xx) || defined(STM32U585XX) || defined(ARDUINO_UNO_Q) || defined(CONFIG_BOARD_ARDUINO_UNO_Q) || defined(CONFIG_SOC_STM32U585XX)
+#elif defined(STM32F10X_MD) || defined(__STM32F1__) || defined(STM32F1) || defined(STM32F1xx) || defined(STM32F2XX) || defined(STM32F4) || defined(STM32U5) || defined(STM32U5xx) || defined(STM32U585xx) || defined(STM32U585XX) || defined(ARDUINO_UNO_Q) || defined(CONFIG_BOARD_ARDUINO_UNO_Q) || defined(CONFIG_SOC_STM32U585XX) || defined(STM32G0) || defined(STM32G0xx)
     // STM32 microcontrollers
     #include "platforms/arm/stm32/fastpin_arm_stm32.h"
 #elif defined(__SAMD21G18A__) || defined(__SAMD21J18A__) || defined(__SAMD21E17A__) || defined(__SAMD21E18A__)
@@ -37,6 +39,9 @@
 #elif defined(__SAMD51G19A__) || defined(__SAMD51J19A__) || defined(__SAME51J19A__) || defined(__SAMD51P19A__) || defined(__SAMD51P20A__)
     // Microchip SAMD51/SAME51
     #include "platforms/arm/d51/fastpin_arm_d51.h"
+#elif defined(FL_IS_SAME53)
+    // Microchip SAME53 (Teknic ClearCore)
+    #include "platforms/arm/same53/fastpin_arm_same53.h"
 #elif defined(PICO_RP2350) || defined(ARDUINO_ARCH_RP2350)
     // RP2350 (Raspberry Pi Pico 2)
     #include "platforms/arm/rp/rp2350/fastpin_arm_rp2350.h"

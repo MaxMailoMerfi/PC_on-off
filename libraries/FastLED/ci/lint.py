@@ -12,8 +12,16 @@ import sys
 from pathlib import Path
 
 from ci.lint.args_parser import LintArgs, parse_lint_args
+from ci.lint.banned_build_tools import run_banned_build_tools_lint
+from ci.lint.banned_linkers import run_banned_linkers_lint
+from ci.lint.check_size_thresholds import run as run_size_thresholds_check
 from ci.lint.duration_tracker import DurationTracker
 from ci.lint.orchestrator import LintOrchestrator
+from ci.lint.pch_strict_flags import run_pch_strict_flags_lint
+from ci.lint.root_project_ini_lockdown import (
+    _warn_only_from_env as _root_ini_warn_only_from_env,
+)
+from ci.lint.root_project_ini_lockdown import check as run_root_ini_lockdown_lint
 from ci.lint.stage_impls import (
     run_clang_tidy,
     run_cpp_lint,
@@ -28,7 +36,7 @@ from ci.lint.stage_impls import (
 )
 from ci.lint.stages import LintStage
 from ci.lint_meson.run_all_checkers import run_meson_lint
-from ci.lint_platformio.run_all_checkers import run_platformio_lint
+from ci.release import run_release_version_lint
 from ci.util.global_interrupt_handler import install_signal_handler, wait_for_cleanup
 
 
@@ -146,7 +154,8 @@ def print_ai_hints() -> None:
     print("  - Use 'bash lint --js' for JavaScript linting only")
     print("  - Use 'bash lint --cpp' for C++ linting only")
     print(
-        "  - Use 'bash lint --cpp --rust' to use Rust-backed C++ checkers where available"
+        "  - C++ linting uses the Rust-backed `fastled-lint` binary by default; "
+        "pass --no-rust to fall back to the legacy Python-only path"
     )
     print("  - Use 'bash lint --full' to include IWYU (Include-What-You-Use) analysis")
     print("  - Use 'bash lint --iwyu' to run IWYU analysis only")
@@ -155,7 +164,8 @@ def print_ai_hints() -> None:
     print("  - Python linting includes: ruff (lint + format) + KBI checker + ty")
     print("  - Use --strict to also run pyright (strict type checking)")
     print(
-        "  - C++ linting includes: clang-format, custom checkers, and the default FL_NOEXCEPT AST ratchet"
+        "  - C++ linting includes: clang-format, custom checkers, strict FL_NO_EXCEPT"
+        " AST enforcement, and a decayed-array-parameter AST ratchet"
     )
     print("  - IWYU runs with --full, --iwyu, or --strict flags")
     print("  - clang-tidy runs with --tidy flag")
@@ -244,16 +254,75 @@ def create_stages(args: LintArgs) -> list[LintStage]:
             )
         )
 
-    # PlatformIO-internal-usage stage (issue #2701, warn-only by default).
-    # Runs whenever non-JS-only linting is invoked — repo hygiene check
-    # for build/CI scripts. Skipped via --skip-platformio-check.
-    if not args.js_only and not args.skip_platformio_check:
+    # Banned build tools: the old board build tool was purged (fbuild is the only
+    # board backend) and its name may not reappear anywhere in the tree.
+    # Always an error; no skip flag and no warn-only mode.
+    if not args.js_only:
         stages.append(
             LintStage(
-                name="platformio_internal_usage",
-                display_name="PLATFORMIO-INTERNAL-USAGE LINT",
-                run_fn=lambda: run_platformio_lint(),
-                timeout=30.0,
+                name="banned_build_tools",
+                display_name="BANNED BUILD TOOLS",
+                run_fn=lambda: run_banned_build_tools_lint(),
+                timeout=60.0,
+            )
+        )
+        # Banned linkers: host builds link only through reld (ci/tools/reld.py);
+        # any other linker selection in ci/, .github/ or Meson files fails.
+        stages.append(
+            LintStage(
+                name="banned_linkers",
+                display_name="BANNED LINKERS (RELD ONLY)",
+                run_fn=lambda: run_banned_linkers_lint(),
+                timeout=60.0,
+            )
+        )
+        # Strict PCH validation: every PCH producer keeps -Werror=invalid-pch,
+        # -verify-pch and -fpch-validate-input-files-content, every consumer the
+        # first and last, and PCH timestamps are never disabled (/pch-debug skill).
+        stages.append(
+            LintStage(
+                name="pch_strict_flags",
+                display_name="PCH STRICT FLAGS",
+                run_fn=lambda: run_pch_strict_flags_lint(),
+                timeout=60.0,
+            )
+        )
+        # Release version: every version string agrees and master never shows
+        # a version that is not tagged (the package registry's crawler would
+        # publish it). See ci/release.py and #4444.
+        stages.append(
+            LintStage(
+                name="release_version",
+                display_name="RELEASE VERSION",
+                run_fn=lambda: run_release_version_lint(),
+                timeout=60.0,
+            )
+        )
+        # Root ./platformio.ini lockdown: every diff line needs an adjacent
+        # `; justification:` + `; added-in:` comment. See #3274 and the
+        # matching CodeRabbit rule. No-op on master and when the file is
+        # unchanged against origin/master.
+        stages.append(
+            LintStage(
+                name="root_project_ini_lockdown",
+                display_name="ROOT PROJECT INI LOCKDOWN",
+                run_fn=lambda: run_root_ini_lockdown_lint(
+                    warn_only=_root_ini_warn_only_from_env()
+                ),
+                timeout=10.0,
+            )
+        )
+        # check_*_size.yml threshold lockdown: every max_size{,_apa102} value
+        # in .github/workflows/check_*_size.yml must match the frozen list
+        # in ci/lint/check_size_thresholds.py. Prevents agents from silently
+        # raising the ceiling to make CI green. ALWAYS error mode — no
+        # warn-only escape hatch.
+        stages.append(
+            LintStage(
+                name="size_thresholds_locked",
+                display_name="SIZE-CHECK YML THRESHOLDS LOCKED",
+                run_fn=run_size_thresholds_check,
+                timeout=10.0,
             )
         )
 
@@ -297,9 +366,9 @@ def main() -> int:
         # Create duration tracker
         tracker = DurationTracker()
 
-        # Determine if we should run in parallel
-        # Parallel mode: 2+ stages and not in single-mode (--cpp/--js)
-        parallel = len(stages) > 1 and not args.js_only and not args.cpp_only
+        # Run every multi-stage invocation concurrently.  `--cpp` includes the
+        # C++, Meson, and repository-policy checks, all of which are independent.
+        parallel = len(stages) > 1
 
         # Create orchestrator
         orchestrator = LintOrchestrator(stages, tracker, parallel)

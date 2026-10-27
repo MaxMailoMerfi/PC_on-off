@@ -20,9 +20,8 @@ class LintArgs:
     run_iwyu: bool = False
     run_pyright: bool = False
     run_tidy: bool = False
-    use_rust_cpp_lint: bool = False
+    use_rust_cpp_lint: bool = True
     iwyu_fix: bool = False
-    skip_platformio_check: bool = False
     skip_meson: bool = False
     files: list[str] = field(default_factory=lambda: list[str]())
 
@@ -49,6 +48,7 @@ Python linting includes:
 
 C++ linting includes:
   - clang-format and custom checkers
+  - AST ratchets for FL_NO_EXCEPT and decayed array parameters
   - IWYU (Include-What-You-Use) runs with --full, --iwyu, or --strict
   - clang-tidy static analysis runs with --tidy
 
@@ -60,7 +60,7 @@ Examples:
   bash lint --strict           # Also run pyright + IWYU on single files (strict mode)
   bash lint --js               # JavaScript linting only
   bash lint --cpp              # C++ linting only
-  bash lint --cpp --rust       # Use Rust-backed checker subset where available
+  bash lint --cpp --no-rust    # Fall back to the legacy Python-only C++ path
   bash lint --full             # Include IWYU (Include-What-You-Use) on all files
   bash lint --iwyu             # Run IWYU only
   bash lint --tidy             # Run clang-tidy static analysis
@@ -113,20 +113,18 @@ Examples:
 
     parser.add_argument(
         "--rust",
-        action="store_true",
-        help="Use the Rust C++ checker subset where available",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use the Rust C++ checker subset where available (default: on). "
+            "Pass --no-rust to fall back to the Python-only checker path."
+        ),
     )
 
     parser.add_argument(
         "--fix",
         action="store_true",
         help="Auto-fix IWYU violations (implies --iwyu)",
-    )
-
-    parser.add_argument(
-        "--skip-platformio-check",
-        action="store_true",
-        help="Skip the PlatformIO-internal-usage checker (issue #2701, warn-only).",
     )
 
     parser.add_argument(
@@ -165,7 +163,6 @@ Examples:
         run_tidy=args.tidy,
         use_rust_cpp_lint=args.rust,
         iwyu_fix=args.fix,
-        skip_platformio_check=args.skip_platformio_check,
         skip_meson=args.skip_meson,
         files=files,
     )

@@ -8,11 +8,27 @@
  * - Fast ISR (RISC-V assembly, GPIO edge-triggered): Captures edges with MCPWM timestamps
  * - Slow ISR (C, GPTimer 10µs interval): Processes buffer, applies filtering, manages completion
  *
- * Performance:
- * - Fast ISR: 25-31 cycles (~104-129 ns @ 240 MHz)
+ * Performance (MEASURED on ESP32-C6 @ 160 MHz — FastLED#3586):
  * - Timestamp resolution: 12.5 ns (MCPWM @ 80 MHz)
- * - Edge capture rate: >1 MHz
- * - CPU load target: <20% during active capture
+ * - Sustained edge capture rate: ~385 kHz, i.e. ~2.6 us between captures.
+ *   Instrumenting a full 100-LED WS2812 frame gave min=2000 ns,
+ *   max=3550 ns, avg=2599 ns, with ZERO of 1137 intervals under 1 us.
+ *   The distribution is tight, which is an ISR saturated at its service
+ *   rate rather than one dropping edges sporadically.
+ * - Fast ISR body: 25-31 cycles. This is the assembly in fast_isr.S ONLY
+ *   and is NOT the cost of servicing an edge. The ~2 us floor above is
+ *   ~320 cycles at 160 MHz, dominated by ESP-IDF interrupt entry/exit:
+ *   a handler registered through esp_intr_alloc() runs via the IDF
+ *   vector with full context save/restore, not as a true high-priority
+ *   vectored interrupt.
+ *
+ * Consequence: this backend CANNOT capture WS28xx-rate signals, which
+ * need ~300 ns resolution (T0H). It is off by ~6.7x. For clockless LED
+ * waveform validation on SoCs with a PARLIO RX unit, use the PARLIO_RX
+ * oversampling backend (drivers/parlio_rx/) — 16 MHz DMA sampling,
+ * 62.5 ns resolution, no interrupt per edge. An earlier version of this
+ * header advertised ">1 MHz edge capture rate" and "25-31 cycles",
+ * which sent debugging down the wrong path before the rate was measured.
  *
  * Integration:
  * - Uses DualIsrContext from dual_isr_context.h
@@ -20,6 +36,7 @@
  * - Uses mcpwm_timer functions from mcpwm_timer.cpp
  */
 
+#include "fl/stl/charconv.h"  // fl::to_hex
 #include "platforms/is_platform.h"
 #ifdef FL_IS_ESP32
 
@@ -83,7 +100,7 @@ namespace {
  * @param interrupt_handle Output parameter for allocated interrupt handle
  * @return true on success, false on failure
  */
-bool install_direct_gpio_isr(int gpio_num, void* isr_context, intr_handle_t* interrupt_handle) FL_NOEXCEPT {
+bool install_direct_gpio_isr(int gpio_num, void* isr_context, intr_handle_t* interrupt_handle) FL_NO_EXCEPT {
     FL_DBG("Installing direct GPIO ISR for pin " << gpio_num);
 
     // Step 1: Determine GPIO interrupt source
@@ -114,7 +131,7 @@ bool install_direct_gpio_isr(int gpio_num, void* isr_context, intr_handle_t* int
         return false;
     }
 
-    FL_DBG("Allocated interrupt handle: " << *interrupt_handle);
+    FL_DBG("Allocated interrupt handle: " << (*interrupt_handle));
 
     // Step 3: Configure GPIO pin
     gpio_config_t io_conf = {};
@@ -162,7 +179,7 @@ namespace {
  * @param pin GPIO pin number to check
  * @return true if pin is valid and usable, false otherwise
  */
-inline bool isValidGpioPin(int pin) FL_NOEXCEPT {
+inline bool isValidGpioPin(int pin) FL_NO_EXCEPT {
     if (pin < 0 || pin >= 64) {
         return false;
     }
@@ -181,7 +198,7 @@ inline bool isValidGpioPin(int pin) FL_NOEXCEPT {
  * @param timing Chipset timing thresholds
  * @return 0 for bit 0, 1 for bit 1, -1 for invalid timing
  */
-inline int decodePulseBit(u32 high_ns, u32 low_ns, const ChipsetTiming4Phase &timing) FL_NOEXCEPT {
+inline int decodePulseBit(u32 high_ns, u32 low_ns, const ChipsetTiming4Phase &timing) FL_NO_EXCEPT {
     // Decision logic: check if timing matches bit 0 pattern
     bool t0h_match = (high_ns >= timing.t0h_min_ns) && (high_ns <= timing.t0h_max_ns);
     bool t0l_match = (low_ns >= timing.t0l_min_ns) && (low_ns <= timing.t0l_max_ns);
@@ -208,7 +225,7 @@ inline int decodePulseBit(u32 high_ns, u32 low_ns, const ChipsetTiming4Phase &ti
  * @param timing Timing thresholds
  * @return true if pulse is reset pulse (long low duration)
  */
-inline bool isResetPulse(u32 duration_ns, const ChipsetTiming4Phase &timing) FL_NOEXCEPT {
+inline bool isResetPulse(u32 duration_ns, const ChipsetTiming4Phase &timing) FL_NO_EXCEPT {
     u32 reset_min_ns = timing.reset_min_us * 1000;
     return duration_ns >= reset_min_ns;
 }
@@ -225,7 +242,7 @@ inline bool isResetPulse(u32 duration_ns, const ChipsetTiming4Phase &timing) FL_
  */
 fl::result<u32, DecodeError> decodeEdgeTimestamps(const ChipsetTiming4Phase &timing,
                                                          fl::span<const EdgeTimestamp> edges,
-                                                         fl::span<u8> bytes_out) FL_NOEXCEPT {
+                                                         fl::span<u8> bytes_out) FL_NO_EXCEPT {
     const size_t edge_count = edges.size();
     const size_t bytes_capacity = bytes_out.size();
 
@@ -384,11 +401,10 @@ public:
         cleanup();
     }
 
-    bool begin(const RxConfig& config) FL_NOEXCEPT override {
+    bool begin(const RxConfig& config) FL_NO_EXCEPT override {
         // Validate pin
         if (!isValidGpioPin(static_cast<int>(mPin))) {
-            FL_ERROR("GPIO ISR RX MCPWM: Invalid pin " << static_cast<int>(mPin)
-                     << " - pin is reserved for UART, flash, or other system use");
+            FL_ERROR("GPIO ISR RX MCPWM: Invalid pin " << (static_cast<int>(mPin)) << " - pin is reserved for UART, flash, or other system use");
             return false;
         }
 
@@ -400,8 +416,7 @@ public:
 
         // Buffer size must be power of 2 for fast modulo optimization
         if ((config.buffer_size & (config.buffer_size - 1)) != 0) {
-            FL_ERROR("GPIO ISR RX MCPWM begin: buffer_size must be power of 2 (got "
-                     << config.buffer_size << ")");
+            FL_ERROR("GPIO ISR RX MCPWM begin: buffer_size must be power of 2 (got " << config.buffer_size << ")");
             return false;
         }
 
@@ -410,8 +425,7 @@ public:
             mBufferSize = config.buffer_size;
             mOutputBufferSize = config.buffer_size;  // Same size for simplicity
 
-            FL_DBG("GPIO ISR RX MCPWM first-time init: pin=" << static_cast<int>(mPin)
-                   << ", buffer_size=" << mBufferSize);
+            FL_DBG("GPIO ISR RX MCPWM first-time init: pin=" << (static_cast<int>(mPin)) << ", buffer_size=" << mBufferSize);
 
             // Allocate circular buffer
             mEdgeBuffer.clear();
@@ -452,7 +466,7 @@ public:
             io_conf.intr_type = GPIO_INTR_ANYEDGE;
             esp_err_t err = gpio_config(&io_conf);
             if (err != ESP_OK) {
-                FL_WARN("Failed to configure GPIO: " << static_cast<int>(err));
+                FL_WARN("Failed to configure GPIO: " << (static_cast<int>(err)));
                 return false;
             }
 
@@ -460,10 +474,13 @@ public:
 #ifdef GPIO_IN1_REG
             // Chips with >32 GPIOs (ESP32, ESP32-S2) have a second input register
             mIsrContext.gpio_in_reg_addr = (mPin < 32) ? GPIO_IN_REG : GPIO_IN1_REG;
+            mIsrContext.gpio_status_w1tc_reg_addr =
+                (mPin < 32) ? GPIO_STATUS_W1TC_REG : GPIO_STATUS1_W1TC_REG;
             u8 pin_bit = (mPin < 32) ? mPin : (mPin - 32);
 #else
             // Chips with <=32 GPIOs (ESP32-H2, ESP32-C3, ESP32-C6) only have GPIO_IN_REG
             mIsrContext.gpio_in_reg_addr = GPIO_IN_REG;
+            mIsrContext.gpio_status_w1tc_reg_addr = GPIO_STATUS_W1TC_REG;
             u8 pin_bit = mPin;
 #endif
             mIsrContext.gpio_bit_mask = (1U << pin_bit);
@@ -483,7 +500,7 @@ public:
 
             err = gptimer_new_timer(&timer_config, reinterpret_cast<gptimer_handle_t*>(&mIsrContext.gptimer_handle)); // ok reinterpret cast
             if (err != ESP_OK) {
-                FL_WARN("Failed to create GPTimer: " << static_cast<int>(err));
+                FL_WARN("Failed to create GPTimer: " << (static_cast<int>(err)));
                 mcpwm_timer_cleanup();
                 return false;
             }
@@ -497,7 +514,7 @@ public:
                 &cbs,
                 &mIsrContext);
             if (err != ESP_OK) {
-                FL_WARN("Failed to register GPTimer callback: " << static_cast<int>(err));
+                FL_WARN("Failed to register GPTimer callback: " << (static_cast<int>(err)));
                 gptimer_del_timer(reinterpret_cast<gptimer_handle_t>(mIsrContext.gptimer_handle)); // ok reinterpret cast
                 mIsrContext.gptimer_handle = nullptr;
                 mcpwm_timer_cleanup();
@@ -516,7 +533,7 @@ public:
                 reinterpret_cast<gptimer_handle_t>(mIsrContext.gptimer_handle), // ok reinterpret cast
                 &alarm_config);
             if (err != ESP_OK) {
-                FL_WARN("Failed to set GPTimer alarm: " << static_cast<int>(err));
+                FL_WARN("Failed to set GPTimer alarm: " << (static_cast<int>(err)));
                 gptimer_del_timer(reinterpret_cast<gptimer_handle_t>(mIsrContext.gptimer_handle)); // ok reinterpret cast
                 mIsrContext.gptimer_handle = nullptr;
                 mcpwm_timer_cleanup();
@@ -526,7 +543,7 @@ public:
             // Enable GPTimer
             err = gptimer_enable(reinterpret_cast<gptimer_handle_t>(mIsrContext.gptimer_handle)); // ok reinterpret cast
             if (err != ESP_OK) {
-                FL_WARN("Failed to enable GPTimer: " << static_cast<int>(err));
+                FL_WARN("Failed to enable GPTimer: " << (static_cast<int>(err)));
                 gptimer_del_timer(reinterpret_cast<gptimer_handle_t>(mIsrContext.gptimer_handle)); // ok reinterpret cast
                 mIsrContext.gptimer_handle = nullptr;
                 mcpwm_timer_cleanup();
@@ -539,7 +556,7 @@ public:
             // This provides low-latency interrupt handling (~300-400ns) while remaining
             // fully compatible with ESP-IDF's interrupt system
             if (!install_direct_gpio_isr(static_cast<int>(mPin), &mIsrContext, &mInterruptHandle)) {
-                FL_WARN("Failed to install direct GPIO ISR for pin " << static_cast<int>(mPin));
+                FL_WARN("Failed to install direct GPIO ISR for pin " << (static_cast<int>(mPin)));
                 gptimer_disable(reinterpret_cast<gptimer_handle_t>(mIsrContext.gptimer_handle)); // ok reinterpret cast
                 gptimer_del_timer(reinterpret_cast<gptimer_handle_t>(mIsrContext.gptimer_handle)); // ok reinterpret cast
                 mIsrContext.gptimer_handle = nullptr;
@@ -558,10 +575,7 @@ public:
             // "Must be NULL when an interrupt of level >3 is requested"
             int flags = ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL5;
 
-            FL_DBG("Allocating GPIO interrupt: source=" << ETS_GPIO_INTR_SOURCE
-                   << " flags=0x" << fl::hex << flags << fl::dec
-                   << " handler=nullptr (Level 5 requires nullptr per ESP-IDF docs)"
-                   << " arg=nullptr (cannot pass context with nullptr handler)");
+            FL_DBG("Allocating GPIO interrupt: source=" << ETS_GPIO_INTR_SOURCE << " flags=0x" << (fl::to_hex(flags)) << " handler=nullptr (Level 5 requires nullptr per ESP-IDF docs) arg=nullptr (cannot pass context with nullptr handler)");
 
             err = esp_intr_alloc(
                 ETS_GPIO_INTR_SOURCE,                           // GPIO interrupt source
@@ -571,12 +585,10 @@ public:
                 reinterpret_cast<intr_handle_t*>(&mIsrContext.intr_handle)  // ok reinterpret cast  // Store handle
             );
 
-            FL_DBG("esp_intr_alloc result: " << esp_err_to_name(err) << " (0x" << fl::hex << err << fl::dec << ")");
+            FL_DBG("esp_intr_alloc result: " << esp_err_to_name(err) << " (0x" << fl::to_hex(static_cast<fl::u32>(err)) << ")");
 
             if (err != ESP_OK) {
-                FL_WARN("Failed to register GPIO interrupt: " << esp_err_to_name(err)
-                        << " - interrupt source=" << ETS_GPIO_INTR_SOURCE
-                        << " flags=0x" << fl::hex << flags << fl::dec);
+                FL_WARN("Failed to register GPIO interrupt: " << esp_err_to_name(err) << " - interrupt source=" << ETS_GPIO_INTR_SOURCE << " flags=0x" << (fl::to_hex(flags)));
                 gptimer_disable(reinterpret_cast<gptimer_handle_t>(mIsrContext.gptimer_handle)); // ok reinterpret cast
                 gptimer_del_timer(reinterpret_cast<gptimer_handle_t>(mIsrContext.gptimer_handle)); // ok reinterpret cast
                 mIsrContext.gptimer_handle = nullptr;
@@ -616,11 +628,7 @@ public:
             mIsrContext.min_pulse_ticks = 1;  // Minimum 1 tick
         }
 
-        FL_DBG("GPIO ISR RX MCPWM begin: signal_range_min=" << config.signal_range_min_ns
-               << "ns (" << mIsrContext.min_pulse_ticks << " ticks)"
-               << ", signal_range_max=" << config.signal_range_max_ns << "ns ("
-               << mIsrContext.timeout_ticks << " ticks)"
-               << ", skip_signals=" << config.skip_signals);
+        FL_DBG("GPIO ISR RX MCPWM begin: signal_range_min=" << config.signal_range_min_ns << "ns (" << mIsrContext.min_pulse_ticks << " ticks), signal_range_max=" << config.signal_range_max_ns << "ns (" << mIsrContext.timeout_ticks << " ticks), skip_signals=" << config.skip_signals);
 
         // Clear receive state
         mIsrContext.write_index = 0;
@@ -628,6 +636,7 @@ public:
         mIsrContext.output_count = 0;
         mIsrContext.last_edge_timestamp = 0;
         mIsrContext.done = false;
+        mEdgesConverted = false;  // Fresh capture: ticks not yet converted to ns
 
         // Start MCPWM timer
         if (mcpwm_timer_start() != 0) {
@@ -638,7 +647,7 @@ public:
         // Start GPTimer
         esp_err_t err = gptimer_start(reinterpret_cast<gptimer_handle_t>(mIsrContext.gptimer_handle)); // ok reinterpret cast
         if (err != ESP_OK) {
-            FL_WARN("Failed to start GPTimer: " << static_cast<int>(err));
+            FL_WARN("Failed to start GPTimer: " << (static_cast<int>(err)));
             mcpwm_timer_stop();
             return false;
         }
@@ -650,12 +659,12 @@ public:
         return true;
     }
 
-    bool finished() const FL_NOEXCEPT override {
+    bool finished() const FL_NO_EXCEPT override {
         // Atomic load with acquire semantics
         return __atomic_load_n(&mIsrContext.done, __ATOMIC_ACQUIRE);
     }
 
-    RxWaitResult wait(u32 timeout_ms) FL_NOEXCEPT override {
+    RxWaitResult wait(u32 timeout_ms) FL_NO_EXCEPT override {
         if (!mInitialized) {
             FL_WARN("wait(): GPIO ISR RX MCPWM not initialized");
             return RxWaitResult::TIMEOUT;
@@ -673,8 +682,7 @@ public:
 
             // Check wait timeout
             if (elapsed_us >= timeout_us) {
-                FL_WARN("wait(): timeout after " << elapsed_us << "us, captured "
-                        << mIsrContext.output_count << " edges");
+                FL_WARN("wait(): timeout after " << elapsed_us << "us, captured " << mIsrContext.output_count << " edges");
                 return RxWaitResult::TIMEOUT;
             }
 
@@ -686,7 +694,7 @@ public:
         return RxWaitResult::SUCCESS;
     }
 
-    fl::span<const EdgeTimestamp> getEdges() const FL_NOEXCEPT override {
+    fl::span<const EdgeTimestamp> getEdges() const FL_NO_EXCEPT override {
         if (mOutputBuffer.empty()) {
             return fl::span<const EdgeTimestamp>();
         }
@@ -703,16 +711,28 @@ public:
         EdgeEntry* output_ptr = const_cast<EdgeEntry*>(mOutputBuffer.data());
         auto* result_ptr = reinterpret_cast<EdgeTimestamp*>(output_ptr);  // ok reinterpret cast
 
-        for (size_t i = 0; i < count; i++) {
-            result_ptr[i].time_ns = (output_ptr[i].timestamp * 25) / 2;
-            result_ptr[i].level = output_ptr[i].level;
+        // This conversion is DESTRUCTIVE and IN PLACE: result_ptr aliases
+        // output_ptr, and EdgeTimestamp::time_ns is a union member overlaying
+        // the same 4 bytes as EdgeEntry::timestamp. Writing time_ns therefore
+        // overwrites the tick value it was computed from. Converting twice
+        // multiplies by 12.5 again, and both getRawEdgeTimes() and decode()
+        // call getEdges(), so a single capture was being scaled 12.5x, 156x,
+        // ... on each successive read (FastLED #3586: consecutive reads of one
+        // capture differed by exactly 12.5x on the bench). Convert once per
+        // capture; the flag is cleared when a new capture is armed.
+        if (!mEdgesConverted) {
+            for (size_t i = 0; i < count; i++) {
+                result_ptr[i].time_ns = (output_ptr[i].timestamp * 25) / 2;
+                result_ptr[i].level = output_ptr[i].level;
+            }
+            mEdgesConverted = true;
         }
 
         return fl::span<const EdgeTimestamp>(result_ptr, count);
     }
 
     fl::result<u32, DecodeError> decode(const ChipsetTiming4Phase &timing,
-                                               fl::span<u8> out) FL_NOEXCEPT override {
+                                               fl::span<u8> out) FL_NO_EXCEPT override {
         // Get captured edges
         fl::span<const EdgeTimestamp> edges = getEdges();
 
@@ -724,7 +744,7 @@ public:
         return decodeEdgeTimestamps(timing, edges, out);
     }
 
-    size_t getRawEdgeTimes(fl::span<EdgeTime> out, size_t offset = 0) FL_NOEXCEPT override {
+    size_t getRawEdgeTimes(fl::span<EdgeTime> out, size_t offset = 0) FL_NO_EXCEPT override {
         // Get converted edges
         fl::span<const EdgeTimestamp> edges = getEdges();
 
@@ -767,7 +787,7 @@ public:
         return out_index;
     }
 
-    bool injectEdges(fl::span<const EdgeTime> edges) FL_NOEXCEPT override {
+    bool injectEdges(fl::span<const EdgeTime> edges) FL_NO_EXCEPT override {
         // Ensure output buffer is large enough
         if (edges.size() > mOutputBuffer.size()) {
             mOutputBuffer.clear();
@@ -789,14 +809,15 @@ public:
 
         mIsrContext.output_count = static_cast<u32>(edges.size());
         mIsrContext.done = true;
+        mEdgesConverted = false;  // Freshly written raw ticks await conversion
         return true;
     }
 
-    const char* name() const FL_NOEXCEPT override {
+    const char* name() const FL_NO_EXCEPT override {
         return "ISR_MCPWM";
     }
 
-    int getPin() const FL_NOEXCEPT override {
+    int getPin() const FL_NO_EXCEPT override {
         return static_cast<int>(mPin);
     }
 
@@ -886,7 +907,7 @@ private:
     /**
      * @brief Clean up resources
      */
-    void cleanup() FL_NOEXCEPT {
+    void cleanup() FL_NO_EXCEPT {
         if (!mInitialized) {
             return;
         }
@@ -934,6 +955,9 @@ private:
     fl::vector<EdgeEntry> mOutputBuffer;   ///< Filtered output buffer
     DualIsrContext mIsrContext;
     bool mInitialized;
+    /// getEdges() is const but converts mOutputBuffer in place, so this caches
+    /// whether that one-time conversion already ran for the current capture.
+    mutable bool mEdgesConverted = false;
 #ifdef __riscv
     intr_handle_t mInterruptHandle = nullptr;  ///< ESP-IDF interrupt handle for cleanup
 #endif
@@ -941,7 +965,7 @@ private:
 
 // Factory method for MCPWM-based implementation
 // Note: This is a separate factory - doesn't override the existing GpioIsrRx::create()
-fl::shared_ptr<GpioIsrRx> GpioIsrRxMcpwm_create(int pin) FL_NOEXCEPT {
+fl::shared_ptr<GpioIsrRx> GpioIsrRxMcpwm_create(int pin) FL_NO_EXCEPT {
     return fl::make_shared<GpioIsrRxMcpwm>(pin);
 }
 

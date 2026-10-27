@@ -180,8 +180,9 @@ Successfully tested platforms:
 esp32_boards = ["esp32dev", "esp32", "esp32s2", ...]
 
 # FastLED-specific filtering
-if any(keyword in search_text for keyword in [
-    "fastled", "cfastled", "crgb", "hsv", ...]):
+if any(
+    keyword in search_text for keyword in ["fastled", "cfastled", "crgb", "hsv", ...]
+):
     fastled_symbols.append(symbol_info)
 ```
 
@@ -243,7 +244,7 @@ The new tool provides all the same information plus:
 
 To add support for a new platform:
 
-1. Ensure the platform builds correctly with PlatformIO
+1. Ensure the platform builds correctly with fbuild (`bash compile <platform> --examples Blink`)
 2. Verify `build_info.json` is generated in `.build/{platform}/`
 3. Run: `uv run symbol_analysis.py --board {platform}`
 

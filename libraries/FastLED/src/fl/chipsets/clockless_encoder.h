@@ -22,15 +22,17 @@ enum class ClocklessEncoder : u8 {
     CLOCKLESS_ENCODER_WS2812 = 0,           ///< Default, no preamble (WS2812 and compatible)
     CLOCKLESS_ENCODER_UCS7604_8BIT,         ///< UCS7604 8-bit 800KHz
     CLOCKLESS_ENCODER_UCS7604_16BIT,        ///< UCS7604 16-bit 800KHz
-    CLOCKLESS_ENCODER_UCS7604_16BIT_1600    ///< UCS7604 16-bit 1600KHz
+    CLOCKLESS_ENCODER_UCS7604_16BIT_1600,   ///< UCS7604 16-bit 1600KHz
+    CLOCKLESS_ENCODER_TM1812_RGBWW,         ///< TM1812: two 5-byte RGBWW pixels in each 12-byte IC frame
+    CLOCKLESS_ENCODER_TM1908                ///< TM1908: command prefix followed by RGB pixels
 };
 
 /// @brief SFINAE helpers for detecting a static ENCODER member on timing structs
 namespace detail {
     template <typename T>
-    constexpr auto test_encoder(int) FL_NOEXCEPT -> decltype(T::ENCODER, true) { return true; }
+    constexpr auto test_encoder(int) FL_NO_EXCEPT -> decltype(T::ENCODER, true) { return true; }
     template <typename T>
-    constexpr bool test_encoder(...) FL_NOEXCEPT { return false; }
+    constexpr bool test_encoder(...) FL_NO_EXCEPT { return false; }
 
     template <typename CHIPSET, bool HAS_ENCODER>
     struct get_encoder {
@@ -52,7 +54,7 @@ struct has_encoder {
 /// If TIMING has a static `ENCODER` member it is returned; otherwise defaults
 /// to `CLOCKLESS_ENCODER_WS2812`.
 template <typename TIMING>
-constexpr ClocklessEncoder encoder_for() FL_NOEXCEPT {
+constexpr ClocklessEncoder encoder_for() FL_NO_EXCEPT {
     return detail::get_encoder<TIMING, has_encoder<TIMING>::value>::value;
 }
 

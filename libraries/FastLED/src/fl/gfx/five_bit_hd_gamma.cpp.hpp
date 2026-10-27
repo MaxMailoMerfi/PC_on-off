@@ -2,6 +2,7 @@
 #include "fl/stl/align.h"
 #include "fl/math/ease.h"
 #include "fl/system/fastled.h"
+#include "fl/stl/noexcept.h"
 
 FL_OPTIMIZATION_LEVEL_O3_BEGIN
 
@@ -20,14 +21,14 @@ FL_ALIGN_PROGMEM(4) static constexpr u32 BRIGHT_SCALE[32] FL_PROGMEM = {
 
 // Inlined gamma lookup with alignment enforced by aligned_ptr type.
 // Avoids cross-TU function call overhead of gamma_2_8() in hot span loops.
-FL_ALWAYS_INLINE u16 gamma_lut_read(aligned_ptr<const u16, 64> lut, u8 idx) {
+FL_ALWAYS_INLINE u16 gamma_lut_read(aligned_ptr<const u16, 64> lut, u8 idx) FL_NO_EXCEPT {
     return FL_PGM_READ_WORD_ALIGNED(&lut[idx]);
 }
 
 // Branchless scale16by8: (i * (1 + scale)) >> 8.
 // Eliminates the if(scale==0) branch from the standard scale16by8.
 // The caller is responsible for skipping the call when scale==0.
-FL_ALWAYS_INLINE u16 scale16by8_nozero(u16 i, u16 scale_plus_one) {
+FL_ALWAYS_INLINE u16 scale16by8_nozero(u16 i, u16 scale_plus_one) FL_NO_EXCEPT {
     return static_cast<u16>((static_cast<u32>(i) * scale_plus_one) >> 8);
 }
 
@@ -37,7 +38,7 @@ FL_ALWAYS_INLINE void five_bit_pixel(
     u16 r16, u16 g16, u16 b16, u8 brightness,
     // Precomputed: (1 + brightness), or 0 if brightness==0xff (skip scaling)
     u16 bright_p1, bool apply_brightness,
-    CRGB *out, u8 *out_power_5bit) {
+    CRGB *out, u8 *out_power_5bit) FL_NO_EXCEPT {
 
     // All-zero fast path (rare but worth checking — writes are cheap).
     if ((r16 | g16 | b16) == 0) {
@@ -82,7 +83,7 @@ FL_ALWAYS_INLINE void five_bit_pixel(
 FL_OPTIMIZE_FUNCTION
 void five_bit_hd_gamma_bitshift(
     fl::span<const CRGB> colors, CRGB colors_scale, u8 global_brightness,
-    fl::span<CRGB> out_colors, fl::span<u8> out_power_5bit) {
+    fl::span<CRGB> out_colors, fl::span<u8> out_power_5bit) FL_NO_EXCEPT {
 
     u16 n = static_cast<u16>(colors.size());
     if (out_colors.size() < n) n = static_cast<u16>(out_colors.size());
@@ -132,7 +133,7 @@ void five_bit_hd_gamma_bitshift(
 FL_OPTIMIZE_FUNCTION
 void five_bit_hd_gamma_bitshift(
     fl::span<const CRGB> colors, CRGB colors_scale, u8 global_brightness,
-    fl::span<CRGBA5> out) {
+    fl::span<CRGBA5> out) FL_NO_EXCEPT {
 
     u16 n = static_cast<u16>(colors.size());
     if (out.size() < n) n = static_cast<u16>(out.size());
@@ -177,6 +178,52 @@ void five_bit_hd_gamma_bitshift(
                                       &out[i].color, &out[i].brightness_5bit);
     }
 }
+
+namespace detail {
+
+void five_bit_hd_solve16(u16 r16, u16 g16, u16 b16, u8 min_field, CRGB* out,
+                         u8* out_field) FL_NO_EXCEPT {
+    // Target light per channel, in code x field units with eight fraction
+    // bits: a drive of 65535 is 255 x 31. The legacy solve's field rule is
+    // not monotonic at 16-bit resolution -- a one-step rise can move it to a
+    // field whose rounding lands lower -- so this uses its own: the smallest
+    // field f with T < 255.5 f, and codes rounded at that field. Within a
+    // field, rounding is monotonic; across a transition the new field's light
+    // is at least T - (f + 1) / 2 > 255 f, which is at least the old field's
+    // maximum. So emitted light never falls as a drive rises.
+    if (min_field < 1) {
+        min_field = 1;
+    }
+    if (min_field > 31) {
+        min_field = 31;
+    }
+    const u16 drives[3] = {r16, g16, b16};
+    u32 target[3];
+    u32 brightest = 0;
+    for (int i = 0; i < 3; ++i) {
+        target[i] = static_cast<u32>(
+            (static_cast<u64>(drives[i]) * 7905u * 256u) / 65535u);  // 7905 = 255 x 31; u64 throughout (AVR int is 16 bits)
+        if (target[i] > brightest) {
+            brightest = target[i];
+        }
+    }
+    // 255.5 in eight fraction bits is 65408.
+    u32 field = brightest / 65408u + 1u;
+    if (field < min_field) {
+        field = min_field;
+    }
+    if (field > 31u) {
+        field = 31u;
+    }
+    const u32 unit = field * 256u;
+    for (int i = 0; i < 3; ++i) {
+        const u32 code = (target[i] + unit / 2u) / unit;
+        out->raw[i] = static_cast<u8>(code > 255u ? 255u : code);
+    }
+    *out_field = static_cast<u8>(field);
+}
+
+}  // namespace detail
 
 } // namespace fl
 

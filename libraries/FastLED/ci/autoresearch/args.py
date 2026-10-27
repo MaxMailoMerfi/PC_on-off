@@ -18,6 +18,7 @@ class Args:
     rmt: bool
     spi: bool
     uart: bool
+    bitbang: bool
     lcd: bool
     lcd_spi: bool
     lcd_rgb: bool
@@ -27,6 +28,13 @@ class Args:
     all: bool
     simd: bool
     coroutine: bool
+    ieee754: bool
+    math: bool
+    fft: bool
+    rpc_smoke: bool
+    # Wave2D perf benchmark — accepts "<W>x<H>" (e.g. "32x32") or None.
+    # Cf. issue #3124 for the future --perf-XX / --test-XX convention.
+    perf_wave2d: str | None
 
     # Standard options
     environment: str | None
@@ -46,6 +54,7 @@ class Args:
     tx_pin: int | None
     rx_pin: int | None
     auto_discover_pins: bool
+    contaminate_tx_mux: bool
 
     # Build system selection
     use_fbuild: bool
@@ -68,6 +77,8 @@ class Args:
 
     # Legacy API testing
     legacy: bool
+    legacy_mixed_timings: bool
+    legacy_rgbw_small_counts: bool
 
     # Chipset selection
     chipset: str
@@ -76,6 +87,9 @@ class Args:
     net_server: bool
     net_client: bool
     net: bool
+    net_peer: bool
+    peer_environment: str
+    peer_upload_port: str | None
 
     # OTA autoresearch mode
     ota: bool
@@ -95,6 +109,36 @@ class Args:
     # LPC845 SCT-RX bench (#3021 Phase 2) — WS2812 byte-match loopback.
     ws2812_loopback: bool
 
+    # LPC845 channels-API SCT+DMA clockless engine self-loopback (#3468).
+    # Drives `ChannelEngineLpcSctDma` and captures via `LpcSctRxChannel`.
+    pwm_dma_cl: bool
+
+    # LPC845 SPI+DMA async driver bench (#3456, Phase 1 of #3453 bring-up).
+    # Drives `ARMHardwareSPIOutputDMA<>` and reports timing + async-proof
+    # metrics. Mutually exclusive with --pwm-dma-cl (both claim DMA0).
+    dma_spi: bool
+
+    # LPC845 async UART TX bench (#3453 follow-up: ISR-refillable drivers).
+    # Drives `ARMHardwareUARTOutputDMA<>` (USART1 TX + DMA0 ch3, ISR chunk
+    # chaining) while USART0 keeps serving the RPC console. Mutually
+    # exclusive with the other LPC DMA harnesses at the flash budget.
+    dma_uart: bool
+
+    # RP2040/RP2350 fixed-SPI DMA byte-loopback harness.
+    rp_spi_loopback: bool
+    rp_spi_index: int
+    rp_spi_public_api: bool
+    rp_spi_chipset: str
+    # RP PL011 UART engine used by --uart on RP2040/RP2350.
+    rp_uart_index: int
+    # RP PIO TX engine used by --flex-io on RP2040/RP2350.
+    rp_pio_index: int | None
+    # Select both PIO TX engines for a parallel RP run.
+    rp_pio_both: bool
+
+    # LPC845 fault emit validation (#3302).
+    test_fault_emit: bool
+
     # Multi-frame capture — number of back-to-back show()/capture cycles per pattern.
     # None = driver-default (SPI → 2, others → 1). Explicit value overrides.
     # See issues #2254 and #2288 (ESP32-S3 SPI second-frame degradation).
@@ -104,6 +148,9 @@ class Args:
     tight_timing: bool
     tight_timing_iterations: int
     tight_timing_max_overhead_us: int
+
+    watchdog_soak: bool = False
+    mp3: bool = False
 
     @staticmethod
     def parse_args(argv: list[str] | None = None) -> "Args":
@@ -118,7 +165,7 @@ Examples:
   %(prog)s --rmt --spi                 # Test RMT and SPI drivers
   %(prog)s --all                       # Test all drivers
   %(prog)s --parlio --skip-lint        # Skip linting for faster iteration
-  %(prog)s --rmt --timeout 120         # Custom timeout (default: 60s)
+  %(prog)s --rmt --timeout 2m          # Custom timeout (default: 30s; supports s/m/h/ms)
   %(prog)s --lcd --lanes 2 --strip-sizes 100,300  # Test LCD_CLOCKLESS with 2 lanes, strips of 100 and 300 LEDs
   %(prog)s --lcd-spi --strip-sizes 100,500   # Test LCD_SPI (APA102) on ESP32-S3
   %(prog)s --parlio --lanes 1-4        # Test PARLIO with 1-4 lanes
@@ -131,17 +178,19 @@ Driver Selection (JSON-RPC):
   Driver selection happens at runtime via JSON-RPC (no recompilation needed).
   You can instantly switch between drivers without rebuilding firmware.
 
-  MANDATORY: You MUST specify at least one driver flag:
+  Optional: omit driver/special flags for GPIO-only bring-up.
+  Specify one or more driver flags when validating a driver:
     --parlio       Test only PARLIO driver
     --rmt          Test only RMT driver
-    --spi          Test only SPI driver
+    --spi          Test only SPI driver (Teensy 4.x resolves to SPI_UNIFIED)
     --uart         Test only UART driver
     --lcd          Test only LCD_CLOCKLESS driver (ESP32-S3 only, replaces misnamed I2S)
     --lcd-spi      Test only LCD_SPI driver (ESP32-S3 only, APA102/SK9822)
     --lcd-rgb      Test only LCD RGB driver (ESP32-P4 only)
     --object-fled  Test only ObjectFLED DMA driver (Teensy 4.x)
-    --lpuart       Test only LPUART driver (Teensy 4.x; eDMA-backed UART TX, pinned to pin 1 by default)
-    --all          Test all drivers
+    --flexio [0|1] Deprecated alias for --flex-io; default 0, 1 enables it
+    --lpuart       Deprecated alias for --uart; emits a warning
+    --all          Test all currently implemented drivers
 
 Strip Size Configuration:
   Configure LED strip sizes for autoresearch testing via JSON-RPC:
@@ -193,7 +242,7 @@ See Also:
         parser.add_argument(
             "environment_positional",
             nargs="?",
-            help="PlatformIO environment to build (e.g., esp32s3, esp32dev). If omitted, auto-detects from attached device.",
+            help="Board environment to build (e.g., esp32s3, esp32dev). If omitted, auto-detects from attached device.",
         )
 
         # Driver selection flags
@@ -213,12 +262,53 @@ See Also:
         driver_group.add_argument(
             "--spi",
             action="store_true",
-            help="Test only SPI driver",
+            help="Test only SPI driver (Teensy 4.x resolves to SPI_UNIFIED)",
+        )
+        driver_group.add_argument(
+            "--rp-spi-loopback",
+            action="store_true",
+            help="RP2040/RP2350: fixed SPI0/SPI1 DMA byte-loopback "
+            + "through the channel engine; requires MOSI-to-MISO jumper.",
+        )
+        driver_group.add_argument(
+            "--rp-spi-index",
+            type=int,
+            choices=(0, 1),
+            default=0,
+            help="RP fixed SPI instance for --rp-spi-loopback (default: 0).",
+        )
+        driver_group.add_argument(
+            "--rp-spi-public-api",
+            action="store_true",
+            help="RP2040/RP2350: verify APA102/SK9822 through FastLED.addLeds() on SPI1.",
+        )
+        driver_group.add_argument(
+            "--rp-spi-chipset",
+            choices=("apa102", "sk9822"),
+            default="apa102",
+            help="Chipset for --rp-spi-public-api (default: apa102).",
         )
         driver_group.add_argument(
             "--uart",
             action="store_true",
-            help="Test only UART driver",
+            help="Test only UART driver (LPC845: UART DMA clockless RX-DMA loopback)",
+        )
+        driver_group.add_argument(
+            "--bitbang",
+            action="store_true",
+            help=(
+                "Test only the portable GPIO bit-bang driver (Bus::BIT_BANG). "
+                "This is AUTO's last-resort fallback on every platform, so it "
+                "is the one driver that must keep working when the hardware "
+                "engines are all claimed."
+            ),
+        )
+        driver_group.add_argument(
+            "--rp-uart-index",
+            type=int,
+            choices=(0, 1),
+            default=0,
+            help="RP UART engine for --uart on RP2040/RP2350 (default: 0).",
         )
         driver_group.add_argument(
             "--lcd",
@@ -243,17 +333,46 @@ See Also:
         driver_group.add_argument(
             "--flex-io",
             action="store_true",
-            help="Test only FlexIO clockless driver (Teensy 4.x only; requires --tx-pin in {6-13,32})",
+            help=(
+                "Test FlexIO clockless (Teensy 4.x; requires --tx-pin in {6-13,32}) "
+                "or RP PIO clockless (RP2040/RP2350)"
+            ),
+        )
+        driver_group.add_argument(
+            "--rp-engine-index",
+            dest="rp_pio_index",
+            type=int,
+            choices=(0, 1, 2),
+            default=None,
+            help=(
+                "RP PIO engine for --flex-io; PIO2 requires RP2350 "
+                "(default: 1, or 0 with --legacy since legacy templates bind PIO0)."
+            ),
+        )
+        driver_group.add_argument(
+            "--rp-engine-both",
+            dest="rp_pio_both",
+            action="store_true",
+            help="RP2040/RP2350: select PIO0 and PIO1 together (requires --flex-io --parallel).",
+        )
+        driver_group.add_argument(
+            "--flexio",
+            dest="flexio_alias",
+            nargs="?",
+            const="0",
+            choices=("0", "1"),
+            default=None,
+            help="Deprecated numeric alias for --flex-io; default 0, pass 1 to enable",
         )
         driver_group.add_argument(
             "--lpuart",
             action="store_true",
-            help="Test only LPUART clockless driver (Teensy 4.x only; eDMA-backed UART TX; pin pinned to 1=LPUART6_TX by default, override with --tx-pin in {1,8,14,17,20,24,29,35,47,48})",
+            help="Deprecated alias for --uart; emits a warning and will be removed after the transition",
         )
         driver_group.add_argument(
             "--all",
             action="store_true",
-            help="Test all drivers (equivalent to --parlio --rmt --spi --uart --lcd --lcd-spi --lcd-rgb --object-fled --flex-io --lpuart)",
+            help="Test all currently implemented drivers (Teensy 4.x: --object-fled --flex-io)",
         )
         driver_group.add_argument(
             "--simd",
@@ -264,6 +383,52 @@ See Also:
             "--coroutine",
             action="store_true",
             help="Test coroutine/task creation, stop, and await (no LED drivers needed)",
+        )
+        driver_group.add_argument(
+            "--math",
+            action="store_true",
+            help="Run on-device fl::exp accuracy (ulp vs libm) and speed benchmark (#4288)",
+        )
+        driver_group.add_argument(
+            "--fft",
+            action="store_true",
+            help="Run on-device CQ_OCTAVE FFT per-frame time and heap benchmark (#4540)",
+        )
+        driver_group.add_argument(
+            "--ieee754",
+            action="store_true",
+            help="Run on-device integer IEEE 754 decimal codec verification (#3039)",
+        )
+        driver_group.add_argument(
+            "--mp3",
+            action="store_true",
+            help=(
+                "Run on-device fixed-point MP3 decoder verification: a Layer I "
+                "and a Layer III stream decoded bit-exactly against "
+                "host-computed checksums (no LED drivers)"
+            ),
+        )
+        driver_group.add_argument(
+            "--rpc-smoke",
+            action="store_true",
+            help="Validate pin-free JSON-RPC discovery, health, payload, and error handling",
+        )
+        driver_group.add_argument(
+            "--watchdog-soak",
+            action="store_true",
+            help="Exercise deliberateHang watchdog recovery and post-reset RPC smoke",
+        )
+        driver_group.add_argument(
+            "--perf-wave2d",
+            type=str,
+            default=None,
+            metavar="WxH",
+            help=(
+                "Run the Wave2D perf benchmark (meta #3113 Task 1). "
+                "Argument is grid size 'WxH', e.g. '32x32' or '64x64'. "
+                "Chains perfProbe* sanity probes before wave2dPerf; "
+                "marks results UNTRUSTED if probes fail."
+            ),
         )
         driver_group.add_argument(
             "--parallel",
@@ -290,6 +455,23 @@ See Also:
             "--net",
             action="store_true",
             help="Self-contained loopback test: ESP32 starts HTTP server, then GETs localhost (no WiFi needed)",
+        )
+        net_group.add_argument(
+            "--net-peer",
+            action="store_true",
+            help=(
+                "Deploy RP2350W and ESP32-C6 to explicit ports, then validate "
+                "device-to-device WiFi and HTTP without changing host WiFi"
+            ),
+        )
+        net_group.add_argument(
+            "--peer-environment",
+            default="esp32c6",
+            help="Companion board for --net-peer (currently esp32c6 only)",
+        )
+        net_group.add_argument(
+            "--peer-upload-port",
+            help="Explicit serial port for the --net-peer companion board",
         )
 
         # OTA autoresearch mode
@@ -347,8 +529,55 @@ See Also:
             action="store_true",
             help="LPC845-only: WS2812 byte-match loopback via "
             "FastLED.show() (bit-bang TX) → SCT input-capture RX "
-            "(FastLED #3021 Phase 2). Requires the sketch to be built "
-            "with -DFASTLED_LPC_RX_SCT_WS2812=1.",
+            "(FastLED #3021 Phase 2). The LPC845 low-memory sketch binds "
+            "the RPC automatically.",
+        )
+        lpc_group.add_argument(
+            "--pwm-dma-cl",
+            action="store_true",
+            help="LPC845-only: channels-API SCT+DMA clockless engine self-"
+            "loopback (FastLED #3468). Drives `ChannelEngineLpcSctDma` "
+            "through `BusTraits<Bus::BIT_BANG>::instance()` and captures "
+            "the wire via `LpcSctRxChannel` on --rx-pin for a byte-match "
+            "readback. Requires a jumper from --tx-pin (data) to --rx-pin. "
+            "Mutually exclusive with --ws2812-loopback (both target the "
+            "same SCT peripheral).",
+        )
+        lpc_group.add_argument(
+            "--dma-spi",
+            action="store_true",
+            help="LPC845-only SPI+DMA async driver bench (FastLED "
+            "#3456, Phase 1 of #3453). Drives `ARMHardwareSPIOutputDMA<>` "
+            "and reports (a) single-shot transfer timing, (b) beacon-"
+            "toggle count during overlap to affirmatively prove CPU is "
+            "free during DMA, (c) SCK rate measurement via wall clock. "
+            "Mutually exclusive with --pwm-dma-cl (both claim DMA0 "
+            "channels and the LowMemory flash budget doesn't fit both). "
+            "LPC804 not supported — silicon has no DMA peripheral (see "
+            "agents/docs/peripheral-existence.md).",
+        )
+        lpc_group.add_argument(
+            "--dma-uart",
+            action="store_true",
+            help="LPC845-only async UART TX bench (#3453 follow-up). "
+            "Drives `ARMHardwareUARTOutputDMA<>` — USART1 TX via DMA0 "
+            "channel 3, chunks chained from the DMA completion ISR — "
+            "while USART0 keeps serving the RPC console. Reports "
+            "stream timing + beacon-toggle async proof. Mutually "
+            "exclusive with --dma-spi / --pwm-dma-cl (flash budget).",
+        )
+        lpc_group.add_argument(
+            "--test-fault-emit",
+            action="store_true",
+            help="LPC845-only fault-emission validation (#3302). Builds "
+            "the gated low-memory fault RPCs, triggers intentional OOM "
+            "and stack-blow faults, and asserts a FAULT diagnostic appears.",
+        )
+        lpc_description = lpc_group.description or ""
+        lpc_group.description = (
+            lpc_description
+            + " Use the top-level --uart flag on LPC845 for the UART DMA "
+            "clockless FastLED API loopback (#3611)."
         )
 
         # Standard options
@@ -356,7 +585,7 @@ See Also:
             "--env",
             "-e",
             dest="environment",
-            help="PlatformIO environment to build (optional, auto-detect if not provided)",
+            help="Board environment to build (optional, auto-detect if not provided)",
         )
         parser.add_argument(
             "--verbose",
@@ -378,15 +607,30 @@ See Also:
             "--timeout",
             "-t",
             type=str,
-            default="60",
-            help="Timeout for monitor phase. Supports: plain number (seconds), '120s', '2m', '5000ms' (default: 60)",
+            default=None,
+            help=(
+                "Timeout for monitor phase. Supports: plain number (seconds), "
+                "'30s', '2m', '1h', '5000ms'. "
+                "Default: 30s with a yellow advisory banner (FastLED #3309). "
+                "Pass --no-timeout to disable."
+            ),
+        )
+        parser.add_argument(
+            "--no-timeout",
+            action="store_true",
+            help=(
+                "Disable the monitor-phase timeout entirely. Use for debugger "
+                "sessions or interactive bring-up where the device may legitimately "
+                "stay quiet for a long time. Suppresses the default-timeout banner. "
+                "FastLED #3309."
+            ),
         )
         parser.add_argument(
             "--project-dir",
             "-d",
             type=Path,
             default=Path.cwd(),
-            help="PlatformIO project directory (default: current directory)",
+            help="Project directory (default: current directory)",
         )
 
         # Pattern overrides (for advanced usage)
@@ -444,6 +688,14 @@ See Also:
             "--no-auto-discover-pins",
             action="store_true",
             help="Disable auto-discovery of connected pins",
+        )
+        pin_group.add_argument(
+            "--contaminate-tx-mux",
+            action="store_true",
+            help=(
+                "Before runSingleTest, remux the selected TX pin through "
+                "analogWrite() so ObjectFLED must reclaim GPIO mux mode."
+            ),
         )
 
         # Build system selection
@@ -520,15 +772,46 @@ See Also:
         parser.add_argument(
             "--legacy",
             action="store_true",
-            help="Test using legacy template addLeds API (WS2812B<PIN>) instead of Channel API. Single-lane only, pin must be 0-8.",
+            help=(
+                "Test using the legacy template addLeds API instead of the "
+                "Channel API (WS2812B<PIN> by default; WS2814<PIN> or "
+                "WS2818<PIN> when selected). Supports consecutive TX pins "
+                "0-8; pin "
+                "22 is single-lane for the current ObjectFLED loopback."
+            ),
+        )
+        parser.add_argument(
+            "--legacy-mixed-timings",
+            action="store_true",
+            help=(
+                "With --legacy, alternate WS2812B/SK6812 template chipsets "
+                "across lanes to exercise multiple ObjectFLED timing groups. "
+                "Requires multi-lane historical TX pins 0-8."
+            ),
+        )
+        parser.add_argument(
+            "--legacy-rgbw-small-counts",
+            action="store_true",
+            help=(
+                "With --legacy, run RGBW 1, 2, 3, and 4 LED cases to cover "
+                "small-count ObjectFLED RGBW overflow regressions."
+            ),
         )
 
         # Chipset selection
         parser.add_argument(
             "--chipset",
-            choices=["ws2812", "ucs7604"],
+            choices=["ws2812", "ws2814", "ws2818", "ucs7604", "ws2811-400"],
             default="ws2812",
-            help="Chipset timing to use for autoresearch (default: ws2812). ucs7604 uses UCS7604-800KHZ timing with 16-bit encoding.",
+            help=(
+                "Chipset to use for autoresearch (default: ws2812). "
+                "ws2814 requires --legacy and exercises automatic RGBW output; "
+                "ws2818 requires --legacy and exercises its RGB backup-input "
+                "chipset timing; "
+                "ucs7604 uses UCS7604-800KHZ timing with 16-bit encoding; "
+                "ws2811-400 uses 400 kHz (2500 ns) timing, which is the only "
+                "geometry the RP PL011 can reach over UART."
+            ),
         )
 
         # Multi-frame capture (second-frame degradation detection)
@@ -577,6 +860,29 @@ See Also:
                 file=sys.stderr,
             )
 
+        if parsed.lpuart:
+            print(
+                "warning: --lpuart is deprecated; use --uart. "
+                "Treating --lpuart as --uart for this run.",
+                file=sys.stderr,
+            )
+            parsed.uart = True
+
+        if parsed.flexio_alias is not None:
+            if parsed.flexio_alias == "1":
+                print(
+                    "warning: --flexio is deprecated; use --flex-io. "
+                    "Treating --flexio 1 as --flex-io for this run.",
+                    file=sys.stderr,
+                )
+                parsed.flex_io = True
+            else:
+                print(
+                    "warning: --flexio is deprecated; omit it or use "
+                    "--flex-io to enable FlexIO.",
+                    file=sys.stderr,
+                )
+
         # Convert argparse.Namespace to Args dataclass
         return Args(
             environment_positional=parsed.environment_positional,
@@ -584,15 +890,23 @@ See Also:
             rmt=parsed.rmt,
             spi=parsed.spi,
             uart=parsed.uart,
+            bitbang=parsed.bitbang,
             lcd=parsed.lcd,
             lcd_spi=parsed.lcd_spi,
             lcd_rgb=parsed.lcd_rgb,
             object_fled=parsed.object_fled,
             flex_io=parsed.flex_io,
-            lpuart=parsed.lpuart,
+            lpuart=False,
             all=parsed.all,
             simd=parsed.simd,
             coroutine=parsed.coroutine,
+            ieee754=parsed.ieee754,
+            math=parsed.math,
+            fft=parsed.fft,
+            mp3=parsed.mp3,
+            rpc_smoke=parsed.rpc_smoke,
+            watchdog_soak=parsed.watchdog_soak,
+            perf_wave2d=parsed.perf_wave2d,
             environment=parsed.environment,
             verbose=parsed.verbose,
             skip_lint=parsed.skip_lint,
@@ -607,6 +921,7 @@ See Also:
             rx_pin=parsed.rx_pin,
             auto_discover_pins=parsed.auto_discover_pins
             and not parsed.no_auto_discover_pins,
+            contaminate_tx_mux=parsed.contaminate_tx_mux,
             use_fbuild=parsed.use_fbuild,
             no_fbuild=parsed.no_fbuild,
             clean=parsed.clean,
@@ -617,16 +932,32 @@ See Also:
             lane_counts=parsed.lane_counts,
             color_pattern=parsed.color_pattern,
             legacy=parsed.legacy,
+            legacy_mixed_timings=parsed.legacy_mixed_timings,
+            legacy_rgbw_small_counts=parsed.legacy_rgbw_small_counts,
             chipset=parsed.chipset,
             net_server=parsed.net_server,
             net_client=parsed.net_client,
             net=parsed.net,
+            net_peer=parsed.net_peer,
+            peer_environment=parsed.peer_environment,
+            peer_upload_port=parsed.peer_upload_port,
             ota=parsed.ota,
             ble=parsed.ble,
             parallel=parsed.parallel,
             decode=parsed.decode,
             pin_toggle_rx=parsed.pin_toggle_rx,
             ws2812_loopback=parsed.ws2812_loopback,
+            pwm_dma_cl=parsed.pwm_dma_cl,
+            dma_spi=parsed.dma_spi,
+            dma_uart=parsed.dma_uart,
+            rp_spi_loopback=parsed.rp_spi_loopback,
+            rp_spi_index=parsed.rp_spi_index,
+            rp_spi_public_api=parsed.rp_spi_public_api,
+            rp_spi_chipset=parsed.rp_spi_chipset,
+            rp_uart_index=parsed.rp_uart_index,
+            rp_pio_index=parsed.rp_pio_index,
+            rp_pio_both=parsed.rp_pio_both,
+            test_fault_emit=parsed.test_fault_emit,
             frames=parsed.frames,
             tight_timing=parsed.tight_timing,
             tight_timing_iterations=parsed.tight_timing_iterations,

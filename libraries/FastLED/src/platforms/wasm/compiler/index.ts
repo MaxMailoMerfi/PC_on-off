@@ -26,7 +26,7 @@ import { JsonUiManager } from './modules/ui/ui_manager.ts';
 
 // Graphics System imports
 import { GraphicsManager } from './modules/graphics/graphics_manager.ts';
-import { GraphicsManagerThreeJS } from './modules/graphics/graphics_manager_threejs.ts';
+import { GraphicsManagerGfx } from './modules/graphics/graphics_manager_gfx.ts';
 
 // Utility imports
 import { JsonInspector } from './modules/utils/json_inspector.ts';
@@ -68,8 +68,9 @@ console.log(`⭐ index.js loading, URL: ${window.location.href}`);
  *
  * The WASM build pipeline emits `asset_manifest.json` alongside `fastled.js`.
  * The manifest maps sketch-relative asset paths (e.g. "data/track.mp3") to
- * `{url, sha256, fallback}`. sha256 and fallback are parsed but NOT enforced
- * by v1 — they are reserved for future integrity/retry features.
+ * `{url, sha256, fallback}`. `resolveManifestAssets()` below fetches each
+ * asset, retries `fallback` when the primary URL fails, and verifies the bytes
+ * against `sha256` before the sketch can read them (issue #4025).
  *
  * We expose the manifest as `window.fastledAssetManifest` so C++-side
  * `fl::resolve_asset()` consumers (populated via register_asset calls in
@@ -111,25 +112,37 @@ console.log(`⭐ index.js loading, URL: ${window.location.href}`);
 
 /**
  * Browser Compatibility Check
- * FastLED WASM requires OffscreenCanvas and WebGL2 support for Web Worker mode
+ *
+ * WebGL2 on a regular canvas is required. WebGL2 on an OffscreenCanvas lets
+ * the Web Worker render directly; when it is missing (WebKitGTK, which backs
+ * the Tauri viewer on Linux, has OffscreenCanvas but no WebGL on it) the
+ * worker still runs the sketch and posts frames to the main thread, which
+ * draws them. FastLEDWorkerManager detects that itself; this only warns.
  */
 (function checkBrowserCompatibility() {
   const errors = [];
 
-  // Check OffscreenCanvas support
-  if (typeof OffscreenCanvas === 'undefined') {
-    errors.push('OffscreenCanvas not supported');
-  } else {
-    // Check WebGL2 support with OffscreenCanvas
-    try {
-      const testCanvas = new OffscreenCanvas(1, 1);
-      const ctx = testCanvas.getContext('webgl2');
-      if (!ctx) {
-        errors.push('WebGL2 not supported with OffscreenCanvas');
-      }
-    } catch (error) {
-      errors.push(`OffscreenCanvas WebGL2 test failed: ${error.message}`);
+  // WebGL2 on a regular canvas is the hard requirement
+  try {
+    const ctx = document.createElement('canvas').getContext('webgl2');
+    if (!ctx) {
+      errors.push('WebGL2 not supported');
     }
+  } catch (error) {
+    errors.push(`WebGL2 test failed: ${error.message}`);
+  }
+
+  // WebGL2 on an OffscreenCanvas is optional: without it frames are drawn on the main thread
+  let offscreenWebGL2 = false;
+  if (typeof OffscreenCanvas !== 'undefined') {
+    try {
+      offscreenWebGL2 = !!new OffscreenCanvas(1, 1).getContext('webgl2');
+    } catch (error) {
+      offscreenWebGL2 = false;
+    }
+  }
+  if (!offscreenWebGL2) {
+    console.warn('WebGL2 on OffscreenCanvas is unavailable; frames will be rendered on the main thread');
   }
 
   if (errors.length > 0) {
@@ -390,12 +403,15 @@ console.error = _prev_error;
  */
 function jsAppendFileRaw(moduleInstance, path_cstr, data_cbytes, len_int) {
   // Stream this chunk
-  moduleInstance.ccall(
+  const appended = moduleInstance.ccall(
     'jsAppendFile',
     'number', // return value
     ['number', 'number', 'number'], // argument types, not sure why numbers works.
     [path_cstr, data_cbytes, len_int],
   );
+  if (!appended) {
+    throw new Error('WASM filesystem rejected the file append');
+  }
 }
 
 /**
@@ -405,14 +421,19 @@ function jsAppendFileRaw(moduleInstance, path_cstr, data_cbytes, len_int) {
  * @param {Uint8Array} blob - File data as byte array
  */
 function jsAppendFileUint8(moduleInstance, path, blob) {
+  if (blob.length === 0) return; // The declaration already created an empty file.
   const n = moduleInstance.lengthBytesUTF8(path) + 1;
   const path_cstr = moduleInstance._malloc(n);
-  moduleInstance.stringToUTF8(path, path_cstr, n);
-  const ptr = moduleInstance._malloc(blob.length);
-  moduleInstance.HEAPU8.set(blob, ptr);
-  jsAppendFileRaw(moduleInstance, path_cstr, ptr, blob.length);
-  moduleInstance._free(ptr);
-  moduleInstance._free(path_cstr);
+  let ptr = 0;
+  try {
+    moduleInstance.stringToUTF8(path, path_cstr, n);
+    ptr = moduleInstance._malloc(blob.length);
+    moduleInstance.HEAPU8.set(blob, ptr);
+    jsAppendFileRaw(moduleInstance, path_cstr, ptr, blob.length);
+  } finally {
+    if (ptr) moduleInstance._free(ptr);
+    moduleInstance._free(path_cstr);
+  }
 }
 
 /**
@@ -482,7 +503,7 @@ function updateCanvas(frameData) {
         // Default to ThreeJS renderer (gfx=1) if no parameter specified
         const explicitlyRequested = FORCE_THREEJS_RENDERER ? 'gfx=1' : 'default (gfx=1)';
         console.log(`Creating Beautiful GraphicsManager with canvas ID (${explicitlyRequested})`, canvasId);
-        graphicsManager = new GraphicsManagerThreeJS(currentGraphicsArgs);
+        graphicsManager = new GraphicsManagerGfx(currentGraphicsArgs);
       }
     } catch (error) {
       console.error('Failed to create graphics manager:', error);
@@ -581,12 +602,14 @@ async function FastLED_SetupAndLoop(moduleInstance, frame_rate) {
 
     FASTLED_DEBUG_LOG('INDEX_JS', 'Controller setup completed, initializing worker mode...');
 
-    // Initialize Web Worker mode for background thread rendering (always enabled)
     const canvas = /** @type {HTMLCanvasElement | null} */ (document.getElementById('myCanvas'));
     if (!canvas) {
       throw new Error('Canvas element not found');
     }
 
+    // Web Worker mode for background thread rendering (always enabled). When
+    // the browser has no WebGL2 on OffscreenCanvas the worker still runs the
+    // sketch and posts frames back for main-thread rendering.
     FASTLED_DEBUG_LOG('INDEX_JS', 'Initializing Web Worker mode with OffscreenCanvas...');
     await fastLEDController.initializeWorkerMode(canvas, {
       maxRetries: 3
@@ -645,13 +668,14 @@ async function FastLED_SetupAndLoop(moduleInstance, frame_rate) {
       FASTLED_DEBUG_LOG('INDEX_JS', 'Setting up performance monitoring...');
       setInterval(() => {
         const fps = fastLEDController.getFPS();
+        const renderFps = fastLEDController.getRenderFPS();
         const frameTime = fastLEDController.getAverageFrameTime();
 
         // Record performance metrics
         fastLEDPerformanceMonitor.recordFrameTime(frameTime);
 
         // Update display
-        fpsDisplay.textContent = `FPS: ${fps.toFixed(1)} | Frame: ${frameTime.toFixed(1)}ms`;
+        fpsDisplay.textContent = `FPS: ${fps.toFixed(1)} | Render: ${renderFps.toFixed(1)} fps | Loop: ${frameTime.toFixed(2)}ms`;
 
         // Monitor memory usage if available
         if (performance.memory) {
@@ -730,6 +754,134 @@ async function FastLED_SetupAndLoop(moduleInstance, frame_rate) {
  * @param {Object} moduleInstance - The loaded WASM module instance
  * @param {Array<Object>} filesJson - Array of files to load into the virtual filesystem
  */
+/** How long a single asset may take to fetch before the preview gives up. */
+const assetFetchTimeoutMs = 30000;
+
+/**
+ * Hex-encodes a SHA-256 digest of the given bytes.
+ * @param {Uint8Array} bytes
+ * @returns {Promise<string>} lowercase hex, or '' if the platform has no SubtleCrypto
+ */
+async function sha256Hex(bytes) {
+  if (!globalThis.crypto || !globalThis.crypto.subtle) return '';
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/**
+ * Fetches one asset, following its declared `fallback` if the primary fails.
+ * @returns {Promise<{bytes: Uint8Array, cleanEnd: boolean}|null>}
+ */
+async function fetchAssetBytes(path, spec) {
+  const urls = [spec.url, spec.fallback].filter(Boolean);
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(assetFetchTimeoutMs) });
+      if (!response.ok) {
+        console.warn(`Asset '${path}': ${response.status} from ${url}`);
+        continue;
+      }
+      // Buffered rather than streamed on purpose. These assets must be whole
+      // before setup() anyway, and holding the bytes gives an exact length
+      // without depending on Content-Length -- which many hosts omit, exactly
+      // where a truncated download is most likely -- and allows the declared
+      // digest to be checked before anything reaches the sketch.
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (url !== spec.url) {
+        console.log(`Asset '${path}': primary failed, served from fallback ${url}`);
+      }
+      // A resolved arrayBuffer() means the response body reached a clean end.
+      // Keep that fact explicit so unknown-size assets still have a meaningful
+      // completeness signal independent of future digest verification.
+      return { bytes, cleanEnd: true };
+    } catch (err) {
+      const why = (err && err.name === 'TimeoutError')
+        ? `timed out after ${assetFetchTimeoutMs}ms`
+        : String(err);
+      console.warn(`Asset '${path}' from ${url}: ${why}`);
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolves `window.fastledAssetManifest` entries into virtual-filesystem
+ * entries (FastLED issue #2284).
+ *
+ * A `.lnk` / `assets.json` asset lives at a remote URL and has no local file,
+ * so `files.json` cannot list it -- for a sketch whose only asset is a `.lnk`,
+ * `files.json` is literally `[]`. Without this the manifest only ever handed
+ * C++ a URL to stream, so `fl::getEmbeddedFs()` had nothing to read and a
+ * sketch written against ESP LittleFS could not be previewed.
+ *
+ * Each asset is fetched whole, verified against its declared `sha256`, and
+ * only then handed on. A failure here is reported and the asset dropped: the
+ * sketch still starts, because a preview that never runs tells the user less
+ * than one that runs with a missing file and says so.
+ *
+ * @param {Object} manifest - path -> {url, sha256, fallback, size?}
+ * @returns {Promise<Array<Object>>} records shaped like `files.json` entries,
+ *   each carrying the verified `bytes`.
+ */
+async function resolveManifestAssets(manifest) {
+  const entries = Object.entries(manifest || {});
+  if (entries.length === 0) return [];
+
+  const resolved = await Promise.all(entries.map(async ([path, spec]) => {
+    if (!spec || !spec.url) {
+      console.warn(`Asset '${path}' has no url; skipping`);
+      return null;
+    }
+    const fetched = await fetchAssetBytes(path, spec);
+    if (!fetched || !fetched.cleanEnd) {
+      console.error(`Asset '${path}' could not be fetched; the sketch will see no such file`);
+      return null;
+    }
+    const { bytes } = fetched;
+
+    if (spec.sha256) {
+      const actual = await sha256Hex(bytes);
+      if (!actual) {
+        // Fail closed: a declared digest that cannot be checked (no
+        // SubtleCrypto, e.g. an insecure origin) must not admit the bytes.
+        console.error(
+          `Asset '${path}' declares a sha256 but SubtleCrypto is unavailable; cannot verify. Dropping it.`,
+        );
+        return null;
+      }
+      if (actual !== String(spec.sha256).toLowerCase()) {
+        console.error(
+          `Asset '${path}' failed integrity check: declared ${spec.sha256}, got ${actual}. Dropping it.`,
+        );
+        return null;
+      }
+      console.log(`Asset '${path}' sha256 verified`);
+    } else {
+      console.warn(`Asset '${path}' declares no sha256; contents are unverified`);
+    }
+
+    const hasDeclaredSize = spec.size !== undefined && spec.size !== null;
+    if (!hasDeclaredSize) {
+      console.warn(
+        `Asset '${path}' has no declared size; completeness was verified by clean stream end only`,
+      );
+    } else if (Number(spec.size) !== bytes.length) {
+      console.error(
+        `Asset '${path}' is incomplete: declared size ${spec.size} but received ${bytes.length} bytes. Dropping it.`,
+      );
+      return null;
+    }
+    console.log(`Asset '${path}' -> ${spec.url} (${bytes.length} bytes)`);
+    // `embedded` marks this as backing fl::getEmbeddedFs(), which forces full
+    // load before setup() -- see the ordering below. The size is the real byte
+    // count, so the completeness check downstream can never be skipped.
+    return { path, size: bytes.length, bytes, embedded: true };
+  }));
+  return resolved.filter(Boolean);
+}
+
 async function fastledLoadSetupLoop(
   frame_rate,
   moduleInstance,
@@ -737,20 +889,50 @@ async function fastledLoadSetupLoop(
 ) {
   console.log('Calling setup function...');
 
+  // Remote assets become filesystem entries alongside the local ones, so
+  // everything downstream -- declaration, streaming, fl::FileSystem -- treats
+  // them identically and neither C++ nor the loader needs to know the
+  // difference.
+  const manifestFiles = await resolveManifestAssets((window as any).fastledAssetManifest);
+  if (manifestFiles.length > 0) {
+    console.log(`Injecting ${manifestFiles.length} manifest asset(s) into the filesystem`);
+    filesJson = (filesJson || []).concat(manifestFiles);
+  }
+
   const fileManifest = getFileManifestJson(filesJson, frame_rate);
   moduleInstance.cwrap('fastled_declare_files', null, ['string'])(JSON.stringify(fileManifest));
   console.log('Files JSON:', filesJson);
 
   /**
-   * Processes a single file by streaming it to the WASM module
-   * @async
-   * @param {Object} file - File object with path and data
-   * @param {string} file.path - File path in the virtual filesystem
-   * @param {number} file.size - File size in bytes
+   * Streams one file into the WASM filesystem.
+   *
+   * Returns the number of bytes actually written so the caller can verify a
+   * file arrived whole. A short read is otherwise invisible: `FileData` keeps
+   * the declared capacity, so `is_eof()` stays false while `read()` returns 0,
+   * and a sketch waits forever on bytes that are never coming.
+   *
+   * @param {Object} file - {path, size, response?}
+   * @returns {Promise<{written: number, cleanEnd: boolean}>} transfer result
    */
   const processFile = async (file) => {
+    let written = 0;
     try {
-      const response = await fetch(file.path);
+      // Manifest assets arrive already fetched and verified, so they are
+      // injected in one shot; local files are still streamed by path.
+      if (file.bytes) {
+        jsAppendFileUint8(moduleInstance, file.path, file.bytes);
+        console.log(`File fetched: ${file.path}, size: ${file.bytes.length}`);
+        return { written: file.bytes.length, cleanEnd: true };
+      }
+      const response = await fetch(file.path, {
+        signal: AbortSignal.timeout(assetFetchTimeoutMs),
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} ${response.statusText}`);
+      }
+      if (!response.body) {
+        throw new Error('response has no readable body');
+      }
       const reader = response.body.getReader();
 
       console.log(`File fetched: ${file.path}, size: ${file.size}`);
@@ -761,9 +943,14 @@ async function fastledLoadSetupLoop(
         if (done) break;
         // Allocate and copy chunk data
         jsAppendFileUint8(moduleInstance, file.path, value);
+        written += value.length;
       }
+      return { written, cleanEnd: true };
     } catch (error) {
-      console.error(`Error processing file ${file.path}:`, error);
+      const why = (error && error.name === 'TimeoutError')
+        ? `timed out after ${assetFetchTimeoutMs}ms`
+        : String(error);
+      throw new Error(`Asset '${file.path}' could not be loaded: ${why}`);
     }
   };
 
@@ -774,13 +961,33 @@ async function fastledLoadSetupLoop(
    * @param {Function} [onComplete] - Optional callback when all files are loaded
    */
   const fetchAllFiles = async (filesJson, onComplete) => {
-    const promises = filesJson.map(async (file) => {
-      await processFile(file);
-    });
-    await Promise.all(promises);
+    const results = await Promise.allSettled(filesJson.map(processFile));
+    const failures = [];
+    for (const [index, result] of results.entries()) {
+      if (result.status === 'rejected') {
+        failures.push(result.reason);
+        console.error(result.reason);
+        continue;
+      }
+      const declaredSize = filesJson[index].size;
+      const complete = result.value.cleanEnd
+        && (declaredSize === undefined || declaredSize === null
+          || result.value.written === Number(declaredSize));
+      if (!complete) {
+        const error = new Error(
+          `Asset '${filesJson[index].path}' is incomplete: wrote ${result.value.written} of ${declaredSize} bytes.`,
+        );
+        failures.push(error);
+        console.error(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `${failures.length} required asset(s) failed to load`);
+    }
     if (onComplete) {
       onComplete();
     }
+    return results;
   };
 
   // NOTE: Callback functions are now automatically registered by importing fastled_callbacks.js
@@ -801,14 +1008,63 @@ async function fastledLoadSetupLoop(
     console.log('FastLED Event System ready with stats:', fastLEDEvents.getEventStats());
   }
 
-  // Come back to this later - we want to partition the files into immediate and streaming files
-  // so that large projects don't try to download ALL the large files BEFORE setup/loop is called.
-  const [immediateFiles, streamingFiles] = partition(filesJson, ['.json', '.csv', '.txt', '.cfg']);
+  // Assets declared through the manifest back `fl::getEmbeddedFs()`, which on
+  // a device is LittleFS -- and on a device those files are simply *there*
+  // when setup() runs. Streaming them during loop() would make the browser
+  // diverge from the hardware in the way that matters most: a sketch reading
+  // an asset in setup() would see an empty file in the preview and a complete
+  // one on an ESP32, and the preview would be quietly lying.
+  //
+  // So embedded assets are always immediate and always awaited to completion,
+  // regardless of extension or size. Ordinary `files.json` entries are also
+  // streamed into the virtual filesystem, but the bounded fetch is awaited so
+  // setup() never observes a partially loaded declared file.
+  const embeddedFiles = filesJson.filter((f) => f.embedded);
+  const localFiles = filesJson.filter((f) => !f.embedded);
+
+  const [immediateFiles, streamingFiles] = partition(localFiles, ['.json', '.csv', '.txt', '.cfg']);
+  if (embeddedFiles.length > 0) {
+    console.log(
+      'Embedded filesystem assets loaded fully before setup() (LittleFS parity):',
+      embeddedFiles.map((f) => f.path),
+    );
+  }
   console.log(
     'The following files will be immediatly available and can be read during setup():',
     immediateFiles,
   );
-  console.log('The following files will be streamed in during loop():', streamingFiles);
+  console.log('The following files will be streamed before setup():', streamingFiles);
+
+  // Embedded assets must be whole before setup(), and verified whole: a
+  // truncated download leaves FileData with its declared capacity intact, so
+  // is_eof() stays false while read() returns 0 -- a sketch would block on
+  // bytes that are never coming, with nothing in the log to explain it.
+  const embeddedResults = await Promise.allSettled(embeddedFiles.map(processFile));
+  const embeddedComplete = embeddedResults.map((result, index) => {
+    const file = embeddedFiles[index];
+    if (result.status === 'rejected') {
+      console.error(result.reason);
+      return false;
+    }
+    // No `size === 0` escape hatch: an embedded asset's size is the real byte
+    // count from its buffer, so the check cannot silently disable itself the
+    // way it did when the size came from a possibly-absent Content-Length.
+    const { written, cleanEnd } = result.value;
+    const complete = cleanEnd && written === file.size;
+    if (!complete) {
+      console.error(
+        `Embedded asset '${file.path}' is incomplete: wrote ${written} of ${file.size} bytes. `
+        + 'The filesystem will report the declared size while reads return nothing.',
+      );
+    }
+    return complete;
+  });
+  if (embeddedFiles.length > 0 && embeddedComplete.every(Boolean)) {
+    console.log(`All ${embeddedFiles.length} embedded asset(s) loaded completely before setup().`);
+  }
+  if (embeddedComplete.some((complete) => !complete)) {
+    throw new Error('One or more required embedded assets failed to load completely');
+  }
 
   const promiseImmediateFiles = fetchAllFiles(immediateFiles, () => {
     if (immediateFiles.length !== 0) {
@@ -817,13 +1073,9 @@ async function fastledLoadSetupLoop(
   });
   await promiseImmediateFiles;
   if (streamingFiles.length > 0) {
-    const streamingFilesPromise = fetchAllFiles(streamingFiles, () => {
+    await fetchAllFiles(streamingFiles, () => {
       console.log('All streaming files downloaded to FastLED.');
     });
-    const delay = new Promise((r) => { setTimeout(r, 250); });
-    // Wait for either the time delay or the streaming files to be processed, whichever
-    // happens first.
-    await Promise.any([delay, streamingFilesPromise]);
   }
 
   console.log('Starting fastled with Asyncify support');

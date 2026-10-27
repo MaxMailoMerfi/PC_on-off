@@ -9,17 +9,26 @@ import sys
 import time
 from pathlib import Path
 
-from playwright.async_api import ConsoleMessage, async_playwright
+from playwright.async_api import ConsoleMessage, Response, async_playwright
 from rich.console import Console
 from rich.panel import Panel
+from running_process import RunningProcess
 
 from ci.util.global_interrupt_handler import handle_keyboard_interrupt
+from ci.wasm_build import resolve_example_dir
 
 
 HERE = Path(__file__).parent
 PROJECT_ROOT = HERE.parent
 
 console = Console()
+stderr_console = Console(stderr=True)
+
+
+def _render_smoke_succeeded(state: dict[str, object]) -> bool:
+    """Return whether the browser has produced at least one rendered frame."""
+    frame_count = state.get("frameCount", 0)
+    return isinstance(frame_count, (int, float)) and frame_count > 0
 
 
 def parse_args():
@@ -31,12 +40,20 @@ def parse_args():
         "example",
         nargs="?",
         default="wasm",
-        help="Example name to test (e.g., 'Blink', 'wasm')",
+        help="Example to test: a bare name ('Blink') or an examples-relative "
+        "path ('Fx/FxCylon')",
     )
     parser.add_argument(
         "--gfx",
-        default="0",
-        help="Graphics mode parameter (default: 0)",
+        default=None,
+        help="Graphics mode override (0=legacy 2D, 1=shared gfx renderer). "
+        "Default: no parameter, exercising the renderer users actually get.",
+    )
+    parser.add_argument(
+        "--allow-console-errors",
+        action="store_true",
+        help="Report browser console errors without failing the test "
+        "(default: any console error or uncaught page exception fails).",
     )
     return parser.parse_args()
 
@@ -45,8 +62,10 @@ def parse_args():
 def install_playwright_browsers():
     console.print("[dim]Installing Playwright browsers...[/dim]")
     try:
-        # Simulate the `playwright install` command
-        os.system(f"{sys.executable} -m playwright install chromium")
+        RunningProcess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False,
+        )
         console.print("[dim]Playwright browsers ready.[/dim]")
     except KeyboardInterrupt as ki:
         handle_keyboard_interrupt(ki)
@@ -147,7 +166,10 @@ async def main() -> None:
 
     # Start the HTTP server
     os.chdir(str(PROJECT_ROOT))
-    directory = Path(f"examples/{args.example}/fastled_js")
+    # Accept a bare name or an examples-relative path; resolve_example_dir
+    # finds the sketch either way, so a nested example is served from the
+    # directory the build actually wrote to.
+    directory = resolve_example_dir(args.example) / "fastled_js"
     console.print(f"[cyan]Testing example:[/cyan] [bold]{args.example}[/bold]")
     console.print(f"[dim]Server directory: {directory}[/dim]")
     server_process = start_http_server(port=port, directory=directory)
@@ -190,20 +212,49 @@ async def main() -> None:
                     text = msg.text
                     if msg.type in ("error", "warn"):
                         browser_errors.append(f"[{msg.type}] {text}")
+                    if msg.type == "error":
+                        stderr_console.print(
+                            f"[WASM browser error] {text}", markup=False
+                        )
                     if "INVALID_OPERATION" in text:
-                        console.print(
-                            "[bold red]INVALID_OPERATION detected in console log[/bold red]"
+                        stderr_console.print(
+                            "[WASM browser error] INVALID_OPERATION detected in console log",
+                            markup=False,
                         )
 
                 page.on("console", console_log_handler)
 
                 # Also capture page errors (uncaught exceptions)
                 def page_error_handler(error: Exception) -> None:
-                    browser_errors.append(f"[error] Page error: {error}")
+                    message = f"[error] Page error: {error}"
+                    browser_errors.append(message)
+                    stderr_console.print(
+                        f"[WASM browser error] {message}", markup=False
+                    )
 
                 page.on("pageerror", page_error_handler)
 
-                test_url = f"http://localhost:{port}/?gfx={args.gfx}"
+                # Browser fetch failures are not guaranteed to emit a console
+                # error. Treat HTTP failures as diagnostics too, so a missing
+                # manifest or worker resource cannot make --check look green.
+                def response_handler(response: Response) -> None:
+                    # /favicon.ico is requested by the browser itself, not by
+                    # the sketch, and the generated page ships no icon. Its 404
+                    # says nothing about whether FastLED loaded.
+                    if response.url.endswith("/favicon.ico"):
+                        return
+                    if response.status >= 400:
+                        message = f"[error] HTTP {response.status}: {response.url}"
+                        browser_errors.append(message)
+                        stderr_console.print(
+                            f"[WASM browser error] {message}", markup=False
+                        )
+
+                page.on("response", response_handler)
+
+                test_url = f"http://localhost:{port}/"
+                if args.gfx is not None:
+                    test_url += f"?gfx={args.gfx}"
                 console.print(f"[dim]Navigating to: {test_url}[/dim]")
                 await page.goto(
                     test_url,
@@ -242,7 +293,7 @@ async def main() -> None:
                     call_count = result.get("frameCount", 0)
                     controller_running = result.get("controllerRunning", False)
                     worker_active = result.get("workerActive", False)
-                    is_alive = call_count > 0 or controller_running or worker_active
+                    is_alive = _render_smoke_succeeded(result)
 
                     if is_alive:
                         break
@@ -287,9 +338,26 @@ async def main() -> None:
                 else:
                     console.print()
                     console.print(
-                        f"[bold red]✗ Error:[/bold red] FastLED.js failed to initialize within {max_wait_ms // 1000} seconds",
+                        f"[bold red]✗ Error:[/bold red] FastLED.js rendered no frames "
+                        f"within {max_wait_ms // 1000} seconds "
+                        f"(frames={call_count}, controller_running={controller_running}, "
+                        f"worker_active={worker_active})",
                     )
-                    raise Exception("FastLED.js failed to initialize")
+                    raise Exception("FastLED.js failed to render a frame")
+
+                # Rendering alone is not success: any console error or uncaught
+                # page exception fails the run so runtime regressions (bad
+                # screenmaps, 404'd resources, worker crashes) can't ship
+                # silently. Opt out with --allow-console-errors.
+                fatal_errors = [e for e in browser_errors if e.startswith("[error]")]
+                if fatal_errors and not args.allow_console_errors:
+                    console.print(
+                        f"[bold red]✗ Error:[/bold red] {len(fatal_errors)} browser console "
+                        "error(s) detected (pass --allow-console-errors to downgrade)"
+                    )
+                    raise Exception(
+                        f"Browser console errors detected: {fatal_errors[:5]}"
+                    )
 
             except KeyboardInterrupt as ki:
                 handle_keyboard_interrupt(ki)

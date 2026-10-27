@@ -37,57 +37,63 @@ public:
   static constexpr u32 GPIO_BIT_CLEAR_REG = PIN < 32 ? GPIO_OUT_W1TC_REG : GPIO_OUT1_W1TC_REG;
   #endif
 
-  inline static void setOutput() FL_NOEXCEPT {
+  inline static void setOutput() FL_NO_EXCEPT {
       FL_STATIC_ASSERT(validpin(), "This pin has been marked as an invalid pin, common reasons includes it being a ground pin, read only, or too noisy (e.g. hooked up to the uart).");
       pinMode(PIN, PinMode::Output);
   }
   inline static void setInput() { pinMode(PIN, PinMode::Input); }
 
-  inline static void hi() FL_NOEXCEPT __attribute__ ((always_inline)) {
+  inline static void hi() FL_NO_EXCEPT __attribute__ ((always_inline)) {
       *sport() = MASK;
   }
 
-  inline static void lo() FL_NOEXCEPT __attribute__ ((always_inline)) {
+  inline static void lo() FL_NO_EXCEPT __attribute__ ((always_inline)) {
       *cport() = MASK;
   }
 
-  inline static void set(FASTLED_REGISTER port_t val) FL_NOEXCEPT __attribute__ ((always_inline)) {
+  inline static void set(FASTLED_REGISTER port_t val) FL_NO_EXCEPT __attribute__ ((always_inline)) {
       *port() = val;
   }
 
   inline static void strobe() __attribute__ ((always_inline)) { toggle(); toggle(); }
 
-  inline static void toggle() FL_NOEXCEPT __attribute__ ((always_inline)) {
-      *port() ^= MASK;
+  inline static void toggle() FL_NO_EXCEPT __attribute__ ((always_inline)) {
+      // Never read-modify-write GPIO_OUT: a concurrent GPIO update could be
+      // overwritten. Use the per-bit atomic set/clear registers instead.
+      if (isset()) {
+          lo();
+      } else {
+          hi();
+      }
   }
 
   inline static void hi(FASTLED_REGISTER port_ptr_t port) __attribute__ ((always_inline)) { hi(); }
   inline static void lo(FASTLED_REGISTER port_ptr_t port) __attribute__ ((always_inline)) { lo(); }
   inline static void fastset(FASTLED_REGISTER port_ptr_t port, FASTLED_REGISTER port_t val) __attribute__ ((always_inline)) { *port = val; }
 
-  inline static port_t hival() FL_NOEXCEPT __attribute__ ((always_inline)) {
+  inline static port_t hival() FL_NO_EXCEPT __attribute__ ((always_inline)) {
       return (*port()) | MASK;
   }
 
-  inline static port_t loval() FL_NOEXCEPT __attribute__ ((always_inline)) {
+  inline static port_t loval() FL_NO_EXCEPT __attribute__ ((always_inline)) {
       return (*port()) & ~MASK;
   }
 
-  inline static port_ptr_t port() FL_NOEXCEPT __attribute__ ((always_inline)) {
+  inline static port_ptr_t port() FL_NO_EXCEPT __attribute__ ((always_inline)) {
       return (port_ptr_t)GPIO_REG;
   }
 
-  inline static port_ptr_t sport() FL_NOEXCEPT __attribute__ ((always_inline)) {
+  inline static port_ptr_t sport() FL_NO_EXCEPT __attribute__ ((always_inline)) {
       return (port_ptr_t)GPIO_BIT_SET_REG;
   }
 
-  inline static port_ptr_t cport() FL_NOEXCEPT __attribute__ ((always_inline)) {
+  inline static port_ptr_t cport() FL_NO_EXCEPT __attribute__ ((always_inline)) {
       return (port_ptr_t)GPIO_BIT_CLEAR_REG;
   }
 
   inline static port_t mask() __attribute__ ((always_inline)) { return MASK; }
 
-  inline static bool isset() FL_NOEXCEPT __attribute__ ((always_inline)) {
+  inline static bool isset() FL_NO_EXCEPT __attribute__ ((always_inline)) {
       return (*port()) & MASK;
   }
 };
@@ -156,6 +162,82 @@ public:
 #endif
 
 
+
+#endif
+
+// NOTE: outside the FASTLED_UNUSABLE_PIN_MASK guard on purpose. A build that
+// defines its own mask would otherwise skip this default and fall back to pin
+// 3 -- reintroducing exactly the UART collision described below, but only for
+// builds that customize the mask, which is the worst place for it to hide.
+// Default data pin for examples -- see platforms/default_pins.h.
+//
+// Deliberately not 3. On ESP32 classic GPIO 3 is U0RXD, the pin Serial
+// receives on; the mask comments above already flag "GPIO 1 & 3 commonly used
+// for UART". Blink calls Serial.begin(), so the generic fallback of 3 would
+// have an example drive an output onto its own console RX line. GPIO 3 is also
+// a strapping pin on S3 (JTAG source select) and on H2.
+//
+// GPIO 4 is outside FASTLED_UNUSABLE_PIN_MASK for every variant above, is not
+// a UART pin on any of them, and is not reserved for flash or USB-JTAG. It is
+// a boot-strap pin on C6, which is harmless here: strapping pins are sampled
+// at reset and are ordinary outputs afterwards.
+//
+// This is a compile-time default for examples, not a claim about any
+// particular board's wiring. FastLED#4018 tracks the wider per-platform audit.
+#ifndef FL_PIN_CLOCKLESS_1
+#define FL_PIN_CLOCKLESS_1 4
+#endif
+
+// Default SPI pins for examples -- see platforms/default_pins.h.
+//
+// Deliberately not the generic 1/2 fallback: GPIO 1 is U0TXD on ESP32 classic,
+// the pin Serial transmits on, and the mask comments above flag "GPIO 1 & 3
+// commonly used for UART". A clocked chipset defaulting there drives its data
+// line onto the console. GPIO 2 is a strapping pin on classic, C3 and H2.
+//
+// Per-variant, because no single pair is safe across the family: below GPIO 6
+// everything is UART or strapping, 6-17 is flash on one variant or another,
+// and above 17 exceeds the pin count on C2/C3. Each pair below is outside that
+// variant's FASTLED_UNUSABLE_PIN_MASK, is not its UART, and is not a strapping
+// pin for it.
+//
+// Not taken from the Arduino core's MOSI/SCK, though that was the first
+// instinct: those are `static const uint8_t`, not macros, so `#if defined(MOSI)`
+// is always false and the guard silently selects the fallback instead. Seven
+// variants also set `MOSI = -1`, which would fail FastPin<>::validpin().
+//
+// Compile-time defaults for examples, not a claim about any board's wiring.
+// FastLED#4022 tracks confirming these on hardware.
+#if defined(FL_IS_ESP_32S2)
+#define FL_PIN_SPI_DATA_1_DEFAULT 35
+#define FL_PIN_SPI_CLOCK_1_DEFAULT 36
+#elif defined(FL_IS_ESP_32S3)
+#define FL_PIN_SPI_DATA_1_DEFAULT 11
+#define FL_PIN_SPI_CLOCK_1_DEFAULT 12
+#elif defined(FL_IS_ESP_32C3) || defined(FL_IS_ESP_32C2) || defined(FL_IS_ESP_32C5)
+#define FL_PIN_SPI_DATA_1_DEFAULT 7
+#define FL_PIN_SPI_CLOCK_1_DEFAULT 6
+#elif defined(FL_IS_ESP_32C6)
+#define FL_PIN_SPI_DATA_1_DEFAULT 19
+#define FL_PIN_SPI_CLOCK_1_DEFAULT 18
+#elif defined(FL_IS_ESP_32H2)
+#define FL_PIN_SPI_DATA_1_DEFAULT 11
+#define FL_PIN_SPI_CLOCK_1_DEFAULT 10
+#elif defined(FL_IS_ESP_32P4)
+#define FL_PIN_SPI_DATA_1_DEFAULT 23
+#define FL_PIN_SPI_CLOCK_1_DEFAULT 22
+#else
+// ESP32 classic, and any variant this file does not recognise. 23/18 are the
+// conventional VSPI MOSI/SCK and are free of flash, UART and strapping duty.
+#define FL_PIN_SPI_DATA_1_DEFAULT 23
+#define FL_PIN_SPI_CLOCK_1_DEFAULT 18
+#endif
+
+#ifndef FL_PIN_SPI_DATA_1
+#define FL_PIN_SPI_DATA_1 FL_PIN_SPI_DATA_1_DEFAULT
+#endif
+#ifndef FL_PIN_SPI_CLOCK_1
+#define FL_PIN_SPI_CLOCK_1 FL_PIN_SPI_CLOCK_1_DEFAULT
 #endif
 
 

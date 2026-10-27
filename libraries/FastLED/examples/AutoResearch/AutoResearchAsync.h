@@ -9,8 +9,17 @@
 #include "AutoResearchHelpers.h"  // autoResearchSetExclusiveDriverByName
 #include "fl/task/task.h"
 #include "fl/task/executor.h"
+#include "fl/stl/singleton.h"
 
 namespace autoresearch {
+
+struct StubAutorunLedState {
+    CRGB leds[10];
+};
+
+inline StubAutorunLedState& stubAutorunLedState() {
+    return fl::SingletonShared<StubAutorunLedState>::instance();
+}
 
 /// @brief Setup async task for JSON-RPC processing
 /// @param remote_control Reference to RemoteControl singleton
@@ -54,9 +63,7 @@ inline void maybeRegisterStubAutorun(
         AutoResearchRemoteControl& /*remote*/,
         fl::shared_ptr<AutoResearchState> state) {
 #ifdef FL_IS_STUB
-    // Register a task that runs on the next async_run() cycle (during loop())
-    // Note: every_ms(0) fires immediately; after_frame() requires frame-task
-    // dispatch which isn't wired up in the stub example runner.
+    // Register a task that runs on the next async_run() cycle (during loop()).
     fl::task::every_ms(0, FL_TRACE).then([state]() {
         if (!state || state->drivers_available.empty()) {
             FL_ERROR("[STUB CLIENT] No drivers discovered — autoresearch cannot run");
@@ -73,7 +80,7 @@ inline void maybeRegisterStubAutorun(
             fl::makeTimingConfig<fl::TIMING_WS2812B_V5>(), "WS2812B-V5");
 
         // Static LED storage — span must remain valid for the entire call
-        static CRGB stub_leds[10];
+        CRGB* stub_leds = stubAutorunLedState().leds;
         const int num_leds = 10;
 
         // ChannelConfig stores timing by value internally, so passing a local ref is fine

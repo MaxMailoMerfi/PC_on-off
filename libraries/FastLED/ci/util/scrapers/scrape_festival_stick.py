@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 
 import asyncio
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from playwright.async_api import async_playwright
+from running_process import RunningProcess
 
 from ci.util.global_interrupt_handler import handle_keyboard_interrupt
 
@@ -23,7 +23,10 @@ SCREENSHOTS_DIR.mkdir(exist_ok=True)
 def install_playwright_browsers():
     print("Installing Playwright browsers...")
     try:
-        os.system(f"{sys.executable} -m playwright install chromium")
+        RunningProcess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False,
+        )
         print("Playwright browsers installed successfully.")
     except KeyboardInterrupt as ki:
         handle_keyboard_interrupt(ki)

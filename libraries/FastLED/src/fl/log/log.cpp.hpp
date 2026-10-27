@@ -10,6 +10,43 @@
 namespace fl {
 namespace detail {
 
+FL_NO_INLINE const char* log_kind_name(log_kind kind) FL_NO_EXCEPT {
+    switch (kind) {
+    case log_kind::WARN:  return "WARN";
+    case log_kind::ERROR: return "ERROR";
+    case log_kind::INFO:  return "INFO";
+    }
+    return "LOG";
+}
+
+// Writes "<file>(<line>): <KIND>: " with plain prints. Deliberately not
+// fl::printf: every log site reaches this prefix, so a format string here
+// linked the whole printf engine into images whose own logs never format
+// anything (~3 KB on the LPC845; FastLED#4671).
+FL_NO_INLINE void log_emit_prefix(log_kind kind, const char* file,
+                                  int line) FL_NO_EXCEPT {
+    char digits[12];  // "-2147483648" + NUL
+    char* p = digits + sizeof(digits);
+    *--p = '\0';
+    unsigned magnitude = line < 0 ? 0u - static_cast<unsigned>(line)
+                                  : static_cast<unsigned>(line);
+    do {
+        *--p = static_cast<char>('0' + magnitude % 10u);
+        magnitude /= 10u;
+    } while (magnitude != 0u);
+    if (line < 0) {
+        *--p = '-';
+    }
+    fl::print(file);
+    fl::print("(");
+    fl::print(p);
+    fl::print("): ");
+    fl::print(log_kind_name(kind));
+    fl::print(": ");
+}
+
+FL_NO_INLINE void log_emit_newline() FL_NO_EXCEPT { fl::print("\n"); }
+
 // =============================================================================
 // Centralised log emit (#2963 Proposal B, Option 3)
 // =============================================================================
@@ -28,7 +65,7 @@ namespace detail {
 // FL_WARN call site, the inlined `<< file << "(" << line << "): KIND: "`
 // burst (~30-50 B) collapses to one `log_emit` call (~4 B).
 
-FL_NO_INLINE void log_emit(log_kind kind, const char* file, int line, fl::sstream& body) FL_NOEXCEPT {
+FL_NO_INLINE void log_emit(log_kind kind, const char* file, int line, fl::sstream& body) FL_NO_EXCEPT {
     const char* tag;
     switch (kind) {
     case log_kind::WARN:  tag = "): WARN: ";  break;
@@ -47,13 +84,21 @@ FL_NO_INLINE void log_emit(log_kind kind, const char* file, int line, fl::sstrea
     fl::println(body.c_str());
 }
 
+FL_NO_INLINE void log_emit_literal(log_kind kind, const char* file, int line,
+                                   const char* body) FL_NO_EXCEPT {
+    // Prefix + literal + newline, with no formatter involved.
+    log_emit_prefix(kind, file, line);
+    fl::print(body);
+    log_emit_newline();
+}
+
 } // namespace detail
 
 // ============================================================================
 // Debug Output Helpers
 // ============================================================================
 
-const char *fastled_file_offset(const char *file) {
+const char *fastled_file_offset(const char *file) FL_NO_EXCEPT {
     const char *p = file;
     const char *last_slash = nullptr;
 

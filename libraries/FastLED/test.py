@@ -18,6 +18,7 @@ from pathlib import Path
 from ci.early_exit_cache import (
     argv_ultra_early_exit,
     check_single_test_cached,
+    pytest_addopts_active,
 )
 
 
@@ -95,6 +96,8 @@ from ci.util.test_env import (
     setup_environment,
     setup_force_exit,
 )
+from ci.util.test_exceptions import TestExecutionFailedException, TestTimeoutException
+from ci.util.test_runner import _TOP_LEVEL_TEST_TIMEOUT, failed_fingerprint_scopes
 from ci.util.test_types import (
     process_test_flags,
 )
@@ -114,7 +117,7 @@ import threading  # noqa: PLC0415 - lazy import (not at top level to speed up ea
 
 _CANCEL_WATCHDOG = threading.Event()
 
-_TIMEOUT_EVERYTHING = 600
+_TIMEOUT_EVERYTHING = _TOP_LEVEL_TEST_TIMEOUT
 
 _GDB_CRASH_DIR = Path(".gdb_crash")
 _GDB_CRASH_SEEN = _GDB_CRASH_DIR / ".seen"
@@ -183,7 +186,7 @@ def _get_run_platform_backends() -> dict[str, list[str]]:
 
 
 if os.environ.get("GITHUB_ACTIONS"):
-    _TIMEOUT_EVERYTHING = 1200  # Extended timeout for GitHub CI builds
+    _TIMEOUT_EVERYTHING = max(_TIMEOUT_EVERYTHING, 1200)
     ts_print(
         f"GitHub Actions environment detected - using extended timeout: {_TIMEOUT_EVERYTHING} seconds"
     )
@@ -407,7 +410,7 @@ def main() -> None:
         if args.no_interactive:
             os.environ["FASTLED_CI_NO_INTERACTIVE"] = "true"
             os.environ["GITHUB_ACTIONS"] = (
-                "true"  # This ensures all subprocess also run in non-interactive mode
+                "true"  # This ensures all child processes also run in non-interactive mode
             )
 
         # Handle --interactive flag
@@ -444,6 +447,7 @@ def main() -> None:
             args.build_mode if args.build_mode else ("debug" if args.debug else "quick")
         )
         fingerprint_manager = FingerprintManager(cache_dir, build_mode=build_mode)
+        pytest_options_active = pytest_addopts_active()
 
         # Calculate fingerprints
         # OPTIMIZATION: When --no-fingerprint is set, skip computing fingerprints entirely.
@@ -451,7 +455,6 @@ def main() -> None:
         # machines). When --no-fingerprint is used, these values are ignored anyway because
         # rebuild_mode forces all change flags to True. Skipping saves ~2-3s per invocation.
         if args.no_fingerprint:
-            src_code_change = True
             cpp_test_change = True
             examples_change = True
             python_test_change = True
@@ -466,11 +469,6 @@ def main() -> None:
                 _fp_results[name] = fn()
 
             _fp_threads = [
-                threading.Thread(
-                    target=_fp_check,
-                    args=("all", fingerprint_manager.check_all),
-                    daemon=True,
-                ),
                 threading.Thread(
                     target=_fp_check,
                     args=("cpp", lambda: fingerprint_manager.check_cpp(args)),
@@ -496,19 +494,10 @@ def main() -> None:
                 _t.start()
             for _t in _fp_threads:
                 _t.join()
-            src_code_change = _fp_results["all"]
             cpp_test_change = _fp_results["cpp"]
             examples_change = _fp_results["examples"]
             python_test_change = _fp_results["python"]
             wasm_change = _fp_results["wasm"]
-
-        # Handle --docker flag: run tests in Docker container
-        if args.docker:
-            from ci.runners.docker_runner import run_docker_tests
-
-            ts_print("=== Docker Testing ===")
-            exit_code = run_docker_tests(args)
-            sys.exit(exit_code)
 
         # Handle --run flag (unified emulation interface)
         if args.run is not None:
@@ -538,15 +527,7 @@ def main() -> None:
                 sys.exit(1)
 
             # Route to appropriate backend
-            if backend == "qemu":
-                from ci.runners.qemu_runner import run_qemu_tests
-
-                ts_print(f"=== QEMU Testing ({platform}) ===")
-                # Convert --run to --qemu format for backward compatibility
-                args.qemu = args.run
-                run_qemu_tests(args)
-                return
-            elif backend == "avr8js":
+            if backend == "avr8js":
                 from ci.runners.avr8js_runner import run_avr8js_tests
 
                 ts_print(f"=== avr8js Testing ({platform}) ===")
@@ -554,22 +535,21 @@ def main() -> None:
                 run_avr8js_tests(args)
                 return
             else:
+                # ESP32 QEMU goes through fbuild's native runner, mirroring
+                # .github/workflows/qemu_template.yml.
                 ts_print(
-                    f"Error: Unknown backend '{backend}' for platform '{platform}'"
+                    f"Error: No local runner for backend '{backend}' (platform '{platform}')."
+                )
+                ts_print(
+                    "For ESP32 QEMU, stage the example and run fbuild test-emu "
+                    "(see qemu_template.yml)."
                 )
                 sys.exit(1)
 
-        # Handle QEMU testing (deprecated - use --run)
-        if args.qemu is not None:
-            from ci.runners.qemu_runner import run_qemu_tests
-
-            ts_print("=== QEMU Testing ===")
-            ts_print("Note: --qemu is deprecated, use --run instead")
-            run_qemu_tests(args)
-            return
-
         # Track test success/failure for fingerprint status
         tests_passed = False
+        completed_scopes: set[str] = set()
+        failed_scopes: set[str] = set()
 
         try:
             # Run tests using the test runner with sequential example compilation
@@ -662,6 +642,7 @@ def main() -> None:
                             pass  # Fall back to normal execution
 
                     timings = group.run()
+                    completed_scopes.update(("python_test", "examples"))
 
                     # Stop display thread if it was started
                     if display_thread:
@@ -678,6 +659,12 @@ def main() -> None:
                     _thread.interrupt_main()
                     raise
                 except Exception as e:
+                    if isinstance(
+                        e, (TestExecutionFailedException, TestTimeoutException)
+                    ):
+                        failed_scopes.update(failed_fingerprint_scopes(e.failures))
+                    else:
+                        failed_scopes.update(("python_test", "examples"))
                     ts_print(f"Parallel test execution failed: {e}")
                     sys.exit(1)
             else:
@@ -702,17 +689,16 @@ def main() -> None:
                 force_examples_change = (
                     examples_change
                     or (args.examples is not None and len(args.examples) > 0)
+                    or args.example_group is not None
                     or rebuild_mode != RebuildMode.CACHED
                 )
                 force_python_test_change = (
                     python_test_change
                     or (args.test is not None)
+                    or pytest_options_active
                     or rebuild_mode != RebuildMode.CACHED
                 )
                 force_wasm_change = wasm_change or rebuild_mode != RebuildMode.CACHED
-                force_src_code_change = (
-                    src_code_change or rebuild_mode != RebuildMode.CACHED
-                )
 
                 # Only show cache status when it's enabled (the notable case)
                 # When disabled (--no-fingerprint), this is the default so no message needed
@@ -722,14 +708,14 @@ def main() -> None:
                 # entirely on the ultra-early-exit path (cached test result).
                 from ci.util.test_runner import runner as test_runner
 
-                test_runner(
+                completed_scopes = test_runner(
                     args,
-                    force_src_code_change,
                     force_cpp_test_change,
                     force_examples_change,
                     force_python_test_change,
                     force_wasm_change,
                     fingerprint_manager=fingerprint_manager,
+                    failed_scopes=failed_scopes,
                 )
 
             # If we got here, tests passed
@@ -741,21 +727,26 @@ def main() -> None:
                 tests_passed = False
             raise
         finally:
-            # Only save fingerprints when running ALL tests, not specific tests
-            # This prevents running a specific test from marking the full fingerprint as valid
+            # Only full, successfully completed scopes may update their cache.
             # Note: args.examples == [] means "all examples" (e.g., --cpp mode), which is OK
             # args.examples with specific items (e.g., ['Blink']) means specific examples only
             running_specific_examples = (
                 args.examples is not None and len(args.examples) > 0
-            )
+            ) or args.example_group is not None
             running_all_tests = (
                 args.test is None
                 and not running_specific_examples
                 and not args.no_fingerprint
+                and not args.check
+                and not pytest_options_active
             )
             if running_all_tests:
-                status = "success" if tests_passed else "failure"
-                fingerprint_manager.save_all(status)
+                if tests_passed:
+                    for scope in completed_scopes:
+                        fingerprint_manager.save_success(scope)
+                else:
+                    for scope in failed_scopes:
+                        fingerprint_manager.mark_failure(scope)
 
         # Set up force exit daemon and exit
         _ = setup_force_exit()
@@ -786,7 +777,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt as ki:  # noqa: KBI002
         # Top-level safety net: main() already handles cleanup.
         # Print the full exception chain then exit without propagating
-        # KeyboardInterrupt to parent processes (e.g. os.system() callers).
+        # KeyboardInterrupt to parent processes (e.g. shell callers).
         import traceback  # noqa: PLC0415
 
         traceback.print_exception(ki)

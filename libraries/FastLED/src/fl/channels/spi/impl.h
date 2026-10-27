@@ -40,7 +40,7 @@ struct Device::Impl {
 
     /// @brief Constructor
     explicit Impl(const Config& cfg)
-        : config(cfg)
+        FL_NO_EXCEPT : config(cfg)
         , bus_handle()
         , initialized(false)
         , async_state{false, nullptr, nullptr, 0, 0}
@@ -48,7 +48,7 @@ struct Device::Impl {
         , owns_backend(false) {}
 
     /// @brief Destructor
-    ~Impl() FL_NOEXCEPT {
+    ~Impl() FL_NO_EXCEPT {
         FL_LOG_SPI("Device::Impl: Destructor called");
         // Members will be destroyed in reverse order of declaration:
         // 1. owns_backend (bool) - trivial
@@ -76,7 +76,7 @@ struct Transaction::Impl {
 
     /// @brief Constructor
     explicit Impl(Device* dev)
-        : device(dev)
+        FL_NO_EXCEPT : device(dev)
         , completed(false)
         , cancelled(false)
         , result(fl::nullopt)  // nullopt = success

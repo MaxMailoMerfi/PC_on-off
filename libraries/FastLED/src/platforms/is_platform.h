@@ -21,6 +21,7 @@
 /// - FL_IS_STM32_F7: STM32F7 family
 /// - FL_IS_STM32_L4: STM32L4 family (low-power)
 /// - FL_IS_STM32_H7: STM32H7 family (Giga R1, high-performance)
+/// - FL_IS_STM32_G0: STM32G0 family
 /// - FL_IS_STM32_G4: STM32G4 family (motor control)
 /// - FL_IS_STM32_U5: STM32U5 family (ultra-low-power)
 ///
@@ -41,6 +42,7 @@
 /// - FL_IS_SAMD: General SAMD platform (any SAMD board)
 /// - FL_IS_SAMD21: SAMD21 family (Cortex-M0+, Arduino Zero, etc.)
 /// - FL_IS_SAMD51: SAMD51/SAME51 family (Cortex-M4F, Adafruit Metro M4, etc.)
+/// - FL_IS_SAME53: SAME53 family (Cortex-M4F, Teknic ClearCore)
 ///
 /// SAM Platforms (ARM-based):
 /// - FL_IS_SAM: General SAM platform (any SAM board)
@@ -91,6 +93,9 @@
 ///
 /// Apollo3 Platforms:
 /// - FL_IS_APOLLO3: Ambiq Apollo3 platform (SparkFun Artemis family)
+///
+/// Chipintelli Platforms:
+/// - FL_IS_CI13XX: Chipintelli CI1302/CI1303/CI1306 RISC-V platform
 ///
 /// WebAssembly Platforms:
 /// - FL_IS_WASM: WebAssembly platform (Emscripten)
@@ -144,10 +149,12 @@
 #include "platforms/arm/rp/is_rp.h"
 #include "platforms/arm/sam/is_sam.h"
 #include "platforms/arm/samd/is_samd.h"
+#include "platforms/arm/same53/is_same53.h"
 #include "platforms/arm/silabs/is_silabs.h"
 #include "platforms/arm/stm32/is_stm32.h"
 #include "platforms/arm/teensy/is_teensy.h"
 #include "platforms/avr/is_avr.h"
+#include "platforms/ci13xx/is_ci13xx.h"
 #include "platforms/esp/is_esp.h"
 #include "platforms/posix/is_posix.h"
 #include "platforms/stub/is_stub.h"

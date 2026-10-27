@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
+
+from pytest import MonkeyPatch
+from running_process import RunningProcess
 
 from ci import wasm_flags
 
@@ -31,13 +33,30 @@ def test_lib_quick_flags_do_not_emit_dwarf_prefix_maps() -> None:
         assert not flag.startswith("-ffile-prefix-map="), flag
 
 
+def test_extra_defines_apply_to_library_and_sketch(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "FASTLED_WASM_EXTRA_DEFINES",
+        '["FASTLED_MP3_BACKEND_MINIMP3", "VALUE=2"]',
+    )
+
+    for getter in (
+        wasm_flags.get_lib_compile_flags_dict,
+        wasm_flags.get_sketch_compile_flags_dict,
+    ):
+        defines = getter("quick")["defines"]
+        assert "-DFASTLED_MP3_BACKEND_MINIMP3" in defines
+        assert "-DVALUE=2" in defines
+
+
 def test_rglob_outputs_forward_slashes(tmp_path: Path) -> None:
     source_dir = tmp_path / "src"
     nested = source_dir / "platforms" / "shared"
     nested.mkdir(parents=True)
     (nested / "demo.cpp").write_text("int demo = 0;\n", encoding="utf-8")
 
-    result = subprocess.run(
+    result = RunningProcess.run(
         [
             sys.executable,
             str(wasm_flags.PROJECT_ROOT / "ci" / "meson" / "rglob.py"),
@@ -46,7 +65,8 @@ def test_rglob_outputs_forward_slashes(tmp_path: Path) -> None:
         ],
         check=True,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
     assert "\\" not in result.stdout

@@ -3,10 +3,9 @@
 Nordic nRF52 family support.
 
 The maintained backend targets the Adafruit nRF52 / Bluefruit Arduino BSP used
-by FastLED CI. That BSP provides the Nordic SDK headers, FreeRTOS integration,
-SoftDevice support, PWM EasyDMA, and SPIM HAL APIs this backend includes.
-Arduino mbed OS nRF52 boards such as Arduino Nano 33 BLE and Nano 33 BLE Sense
-are not supported by this backend today.
+by FastLED CI and the Seeed XIAO nRF52840 Plus/Sense Plus with Seeed's
+ArduinoCore-mbed. Other Arduino mbed OS nRF52 boards, such as Arduino Nano 33
+BLE and Nano 33 BLE Sense, are not supported by this backend today.
 
 ## Clocked SPI LEDs
 
@@ -38,12 +37,13 @@ the protocol reset interval lands at the desired update time.
 - `fastled_arm_nrf52.h`: Aggregator; includes pin/SPI/clockless and sysdefs.
 - `fastpin_arm_nrf52.h`, `fastpin_arm_nrf52_variants.h`: Pin helpers/variants.
 - `fastspi_arm_nrf52.h`: SPI backend.
-- `clockless_arm_nrf52.h`: Clockless driver.
+- `clockless_arm_nrf52.h`: Clockless driver. The legacy `addLeds<>()` `ClocklessController` is a `fl::SlimBridgeController` (#4595) over a per-specialization `ClocklessNrf52Driver` (`IChannelDriver`) that keeps the PWM EasyDMA sequence engine as the byte emitter; it self-registers with `ChannelManager` from the controller constructor, so sketches without clockless strips link no clockless channel code.
 - `arbiter_nrf52.h`: PWM arbitration utility (selects/guards PWM instances for drivers).
 - `led_sysdefs_arm_nrf52.h`: System defines for nRF52.
 
 
 Notes:
+- `addLeds<APA102>` (and other clocked SPI chipsets) stay on the legacy `SPIOutput` path: the SPI channel adapter has no multi-lane init for the SpiHw2/SpiHw4 instances registered here, and `DATA_RATE_MHZ` is still a clock divider on this platform.
 - Requires `CLOCKLESS_FREQUENCY` definition in many setups; PWM resources may be shared and must be arbitrated.
  - `arbiter_nrf52.h` exposes a small API to acquire/release PWM instances safely across users; ensure ISR handlers are lightweight.
 
@@ -53,10 +53,10 @@ Notes:
 - **`FASTLED_ALLOW_INTERRUPTS`**: Default `1`.
 - **`FASTLED_ALL_PINS_HARDWARE_SPI`**: Enabled by default unless forcing software SPI.
 - **`FASTLED_NRF52_SPIM`**: Select SPIM instance (e.g., `NRF_SPIM0`).
-- **`FASTLED_NRF52_ENABLE_PWM_INSTANCE0`**: Enable PWM instance used by clockless.
+- **`FL_NRF52_ENABLE_PWM_INSTANCE0`**: Enable PWM instance used by clockless.
 - **`FASTLED_NRF52_NEVER_INLINE`**: Controls inlining attribute via `FASTLED_NRF52_INLINE_ATTRIBUTE`.
 - **`FASTLED_NRF52_MAXIMUM_PIXELS_PER_STRING`**: Limit pixels per string in PWM-encoded path (default 144).
-- **`FASTLED_NRF52_PWM_ID`**: Select PWM instance index used.
+- **`FL_NRF52_PWM_ID`**: Select PWM instance index used.
 - **`FASTLED_NRF52_SUPPRESS_UNTESTED_BOARD_WARNING`**: Suppress pin-map warnings for unverified boards.
 - **`FASTLED_NRF52_ALLOW_NFC_PINS`**: Re-enable `P0.09` / `P0.10` (NFC1/NFC2) as valid FastLED output pins on every nRF52840 variant block (SuperMini, nice!nano v2, nRFMicro, XIAO nRF52840, XIAO nRF52840 Sense). Defining this macro is necessary but **not** sufficient: you also need either `CONFIG_NFCT_PINS_AS_GPIOS=1` in the BSP/build flags, **or** a call to `NFC_PINS_AS_GPIO()` at boot (Adafruit nRF52 core helper).
 - **`FASTLED_NRF52_ALLOW_USR_LED`**: Re-enable on-board user-LED pins (`P0.15` SuperMini/nice!nano v2, `P1.10` nRFMicro, and the XIAO RGB LEDs at `P0.26`/`P0.06`/`P0.30`) as valid FastLED output pins. Be careful: defining this risks a clash with any sketch (or BSP background task) that calls `digitalWrite(LED_BUILTIN, ...)` on the same pin.

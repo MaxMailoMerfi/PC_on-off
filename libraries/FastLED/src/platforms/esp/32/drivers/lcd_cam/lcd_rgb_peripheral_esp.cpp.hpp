@@ -41,7 +41,7 @@ namespace detail {
 // Singleton Instance
 //=============================================================================
 
-LcdRgbPeripheralEsp& LcdRgbPeripheralEsp::instance() FL_NOEXCEPT {
+LcdRgbPeripheralEsp& LcdRgbPeripheralEsp::instance() FL_NO_EXCEPT {
     return Singleton<LcdRgbPeripheralEsp>::instance();
 }
 
@@ -66,7 +66,7 @@ LcdRgbPeripheralEsp::~LcdRgbPeripheralEsp() {
 // Lifecycle Methods
 //=============================================================================
 
-bool LcdRgbPeripheralEsp::initialize(const LcdRgbPeripheralConfig& config) FL_NOEXCEPT {
+bool LcdRgbPeripheralEsp::initialize(const LcdRgbPeripheralConfig& config) FL_NO_EXCEPT {
     if (mInitialized) {
         FL_WARN("LcdRgbPeripheralEsp: Already initialized");
         return false;
@@ -109,7 +109,13 @@ bool LcdRgbPeripheralEsp::initialize(const LcdRgbPeripheralConfig& config) FL_NO
     panel_config.timings.v_res = config.v_res;
     panel_config.timings.hsync_pulse_width = 1;
     panel_config.timings.hsync_back_porch = 0;
-    panel_config.timings.hsync_front_porch = 0;
+    // A frame longer than 4096 pixels spans several lines (12-bit
+    // lcd_ha_width). With a zero front porch an ESP32-P4 never finishes a
+    // multi-line frame (no VSYNC, the driver stays busy); one pixel of front
+    // porch fixes that. With the 1-pixel HSYNC that blanks the data line for
+    // ~625 ns between lines, inside the low phase of a line's last bit, which
+    // WS2812-class LEDs accept as a longer low (FastLED#4669).
+    panel_config.timings.hsync_front_porch = 1;
     panel_config.timings.vsync_pulse_width = 1;
     panel_config.timings.vsync_back_porch = 1;
     panel_config.timings.vsync_front_porch = config.vsync_front_porch;
@@ -154,7 +160,7 @@ bool LcdRgbPeripheralEsp::initialize(const LcdRgbPeripheralConfig& config) FL_NO
     return true;
 }
 
-void LcdRgbPeripheralEsp::deinitialize() FL_NOEXCEPT {
+void LcdRgbPeripheralEsp::deinitialize() FL_NO_EXCEPT {
     if (mPanelHandle != nullptr) {
         esp_lcd_panel_del(mPanelHandle);
         mPanelHandle = nullptr;
@@ -165,7 +171,7 @@ void LcdRgbPeripheralEsp::deinitialize() FL_NOEXCEPT {
     mBusy = false;
 }
 
-bool LcdRgbPeripheralEsp::isInitialized() const FL_NOEXCEPT {
+bool LcdRgbPeripheralEsp::isInitialized() const FL_NO_EXCEPT {
     return mInitialized;
 }
 
@@ -173,7 +179,7 @@ bool LcdRgbPeripheralEsp::isInitialized() const FL_NOEXCEPT {
 // Buffer Management
 //=============================================================================
 
-u16* LcdRgbPeripheralEsp::allocateFrameBuffer(size_t size_bytes) FL_NOEXCEPT {
+u16* LcdRgbPeripheralEsp::allocateFrameBuffer(size_t size_bytes) FL_NO_EXCEPT {
     // Round up to 64-byte alignment
     size_t aligned_size = ((size_bytes + 63) / 64) * 64;
 
@@ -202,7 +208,7 @@ u16* LcdRgbPeripheralEsp::allocateFrameBuffer(size_t size_bytes) FL_NOEXCEPT {
     return static_cast<u16*>(buffer);
 }
 
-void LcdRgbPeripheralEsp::freeFrameBuffer(u16* buffer) FL_NOEXCEPT {
+void LcdRgbPeripheralEsp::freeFrameBuffer(u16* buffer) FL_NO_EXCEPT {
     if (buffer != nullptr) {
         heap_caps_free(buffer);
     }
@@ -212,20 +218,25 @@ void LcdRgbPeripheralEsp::freeFrameBuffer(u16* buffer) FL_NOEXCEPT {
 // Transmission Methods
 //=============================================================================
 
-bool LcdRgbPeripheralEsp::drawFrame(const u16* buffer, size_t size_bytes) FL_NOEXCEPT {
+bool LcdRgbPeripheralEsp::drawFrame(const u16* buffer, size_t size_bytes) FL_NO_EXCEPT {
     if (!mInitialized || mPanelHandle == nullptr) {
         return false;
     }
 
     mBusy = true;
 
-    // Calculate width in pixels (each pixel is 2 bytes)
-    size_t width = size_bytes / 2;
+    // The buffer holds whole lines of h_res pixels (2 bytes each).
+    const size_t width = mConfig.h_res;
+    const size_t height = (width > 0) ? size_bytes / (2 * width) : 0;
+    if (width == 0 || height == 0 || height > mConfig.v_res) {
+        mBusy = false;
+        return false;
+    }
 
     esp_err_t err = esp_lcd_panel_draw_bitmap(
         mPanelHandle,
-        0, 0,           // x, y offset
-        width, 1,       // width (pixels), height
+        0, 0,  // x, y offset
+        static_cast<fl::i32>(width), static_cast<fl::i32>(height),
         buffer
     );
 
@@ -245,7 +256,7 @@ bool LcdRgbPeripheralEsp::drawFrame(const u16* buffer, size_t size_bytes) FL_NOE
     return true;
 }
 
-bool LcdRgbPeripheralEsp::waitFrameDone(u32 timeout_ms) FL_NOEXCEPT {
+bool LcdRgbPeripheralEsp::waitFrameDone(u32 timeout_ms) FL_NO_EXCEPT {
     if (!mInitialized) {
         return false;
     }
@@ -259,12 +270,12 @@ bool LcdRgbPeripheralEsp::waitFrameDone(u32 timeout_ms) FL_NOEXCEPT {
                 return false;  // Timeout
             }
         }
-        task::run(250, task::ExecFlags::SYSTEM);  // OS yield
+        task::yield_system(250);  // OS yield
     }
     return true;
 }
 
-bool LcdRgbPeripheralEsp::isBusy() const FL_NOEXCEPT {
+bool LcdRgbPeripheralEsp::isBusy() const FL_NO_EXCEPT {
     return mBusy;
 }
 
@@ -280,6 +291,7 @@ struct VsyncCallbackData {
 };
 
 // Static storage for callback data (singleton peripheral, so one instance suffices)
+// FL_LINT_ALLOW_GLOBAL(Tier 2c: LCD_CAM VSYNC ISR callback state — pending migration to Singleton<T> per FastLED#3491, needs cached-pointer-in-IRAM pattern for ISR safety)
 static VsyncCallbackData s_vsync_cb_data;
 
 // VSYNC ISR callback - must be in IRAM for ESP-IDF
@@ -299,7 +311,7 @@ static bool IRAM_ATTR vsyncIsrCallback( // ok no noexcept
     return false;
 }
 
-bool LcdRgbPeripheralEsp::registerDrawCallback(void* callback, void* user_ctx) FL_NOEXCEPT {
+bool LcdRgbPeripheralEsp::registerDrawCallback(void* callback, void* user_ctx) FL_NO_EXCEPT {
     if (!mInitialized || mPanelHandle == nullptr) {
         return false;
     }
@@ -324,7 +336,7 @@ bool LcdRgbPeripheralEsp::registerDrawCallback(void* callback, void* user_ctx) F
 // State Inspection
 //=============================================================================
 
-const LcdRgbPeripheralConfig& LcdRgbPeripheralEsp::getConfig() const FL_NOEXCEPT {
+const LcdRgbPeripheralConfig& LcdRgbPeripheralEsp::getConfig() const FL_NO_EXCEPT {
     return mConfig;
 }
 
@@ -332,11 +344,11 @@ const LcdRgbPeripheralConfig& LcdRgbPeripheralEsp::getConfig() const FL_NOEXCEPT
 // Platform Utilities
 //=============================================================================
 
-u64 LcdRgbPeripheralEsp::getMicroseconds() FL_NOEXCEPT {
+u64 LcdRgbPeripheralEsp::getMicroseconds() FL_NO_EXCEPT {
     return esp_timer_get_time();
 }
 
-void LcdRgbPeripheralEsp::delay(u32 ms) FL_NOEXCEPT {
+void LcdRgbPeripheralEsp::delay(u32 ms) FL_NO_EXCEPT {
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 

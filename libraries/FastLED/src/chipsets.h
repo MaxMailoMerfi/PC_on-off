@@ -50,6 +50,7 @@
 #include "fl/chipsets/ws2801.h"
 #include "fl/chipsets/p9813.h"
 #include "fl/chipsets/sm16716.h"
+#include "fl/chipsets/my9221.h"
 
 // Platform-specific clockless timing configuration
 //
@@ -203,11 +204,11 @@ class RGBWEmulatedController
 	typedef CONTROLLER ControllerBaseT;
     class ControllerT : public CONTROLLER {
         friend class RGBWEmulatedController<CONTROLLER, RGB_ORDER>;
-        void *callBeginShowLeds(int size) { return ControllerBaseT::beginShowLeds(size); }
-        void callShow(CRGB *data, int nLeds, fl::u8 brightness) {
+        void *callBeginShowLeds(int size) FL_NO_EXCEPT { return ControllerBaseT::beginShowLeds(size); }
+        void callShow(CRGB *data, int nLeds, fl::u8 brightness) FL_NO_EXCEPT {
             ControllerBaseT::show(data, nLeds, brightness);
         }
-        void callEndShowLeds(void *data) { ControllerBaseT::endShowLeds(data); }
+        void callEndShowLeds(void *data) FL_NO_EXCEPT { ControllerBaseT::endShowLeds(data); }
     };
 
 
@@ -219,18 +220,18 @@ class RGBWEmulatedController
 
     /// @brief Constructor with optional RGBW configuration
     /// @param rgbw Configuration for RGBW color conversion (defaults to kRGBWExactColors mode)
-    RGBWEmulatedController(const Rgbw& rgbw = RgbwDefault()) {
+    RGBWEmulatedController(const Rgbw& rgbw = RgbwDefault()) FL_NO_EXCEPT {
         this->setRgbw(rgbw);
     };
 
     /// @brief Destructor - cleans up the internal RGBW buffer
     ~RGBWEmulatedController() = default;
 
-	virtual void *beginShowLeds(int size) override {
+	VIRTUAL_IF_NOT_AVR void *beginShowLeds(int size) FL_NO_EXCEPT OVERRIDE_IF_NOT_AVR {
 		return mController.callBeginShowLeds(Rgbw::size_as_rgb(size));
 	}
 
-	virtual void endShowLeds(void *data) override {
+	VIRTUAL_IF_NOT_AVR void endShowLeds(void *data) FL_NO_EXCEPT OVERRIDE_IF_NOT_AVR {
 		return mController.callEndShowLeds(data);
 	}
 
@@ -241,7 +242,7 @@ class RGBWEmulatedController
     /// 3. Temporarily bypasses color correction/temperature on the base controller
     /// 4. Sends the packed data to the physical LED strip
     /// @param pixels The pixel controller containing RGB data to be converted
-    virtual void showPixels(PixelController<RGB_ORDER, LANES, MASK> &pixels) override {
+    virtual void showPixels(PixelController<RGB_ORDER, LANES, MASK> &pixels) FL_NO_EXCEPT override {
         // Ensure buffer is large enough
         ensureBuffer(pixels.size());
 		Rgbw rgbw = this->getRgbw();
@@ -275,7 +276,7 @@ class RGBWEmulatedController
     /// @brief Initialize the controller and disable the base controller
     /// @details The base controller is kept disabled to prevent it from
     /// refreshing with its own settings. We only enable it temporarily during show().
-    void init() override {
+    void init() FL_NO_EXCEPT override {
 		mController.init();
 		mController.setEnabled(false);
 	}
@@ -284,7 +285,7 @@ class RGBWEmulatedController
     /// @param num_leds Number of RGB LEDs to convert to RGBW
     /// @details Reallocates the buffer if needed, accounting for the 4:3 byte ratio
     /// when packing RGBW data into RGB format
-    void ensureBuffer(fl::i32 num_leds) {
+    void ensureBuffer(fl::i32 num_leds) FL_NO_EXCEPT {
         if (num_leds != mNumRGBLeds) {
             mNumRGBLeds = num_leds;
             // The delegate controller expects the raw pixel byte data in multiples of 3.
@@ -319,6 +320,7 @@ class RGBWEmulatedController
 /// - WS2801 family: ws2801.h (WS2801, WS2803)
 /// - P9813: p9813.h
 /// - SM16716: sm16716.h
+/// - MY9221: my9221.h
 
 
 
@@ -457,6 +459,14 @@ using UCS7604Controller16bit1600 = fl::UCS7604Controller16bit1600T<DATA_PIN, RGB
 template <int DATA_PIN, EOrder RGB_ORDER = RGB>
 class TM1809Controller800Khz : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_TM1809_800KHZ, RGB_ORDER> {};
 
+/// TM1908 controller @ 1.2 MHz with required mode/current command prefix.
+/// @see fl::TIMING_TM1908 in fl/chipsets/led_timing.h (240, 240, 350 ns)
+template <int DATA_PIN, EOrder RGB_ORDER = RGB>
+class TM1908Controller
+    : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_TM1908,
+                                         RGB_ORDER, 0, false,
+                                         fl::TIMING_TM1908::RESET> {};
+
 /// WS2811 controller @ 800kHz (fast mode)
 /// @see fl::TIMING_WS2811_800KHZ_LEGACY in fl/chipsets/led_timing.h (250, 350, 650 ns = 1250ns cycle = 800kHz)
 /// @note WS2811 supports both 400kHz and 800kHz modes (pins 7&8 configure speed)
@@ -468,6 +478,36 @@ class WS2811Controller800Khz : public fl::ClocklessControllerImpl<DATA_PIN, fl::
 template <int DATA_PIN, EOrder RGB_ORDER = GRB>
 class WS2813Controller : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_WS2813, RGB_ORDER> {};
 
+/// WS2814 RGBW controller - references centralized timing from
+/// fl::TIMING_WS2814 and automatically enables four-channel output.
+/// @see fl::TIMING_WS2814 in fl/chipsets/led_timing.h (320, 320, 640 ns)
+template <int DATA_PIN, EOrder RGB_ORDER = RGB>
+class WS2814Controller
+    : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_WS2814,
+                                         RGB_ORDER, 0, false,
+                                         fl::TIMING_WS2814::RESET> {
+    using Base = fl::ClocklessControllerImpl<
+        DATA_PIN, fl::TIMING_WS2814, RGB_ORDER, 0, false,
+        fl::TIMING_WS2814::RESET>;
+
+  public:
+    WS2814Controller() FL_NO_EXCEPT {
+        this->setFixedRgbw(fl::RgbwDefault::value());
+    }
+
+    void init() FL_NO_EXCEPT override {
+        Base::init();
+    }
+};
+
+/// WS2818 RGB controller with backup data input.
+/// @see fl::TIMING_WS2818 in fl/chipsets/led_timing.h (300, 300, 600 ns)
+template <int DATA_PIN, EOrder RGB_ORDER = GRB>
+class WS2818Controller
+    : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_WS2818,
+                                         RGB_ORDER, 0, false,
+                                         fl::TIMING_WS2818::RESET> {};
+
 /// WS2812 controller @ 800 kHz - references centralized timing from fl::TIMING_WS2812_800KHZ
 /// @note Timing: 250ns, 625ns, 375ns (overclockable via FASTLED_OVERCLOCK_WS2812)
 /// @see fl::TIMING_WS2812_800KHZ in fl::chipsets::led_timing.h (250, 625, 375 ns)
@@ -476,6 +516,17 @@ class WS2813Controller : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING
 template <int DATA_PIN, EOrder RGB_ORDER = GRB>
 class WS2812Controller800Khz : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_WS2812_800KHZ, RGB_ORDER> {};
 #endif
+
+/// OptoSupply OSTW2020C1E controller @ 800 kHz.
+/// @details Uses the WS2812 pulse timing verified against the manufacturer's
+/// VER A.0 datasheet, with a 300us inter-frame wait to satisfy its >280us
+/// reset requirement.
+/// @see https://www.tme.eu/Document/bddfe2b10b24331bb9ab3894a93aba32/OSTW2020C1E.pdf
+template <int DATA_PIN, EOrder RGB_ORDER = GRB>
+class OSTW2020C1EController
+    : public fl::ClocklessControllerImpl<DATA_PIN,
+                                         fl::TIMING_WS2812_800KHZ,
+                                         RGB_ORDER, 0, false, 300> {};
 
 /// WS2812B-Mini-V3 controller @ 800 kHz - references centralized timing from fl::TIMING_WS2812B_MINI_V3
 /// @note Timing: 220ns, 360ns, 580ns (tighter timing specifications)
@@ -517,13 +568,18 @@ class TM1803Controller400Khz : public fl::ClocklessControllerImpl<DATA_PIN, fl::
 
 /// TM1829 controller @ 800 kHz - references centralized timing from fl::TIMING_TM1829_800KHZ
 /// @see fl::TIMING_TM1829_800KHZ in chipsets::led_timing.h (340, 340, 550 ns)
+/// @note The TM1829 drives an *inverted* line (LOW-then-HIGH per bit, idling HIGH),
+///       hence FLIP=true, and needs a 500us latch gap, hence WAIT_TIME=500.
+///       FLIP is currently only honored by the nRF52 backend; see
+///       https://github.com/FastLED/FastLED/issues/8
 template <int DATA_PIN, EOrder RGB_ORDER = RGB>
-class TM1829Controller800Khz : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_TM1829_800KHZ, RGB_ORDER> {};
+class TM1829Controller800Khz : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_TM1829_800KHZ, RGB_ORDER, 0, true, 500> {};
 
 /// TM1829 controller @ 1600 kHz - references centralized timing from fl::TIMING_TM1829_1600KHZ
 /// @see fl::TIMING_TM1829_1600KHZ in chipsets::led_timing.h (100, 300, 200 ns)
+/// @copydetails TM1829Controller800Khz
 template <int DATA_PIN, EOrder RGB_ORDER = RGB>
-class TM1829Controller1600Khz : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_TM1829_1600KHZ, RGB_ORDER> {};
+class TM1829Controller1600Khz : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_TM1829_1600KHZ, RGB_ORDER, 0, true, 500> {};
 
 /// LPD1886 controller @ 1250 kHz - references centralized timing from fl::TIMING_LPD1886_1250KHZ
 /// @see fl::TIMING_LPD1886_1250KHZ in chipsets::led_timing.h (200, 400, 200 ns)
@@ -546,10 +602,37 @@ class SK6822Controller : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING
 template <int DATA_PIN, EOrder RGB_ORDER = RGB>
 class SK6812Controller : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_SK6812, RGB_ORDER> {};
 
+/// LC8816E fixed RGBW controller - references centralized timing from
+/// fl::TIMING_LC8816E and automatically emits the fourth white byte.
+/// @see fl::TIMING_LC8816E in fl/chipsets/led_timing.h (300, 600, 300 ns)
+template <int DATA_PIN, EOrder RGB_ORDER = GRB>
+class LC8816EController
+    : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_LC8816E,
+                                         RGB_ORDER, 0, false,
+                                         fl::TIMING_LC8816E::RESET> {
+    using Base = fl::ClocklessControllerImpl<
+        DATA_PIN, fl::TIMING_LC8816E, RGB_ORDER, 0, false,
+        fl::TIMING_LC8816E::RESET>;
+
+  public:
+    LC8816EController() FL_NO_EXCEPT {
+        this->setFixedRgbw(fl::RgbwDefault::value());
+    }
+
+    void init() FL_NO_EXCEPT override {
+        Base::init();
+    }
+};
+
 /// SM16703 controller - references centralized timing from fl::TIMING_SM16703
 /// @see fl::TIMING_SM16703 in chipsets::led_timing.h (300, 600, 300 ns)
 template <int DATA_PIN, EOrder RGB_ORDER = RGB>
 class SM16703Controller : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_SM16703, RGB_ORDER> {};
+
+/// GS1903 controller - references centralized timing from fl::TIMING_GS1903
+/// @see fl::TIMING_GS1903 in chipsets::led_timing.h (300, 600, 300 ns)
+template <int DATA_PIN, EOrder RGB_ORDER = RGB>
+class GS1903Controller : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_GS1903, RGB_ORDER> {};
 
 /// PL9823 controller - references centralized timing from fl::TIMING_PL9823
 /// @see fl::TIMING_PL9823 in chipsets::led_timing.h (350, 1010, 350 ns)
@@ -564,8 +647,8 @@ class UCS1912Controller : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMIN
 
 /// SM16824E controller - references centralized timing from fl::TIMING_SM16824E
 /// @note NEW LED! Help us test it! Under development.
-/// Timing: T0H=.3μs, T0L=.9μs, T1H=.9μs, T1L=.3μs, TRST=200μs
-/// @see fl::TIMING_SM16824E in chipsets::led_timing.h (300, 900, 100 ns)
+/// Timing: T0H=.3µs, T0L=.9µs, T1H=.9µs, T1L=.3µs, TRST=200µs
+/// @see fl::TIMING_SM16824E in chipsets::led_timing.h (300, 600, 300 ns)
 template <int DATA_PIN, EOrder RGB_ORDER = RGB>
 class SM16824EController : public fl::ClocklessControllerImpl<DATA_PIN, fl::TIMING_SM16824E, RGB_ORDER> {};
 
@@ -593,40 +676,40 @@ public:
 	typedef WS2812Controller800Khz<DATA_PIN, RGB> ControllerBaseT;
 	class ControllerT : public ControllerBaseT {
 		friend class WS2816Controller<DATA_PIN, RGB_ORDER>;
-		void *callBeginShowLeds(int size) { return ControllerBaseT::beginShowLeds(size); }
-		void callShow(CRGB *data, int nLeds, fl::u8 brightness) {
+		void *callBeginShowLeds(int size) FL_NO_EXCEPT { return ControllerBaseT::beginShowLeds(size); }
+		void callShow(CRGB *data, int nLeds, fl::u8 brightness) FL_NO_EXCEPT {
 			ControllerBaseT::show(data, nLeds, brightness);
 		}
-		void callEndShowLeds(void *data) { ControllerBaseT::endShowLeds(data); }
+		void callEndShowLeds(void *data) FL_NO_EXCEPT { ControllerBaseT::endShowLeds(data); }
 	};
 
     static const int LANES = ControllerT::LANES_VALUE;
     static const fl::u32 MASK = ControllerT::MASK_VALUE;
 
-    WS2816Controller() {}
+    WS2816Controller() FL_NO_EXCEPT {}
     ~WS2816Controller() {
         mController.setLeds(nullptr, 0);
     }
 
-    virtual void *beginShowLeds(int size) override {
+    VIRTUAL_IF_NOT_AVR void *beginShowLeds(int size) FL_NO_EXCEPT OVERRIDE_IF_NOT_AVR {
         mController.setEnabled(true);
 		void *result = mController.callBeginShowLeds(2 * size);
         mController.setEnabled(false);
         return result;
     }
 
-    virtual void endShowLeds(void *data) override {
+    VIRTUAL_IF_NOT_AVR void endShowLeds(void *data) FL_NO_EXCEPT OVERRIDE_IF_NOT_AVR {
         mController.setEnabled(true);
 		mController.callEndShowLeds(data);
         mController.setEnabled(false);
     }
 
-    virtual void showPixels(PixelController<RGB_ORDER, LANES, MASK> &pixels) override {
+    virtual void showPixels(PixelController<RGB_ORDER, LANES, MASK> &pixels) FL_NO_EXCEPT override {
         // Ensure buffer is large enough
         ensureBuffer(pixels.size());
 
         // Create PixelIterator from PixelController (WS2816 is RGB-only, no W channel)
-        fl::PixelIterator pixel_iter = pixels.as_iterator(fl::Rgbw());
+        fl::PixelIterator pixel_iter = pixels.as_iterator(fl::RgbwInvalid::value());
 
         // Create 16-bit RGB iterator range (handles RGB reordering, scaling, brightness)
         auto rgb16_range = fl::makeScaledPixelRangeRGB16(&pixel_iter);
@@ -646,12 +729,12 @@ public:
     }
 
 private:
-    void init() override {
+    void init() FL_NO_EXCEPT override {
         mController.init();
         mController.setEnabled(false);
     }
 
-    void ensureBuffer(int size_8bit) {
+    void ensureBuffer(int size_8bit) FL_NO_EXCEPT {
         int size_16bit = 2 * size_8bit;
         if (mController.size() != size_16bit) {
             
@@ -700,6 +783,7 @@ using EZWS2812_GPIO = fl::ClocklessController_ezWS2812_GPIO_Auto<DATA_PIN, RGB_O
 #ifdef FASTLED_USES_EZWS2812_SPI
 
 #include "platforms/arm/mgm240/clockless_ezws2812_spi.h"  // ok platform headers
+#include "fl/stl/noexcept.h"
 
 /// Silicon Labs ezWS2812 SPI controller (requires FASTLED_USES_EZWS2812_SPI)
 /// @tparam RGB_ORDER the RGB ordering for these LEDs (typically GRB for WS2812)

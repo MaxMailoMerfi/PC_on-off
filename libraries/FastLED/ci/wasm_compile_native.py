@@ -20,10 +20,12 @@ Usage:
 """
 
 import argparse
-import subprocess
 import sys
 import time
 from pathlib import Path
+
+from running_process import RunningProcess
+from running_process.command_render import list2cmdline
 
 from ci.wasm_flags import get_sketch_compile_flags_dict
 from ci.wasm_tools import get_emcc
@@ -71,7 +73,7 @@ def ensure_library_built(
     if unity_chunks > 0:
         cmd.extend(["--unity-chunks", str(unity_chunks)])
 
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT)
+    result = RunningProcess.run(cmd, cwd=PROJECT_ROOT)
     return result.returncode == 0
 
 
@@ -153,8 +155,13 @@ def needs_compilation(source_file: Path, output_object: Path) -> bool:
 
     source_mtime = source_file.stat().st_mtime
     object_mtime = output_object.stat().st_mtime
+    if source_mtime > object_mtime:
+        return True
 
-    return source_mtime > object_mtime
+    # An object built against an older PCH is stale even if its own source
+    # did not change.
+    pch_file = BUILD_DIR / "wasm_pch.h.pch"
+    return pch_file.exists() and pch_file.stat().st_mtime > object_mtime
 
 
 def compile_object(
@@ -212,15 +219,19 @@ def compile_object(
             str(output_object),
             "-include-pch",
             str(pch_file),
+            "-Werror=invalid-pch",  # Error if PCH is invalid
+            "-fpch-validate-input-files-content",  # Strict PCH validation (pch_strict_flags lint)
         ]
     )
     cmd += includes + flags["defines"] + flags["compiler_flags"]
 
     if verbose:
         print(f"Compiling {source_file.name}...")
-        print(f"Command: {subprocess.list2cmdline(cmd)}")
+        print(f"Command: {list2cmdline(cmd)}")
 
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT)
+    from ci.meson.native_launchers import wrap_compiler_with_zccache
+
+    result = RunningProcess.run(wrap_compiler_with_zccache(cmd), cwd=PROJECT_ROOT)
     return result.returncode == 0
 
 
@@ -352,9 +363,9 @@ def compile_wasm(
         )
 
         if verbose:
-            print(f"Link command: {subprocess.list2cmdline(link_cmd)}")
+            print(f"Link command: {list2cmdline(link_cmd)}")
 
-        result = subprocess.run(link_cmd, cwd=PROJECT_ROOT)
+        result = RunningProcess.run(link_cmd, cwd=PROJECT_ROOT)
         phase4_time = time.time() - phase4_start
 
         if result.returncode == 0:

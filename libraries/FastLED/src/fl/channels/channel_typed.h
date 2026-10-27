@@ -8,8 +8,12 @@
 /// issue #2428. It is intentionally a thin wrapper around the non-template
 /// `fl::Channel` runtime object so that:
 ///
-///   - Existing `Channel::create(cfg)` callers and `addLeds<>()` subclasses of
-///     the non-template `Channel` keep working unchanged (zero source impact).
+///   - Existing `Channel::create(cfg)` callers keep working unchanged. The
+///     legacy `addLeds<>()` path no longer subclasses `fl::Channel`; it runs
+///     through `fl::SlimBridgeController` (clockless) or
+///     `fl::SlimSpiBridgeController` (clocked SPI; MY9221 uses the bit-bang
+///     `MY9221Controller`). `TypedChannel` is used only by explicit
+///     Channel-API callers.
 ///   - The new templated entry point (`Channel<B, Chipset>::create(cfg)`,
 ///     `FastLED.add<B, Chipset>(cfg)`) enforces the `Bus`<->`Chipset` contract
 ///     at compile time via `static_assert(BusSupports<B, Chipset>::value, ...)`.
@@ -58,9 +62,9 @@ struct resolve_bus<Bus::AUTO, Chipset> {
 /// exists so the templated `create()` factory can `static_assert` the
 /// bus/chipset compatibility before constructing a (non-template) `fl::Channel`.
 /// This matches the API requested in issue #2428 without forcing every existing
-/// `Channel` consumer (subclasses like `ClocklessIdf5`, `ChannelEvents`
-/// callbacks, `ChannelManager`) to be retemplated.
-template<Bus B, typename Chipset>
+/// `Channel` consumer (Channel-API callers, `ChannelEvents` callbacks,
+/// and `ChannelManager`) to be retemplated.
+template<Bus B, typename Chipset, fl::u8 Which = 0>
 class TypedChannel {
 public:
     /// The bus actually used after resolving `Bus::AUTO`.
@@ -72,7 +76,7 @@ public:
     // FL_STATIC_ASSERT) describes the contract: route ClocklessChipset to a
     // clockless bus (RMT/PARLIO/I2S/...) and SpiChipsetConfig to an SPI bus.
     FL_STATIC_ASSERT(
-        BusSupports<kBus, Chipset>::value,
+        BusSupports<kBus, Chipset, Which>::value,
         "TypedChannel: Bus does not support this Chipset family");
 
     /// @brief Construct a runtime `Channel` from a typed configuration.
@@ -80,12 +84,15 @@ public:
     /// The factory returns a `ChannelPtr` to the existing non-template
     /// `fl::Channel` runtime object so the rest of the system (events,
     /// manager, draw list) is unchanged.
-    static ChannelPtr create(const ChannelConfigOf<Chipset>& cfg) FL_NOEXCEPT {
-        // Naming `BusTraits<kBus>::instance` here is the ODR-use that links
-        // the driver translation unit even in the static-only `--gc-sections`
-        // mode (issue #2428 Phase 5 binary-size fix).
-        (void)&BusTraits<kBus>::instance;
+    static ChannelPtr create(const ChannelConfigOf<Chipset>& cfg) FL_NO_EXCEPT {
+        // Register only the compile-time-selected bus specialization and its
+        // associated driver(s). This retains the required translation unit(s)
+        // without pulling in enableAllDrivers().
+        detail::enable_clockless_for<Chipset, BusTraits<kBus, Which>>::apply();  // #4793
+        BusTraits<kBus, Which>::registerWithManager();
         ChannelConfig erased = cfg.toErased();
+        erased.options.mBus = kBus;
+        erased.options.mBusWhich = Which;
         return Channel::create(erased);
     }
 
@@ -95,13 +102,17 @@ public:
     /// compile-time bus/chipset validation. The runtime chipset variant must
     /// match `Chipset` -- there's no compile-time guarantee at this overload,
     /// so the static_assert above is the only contract.
-    static ChannelPtr create(const ChannelConfig& cfg) FL_NOEXCEPT {
-        (void)&BusTraits<kBus>::instance;
-        return Channel::create(cfg);
+    static ChannelPtr create(const ChannelConfig& cfg) FL_NO_EXCEPT {
+        detail::enable_clockless_for<Chipset, BusTraits<kBus, Which>>::apply();  // #4793
+        BusTraits<kBus, Which>::registerWithManager();
+        ChannelConfig erased = cfg;
+        erased.options.mBus = kBus;
+        erased.options.mBusWhich = Which;
+        return Channel::create(erased);
     }
 
 private:
-    TypedChannel() FL_NOEXCEPT = delete;
+    TypedChannel() FL_NO_EXCEPT = delete;
 };
 
 }  // namespace fl

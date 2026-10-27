@@ -46,7 +46,7 @@ class flat_set {
 
   public:
     // Constructors
-    flat_set() FL_NOEXCEPT = default;
+    flat_set() FL_NO_EXCEPT = default;
 
     explicit flat_set(memory_resource* resource)
         : mData(resource) {}
@@ -57,13 +57,13 @@ class flat_set {
     flat_set(const Less& less, memory_resource* resource)
         : mData(resource), mLess(less) {}
 
-    flat_set(const flat_set& other) FL_NOEXCEPT = default;
+    flat_set(const flat_set& other) FL_NO_EXCEPT = default;
     flat_set& operator=(const flat_set& other) = default;
 
-    flat_set(flat_set&& other) FL_NOEXCEPT
+    flat_set(flat_set&& other) FL_NO_EXCEPT
         : mData(fl::move(other.mData)), mLess(fl::move(other.mLess)) {}
 
-    flat_set& operator=(flat_set&& other) FL_NOEXCEPT {
+    flat_set& operator=(flat_set&& other) FL_NO_EXCEPT {
         if (this != &other) {
             mData = fl::move(other.mData);
             mLess = fl::move(other.mLess);
@@ -255,19 +255,11 @@ class flat_set {
 
     // Deletion
     iterator erase(iterator pos) {
-        // Vector erase() returns iterator in some versions, bool in others
-        // To be safe, erase and return the next element
-        iterator next = pos + 1;
-        mData.erase(pos);
-        return next;
+        return mData.erase(pos);
     }
 
     iterator erase(const_iterator pos) {
-        // Convert const_iterator to iterator and erase
-        iterator it = const_cast<iterator>(pos);
-        iterator next = it + 1;
-        mData.erase(it);
-        return next;
+        return mData.erase(const_cast<iterator>(pos));
     }
 
     iterator erase(const_iterator first, const_iterator last) {
@@ -299,7 +291,7 @@ class flat_set {
     }
 
     // Swap
-    void swap(flat_set& other) FL_NOEXCEPT {
+    void swap(flat_set& other) FL_NO_EXCEPT {
         mData.swap(other.mData);
         fl::swap(mLess, other.mLess);
     }
@@ -363,7 +355,7 @@ bool operator>=(const flat_set<Key, Less>& lhs,
 // Swap
 template <typename Key, typename Less>
 void swap(flat_set<Key, Less>& lhs,
-          flat_set<Key, Less>& rhs) FL_NOEXCEPT {
+          flat_set<Key, Less>& rhs) FL_NO_EXCEPT {
     lhs.swap(rhs);
 }
 

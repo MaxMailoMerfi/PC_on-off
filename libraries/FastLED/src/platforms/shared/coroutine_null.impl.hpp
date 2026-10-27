@@ -22,8 +22,8 @@ public:
         : mName(fl::move(name)), mFunction(fl::move(function)) {}
 
     ~TaskCoroutineNull() override = default;
-    void stop() override {}
-    bool isRunning() const override { return false; }
+    void stop() FL_NO_EXCEPT override {}
+    bool isRunning() const FL_NO_EXCEPT override { return false; }
 
 private:
     fl::string mName;
@@ -38,7 +38,7 @@ TaskCoroutinePtr createTaskCoroutine(fl::string name,
                                       ICoroutineTask::TaskFunction function,
                                       size_t stack_size,
                                       u8 priority,
-                                      int /*core_id*/) FL_NOEXCEPT {
+                                      int /*core_id*/) FL_NO_EXCEPT {
     return TaskCoroutinePtr(
         new TaskCoroutineNull(fl::move(name), fl::move(function), stack_size, priority));  // ok bare allocation
 }
@@ -47,7 +47,7 @@ TaskCoroutinePtr createTaskCoroutine(fl::string name,
 // Static exitCurrent implementation
 //=============================================================================
 
-void ICoroutineTask::exitCurrent() FL_NOEXCEPT {
+void ICoroutineTask::exitCurrent() FL_NO_EXCEPT {
     // No-op: No task exists on platforms without OS support
 }
 

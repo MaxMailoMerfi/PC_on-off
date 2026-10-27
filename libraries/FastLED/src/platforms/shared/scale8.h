@@ -23,7 +23,7 @@ namespace fl {
 /// @{
 
 /// Scale one byte by a second one (C implementation)
-FL_ALWAYS_INLINE u8 scale8(u8 i, fract8 scale) FL_NOEXCEPT {
+FL_ALWAYS_INLINE u8 scale8(u8 i, fract8 scale) FL_NO_EXCEPT {
 #if (FASTLED_SCALE8_FIXED == 1)
     return (((u16)i) * (1 + (u16)(scale))) >> 8;
 #else
@@ -31,12 +31,12 @@ FL_ALWAYS_INLINE u8 scale8(u8 i, fract8 scale) FL_NOEXCEPT {
 #endif
 }
 
-constexpr u8 scale8_constexpr(u8 i, fract8 scale) FL_NOEXCEPT {
+constexpr u8 scale8_constexpr(u8 i, fract8 scale) FL_NO_EXCEPT {
     return (((u16)i) * (1 + (u16)(scale))) >> 8;
 }
 
 /// The "video" version of scale8() (C implementation)
-FL_ALWAYS_INLINE u8 scale8_video(u8 i, fract8 scale) FL_NOEXCEPT {
+FL_ALWAYS_INLINE u8 scale8_video(u8 i, fract8 scale) FL_NO_EXCEPT {
     u8 j = (((int)i * (int)scale) >> 8) + ((i && scale) ? 1 : 0);
     return j;
 }
@@ -44,7 +44,7 @@ FL_ALWAYS_INLINE u8 scale8_video(u8 i, fract8 scale) FL_NOEXCEPT {
 /// This version of scale8() does not clean up the R1 register (C implementation)
 /// @warning You **MUST** call cleanup_R1() after using this function!
 FL_ALWAYS_INLINE u8 scale8_LEAVING_R1_DIRTY(u8 i,
-                                                         fract8 scale) FL_NOEXCEPT {
+                                                         fract8 scale) FL_NO_EXCEPT {
 #if (FASTLED_SCALE8_FIXED == 1)
     return (((u16)i) * ((u16)(scale) + 1)) >> 8;
 #else
@@ -55,7 +55,7 @@ FL_ALWAYS_INLINE u8 scale8_LEAVING_R1_DIRTY(u8 i,
 /// In place modifying version of scale8() that does not clean up the R1 (C implementation)
 /// @warning You **MUST** call cleanup_R1() after using this function!
 FL_ALWAYS_INLINE void nscale8_LEAVING_R1_DIRTY(u8 &i,
-                                                       fract8 scale) FL_NOEXCEPT {
+                                                       fract8 scale) FL_NO_EXCEPT {
 #if (FASTLED_SCALE8_FIXED == 1)
     i = (((u16)i) * ((u16)(scale) + 1)) >> 8;
 #else
@@ -66,7 +66,7 @@ FL_ALWAYS_INLINE void nscale8_LEAVING_R1_DIRTY(u8 &i,
 /// This version of scale8_video() does not clean up the R1 register (C implementation)
 /// @warning You **MUST** call cleanup_R1() after using this function!
 FL_ALWAYS_INLINE u8 scale8_video_LEAVING_R1_DIRTY(u8 i,
-                                                               fract8 scale) FL_NOEXCEPT {
+                                                               fract8 scale) FL_NO_EXCEPT {
     u8 j = (((int)i * (int)scale) >> 8) + ((i && scale) ? 1 : 0);
     return j;
 }
@@ -74,17 +74,17 @@ FL_ALWAYS_INLINE u8 scale8_video_LEAVING_R1_DIRTY(u8 i,
 /// In place modifying version of scale8_video() that does not clean up the R1 (C implementation)
 /// @warning You **MUST** call cleanup_R1() after using this function!
 FL_ALWAYS_INLINE void nscale8_video_LEAVING_R1_DIRTY(u8 &i,
-                                                             fract8 scale) FL_NOEXCEPT {
+                                                             fract8 scale) FL_NO_EXCEPT {
     i = (((int)i * (int)scale) >> 8) + ((i && scale) ? 1 : 0);
 }
 
 /// Clean up the r1 register after a series of *LEAVING_R1_DIRTY calls (C implementation)
-FL_ALWAYS_INLINE void cleanup_R1() FL_NOEXCEPT {
+FL_ALWAYS_INLINE void cleanup_R1() FL_NO_EXCEPT {
     // No-op for non-AVR platforms
 }
 
 /// Scale a 16-bit unsigned value by an 8-bit value (C implementation)
-FL_ALWAYS_INLINE u16 scale16by8(u16 i, fract8 scale) FL_NOEXCEPT {
+FL_ALWAYS_INLINE u16 scale16by8(u16 i, fract8 scale) FL_NO_EXCEPT {
     if (scale == 0) {
         return 0;
     }
@@ -100,7 +100,7 @@ FL_ALWAYS_INLINE u16 scale16by8(u16 i, fract8 scale) FL_NOEXCEPT {
 }
 
 /// Scale a 16-bit unsigned value by an 16-bit value (C implementation)
-LIB8STATIC u16 scale16(u16 i, fract16 scale) FL_NOEXCEPT {
+LIB8STATIC u16 scale16(u16 i, fract16 scale) FL_NO_EXCEPT {
 #if FASTLED_SCALE8_FIXED == 1
     u16 result;
     result = ((u32)(i) * (1 + (u32)(scale))) / 65536;
@@ -113,20 +113,22 @@ LIB8STATIC u16 scale16(u16 i, fract16 scale) FL_NOEXCEPT {
 }
 
 /// Scale a 32-bit unsigned value by an 8-bit value (C implementation)
-/// Promotes to 64-bit to prevent overflow during multiplication
-FL_ALWAYS_INLINE u32 scale32by8(u32 i, fract8 scale) FL_NOEXCEPT {
+/// Exact in 32-bit arithmetic (no 64-bit promotion)
+FL_ALWAYS_INLINE u32 scale32by8(u32 i, fract8 scale) FL_NO_EXCEPT {
     if (scale == 0) {
         return 0;
     }
+    // (i * m) >> 8 without a 64-bit product: split i = 256 * hi + lo, so
+    // the result is hi * m + ((lo * m) >> 8) exactly. With m <= 256 the
+    // first term is at most 2^32 - 256 and the second at most 255, so the
+    // sum cannot wrap; the 64-bit form linked libgcc's __muldi3 on AVR.
 #if FASTLED_SCALE8_FIXED == 1
-    u32 result;
-    result = (((u64)(i) * (1 + ((u64)scale))) >> 8);
-    return result;
+    const u32 m = 1 + static_cast<u32>(scale);
 #else
-    u32 result;
-    result = (((u64)i * (u64)scale) >> 8);
-    return result;
+    const u32 m = scale;
 #endif
+    return (i >> 8) * m +
+           ((static_cast<unsigned>(i & 0xFFu) * static_cast<unsigned>(m)) >> 8);
 }
 
 /// @} Scaling_C

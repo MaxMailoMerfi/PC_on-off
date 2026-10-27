@@ -18,7 +18,10 @@
 #include "fl/log/log.h"
 #include "fl/stl/limits.h"
 // IWYU pragma: begin_keep
-#include <SPI.h>
+// Local LPSPI fork -- see lpspi/lpspi_hardware.h. The Arduino SPI
+// library is deliberately NOT used: fbuild never linked it (#3775)
+// and its three global SPIClass objects are unstrippable (#3777).
+#include "platforms/arm/teensy/teensy4_common/lpspi/lpspi_bus.h"
 #include <imxrt.h>
 // IWYU pragma: end_keep
 #include "platforms/shared/spi_manager.h"  // For DMABuffer, TransmitMode, SPIError
@@ -56,7 +59,7 @@ private:
 
     int mBusId;
     const char* mName;
-    SPIClass* mSPI;
+    fl::platforms::teensy::LpspiBus* mSPI;
     bool mTransactionActive;
     bool mInitialized;
     u32 mClockSpeed;
@@ -131,15 +134,15 @@ bool SpiHw2MXRT1062::begin(const SpiHw2::Config& config) {
     u8 bus_num = (mBusId != -1) ? static_cast<u8>(mBusId) : config.bus_num;
     switch (bus_num) {
         case 0:
-            mSPI = &SPI;
+            mSPI = &fl::platforms::teensy::LpspiBus::get(0);
             mBusId = 0;
             break;
         case 1:
-            mSPI = &SPI1;
+            mSPI = &fl::platforms::teensy::LpspiBus::get(1);
             mBusId = 1;
             break;
         case 2:
-            mSPI = &SPI2;
+            mSPI = &fl::platforms::teensy::LpspiBus::get(2);
             mBusId = 2;
             break;
         default:
@@ -184,12 +187,8 @@ bool SpiHw2MXRT1062::begin(const SpiHw2::Config& config) {
 
     if (!pins_valid) {
         FL_WARN("SpiHw2MXRT1062: Invalid pin combination for bus " << mBusId);
-        FL_WARN("  Expected: SCK=" << (int)valid_pins[mBusId].sck
-                   << " D0=" << (int)valid_pins[mBusId].mosi
-                   << " D1=" << (int)valid_pins[mBusId].miso);
-        FL_WARN("  Got: SCK=" << (int)mClockPin
-                   << " D0=" << (int)mData0Pin
-                   << " D1=" << (int)mData1Pin);
+        FL_WARN("  Expected: SCK=" << (int)valid_pins[mBusId].sck << " D0=" << (int)valid_pins[mBusId].mosi << " D1=" << (int)valid_pins[mBusId].miso);
+        FL_WARN("  Got: SCK=" << (int)mClockPin << " D0=" << (int)mData0Pin << " D1=" << (int)mData1Pin);
         return false;
     }
 
@@ -229,15 +228,10 @@ bool SpiHw2MXRT1062::begin(const SpiHw2::Config& config) {
 
         port->CFGR1 = cfgr1;
 
-        FL_LOG_SPI("SpiHw2MXRT1062: Configured CFGR1=" << cfgr1
-                   << " (OUTCFG enabled for dual-mode)");
+        FL_LOG_SPI("SpiHw2MXRT1062: Configured CFGR1=" << cfgr1 << " (OUTCFG enabled for dual-mode)");
     }
 
-    FL_LOG_SPI("SpiHw2MXRT1062: Initialized on bus " << mBusId
-            << " clock=" << mClockSpeed << "Hz"
-            << " pins: CLK=" << (int)mClockPin
-            << " D0=" << (int)mData0Pin
-            << " D1=" << (int)mData1Pin);
+    FL_LOG_SPI("SpiHw2MXRT1062: Initialized on bus " << mBusId << " clock=" << mClockSpeed << "Hz pins: CLK=" << ((int)mClockPin) << " D0=" << ((int)mData0Pin) << " D1=" << ((int)mData1Pin));
 
     mInitialized = true;
     mTransactionActive = false;
@@ -299,7 +293,7 @@ bool SpiHw2MXRT1062::transmit(TransmitMode mode) {
     FL_LOG_SPI("SpiHw2MXRT1062: Transmitting " << mCurrentTotalSize << " bytes via LPSPI bus " << mBusId);
 
     // Begin SPI transaction with configured clock speed
-    mSPI->beginTransaction(SPISettings(mClockSpeed, MSBFIRST, SPI_MODE0));
+    mSPI->beginTransaction(fl::platforms::teensy::LpspiSettings(mClockSpeed, MSBFIRST, SPI_MODE0));
 
     // Note: True dual-mode transmission requires direct LPSPI register access
     // The Teensy SPI library doesn't support this natively.

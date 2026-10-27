@@ -27,12 +27,33 @@
 namespace fl {
 
 // Define platform-default ClocklessController alias for ESP32
-// Multiple driver types are available (ClocklessIdf4/ClocklessIdf5, ClocklessSPI, ClocklessI2S)
-// This alias selects the preferred default for backward compatibility
-#if defined(FASTLED_ESP32_I2S) && !ESP_IDF_VERSION_6_OR_HIGHER
-  // I2S driver requested explicitly (not available on ESP-IDF 6.0+)
-  template <int DATA_PIN, typename TIMING, EOrder RGB_ORDER = RGB, int XTRA0 = 0, bool FLIP = false, int WAIT_TIME = 5>
-  using ClocklessController = ClocklessI2S<DATA_PIN, TIMING, RGB_ORDER, XTRA0, FLIP, WAIT_TIME>;
+// Multiple driver types are available (ClocklessIdf4/ClocklessIdf5, ClocklessSPI)
+// This alias selects the preferred default for backward compatibility.
+//
+// The former `ClocklessI2S` (Yves parallel-out) branch was deleted at
+// FastLED#3526 Phase 2e. The modern I2S engine now lives on
+// `Bus::FLEX_IO, 0` via the channel manager — select it at runtime via
+// `FastLED.setExclusiveDriver<fl::Bus::FLEX_IO, 0>()` if desired.
+// See `agents/docs/cpp-standards.md` -> "Runtime driver selection is
+// `Bus::FLEX_IO` — legacy chipset templates are not (REQUIRED)".
+#if defined(FL_ESP32_LEGACY_CLOCKLESS_USE_RMT) && \
+    FL_ESP32_LEGACY_CLOCKLESS_USE_RMT && !FASTLED_ESP32_HAS_RMT
+  #error "FL_ESP32_LEGACY_CLOCKLESS_USE_RMT requires ESP32 RMT support"
+#endif
+
+#if defined(FL_ESP32_LEGACY_CLOCKLESS_USE_RMT) && \
+    FL_ESP32_LEGACY_CLOCKLESS_USE_RMT
+  // Narrow legacy-template override for validation builds that must exercise
+  // the existing RMT controller even on chips whose normal legacy default is
+  // PARLIO (ESP32-C6/P4/H2/C5). AutoResearch injects this only for an explicit
+  // --legacy --rmt request; ordinary sketches retain the platform default.
+  #if FASTLED_RMT5
+    template <int DATA_PIN, typename TIMING, EOrder RGB_ORDER = RGB, int XTRA0 = 0, bool FLIP = false, int WAIT_TIME = 280>
+    using ClocklessController = ClocklessIdf5<DATA_PIN, TIMING, RGB_ORDER, XTRA0, FLIP, WAIT_TIME>;
+  #else
+    template <int DATA_PIN, typename TIMING, EOrder RGB_ORDER = RGB, int XTRA0 = 0, bool FLIP = false, int WAIT_TIME = 5>
+    using ClocklessController = ClocklessIdf4<DATA_PIN, TIMING, RGB_ORDER, XTRA0, FLIP, WAIT_TIME>;
+  #endif
   #define FL_CLOCKLESS_CONTROLLER_DEFINED 1
 
 #elif FASTLED_ESP32_HAS_PARLIO && \

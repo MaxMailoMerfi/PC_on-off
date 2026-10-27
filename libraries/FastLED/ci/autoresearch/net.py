@@ -4,21 +4,26 @@ Provides WiFi management, HTTP server, and autoresearch flows for
 --net-server and --net-client modes.
 """
 
+import asyncio
+import contextlib
+import errno
 import os
 import platform as platform_mod
-import subprocess
 import tempfile
 import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 from colorama import Fore, Style
+from running_process import PIPE, CompletedProcess, RunningProcess, TimeoutExpired
 
-from ci.rpc_client import RpcClient, RpcTimeoutError
+from ci.rpc_client import RpcClient, RpcError, RpcTimeoutError
 from ci.util.global_interrupt_handler import handle_keyboard_interrupt
 
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ci.util.serial_interface import SerialInterface
 
 # WiFi AP credentials (must match firmware constants)
@@ -42,9 +47,7 @@ class HostWifiManager(ABC):
         """Return the SSID the host is currently connected to, or None."""
 
     @abstractmethod
-    def _run_connect(
-        self, ssid: str, password: str
-    ) -> subprocess.CompletedProcess[str]:
+    def _run_connect(self, ssid: str, password: str) -> CompletedProcess[str]:
         """Run the platform-specific connect command. Subclasses implement this."""
 
     @abstractmethod
@@ -67,7 +70,7 @@ class HostWifiManager(ABC):
             time.sleep(5)
             print(f"  {Fore.GREEN}Connected to '{ssid}'{Style.RESET_ALL}")
             return True
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        except (TimeoutExpired, FileNotFoundError, OSError, RuntimeError) as e:
             print(f"  {Fore.RED}WiFi connection error: {e}{Style.RESET_ALL}")
             return False
 
@@ -80,7 +83,7 @@ class HostWifiManager(ABC):
         try:
             self._run_restore(original_ssid)
             print(f"  WiFi restored to '{original_ssid}'")
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        except (TimeoutExpired, FileNotFoundError, OSError, RuntimeError) as e:
             print(
                 f"  {Fore.YELLOW}Warning: Failed to restore WiFi: {e}{Style.RESET_ALL}"
             )
@@ -93,11 +96,14 @@ class _WindowsWifiManager(HostWifiManager):
 
     def get_current_ssid(self) -> str | None:
         try:
-            result = subprocess.run(
+            result = RunningProcess.run(
                 ["netsh", "wlan", "show", "interfaces"],
-                capture_output=True,
+                stdout=PIPE,
+                stderr=PIPE,
                 text=True,
                 timeout=10,
+                encoding="utf-8",
+                errors="replace",
             )
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
@@ -108,19 +114,20 @@ class _WindowsWifiManager(HostWifiManager):
                             ssid = parts[1].strip()
                             if ssid:
                                 return ssid
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        except (TimeoutExpired, FileNotFoundError, OSError, RuntimeError):
             pass
         return None
 
-    def _run_connect(
-        self, ssid: str, password: str
-    ) -> subprocess.CompletedProcess[str]:
+    def _run_connect(self, ssid: str, password: str) -> CompletedProcess[str]:
         # First try connecting if profile already exists
-        result = subprocess.run(
+        result = RunningProcess.run(
             ["netsh", "wlan", "connect", f"ssid={ssid}", f"name={ssid}"],
-            capture_output=True,
+            stdout=PIPE,
+            stderr=PIPE,
             text=True,
             timeout=15,
+            encoding="utf-8",
+            errors="replace",
         )
         if result.returncode == 0:
             return result
@@ -156,28 +163,37 @@ class _WindowsWifiManager(HostWifiManager):
             profile_path = f.name
 
         try:
-            subprocess.run(
+            RunningProcess.run(
                 ["netsh", "wlan", "add", "profile", f"filename={profile_path}"],
-                capture_output=True,
+                stdout=PIPE,
+                stderr=PIPE,
                 text=True,
                 timeout=10,
+                encoding="utf-8",
+                errors="replace",
             )
-            result = subprocess.run(
+            result = RunningProcess.run(
                 ["netsh", "wlan", "connect", f"ssid={ssid}", f"name={ssid}"],
-                capture_output=True,
+                stdout=PIPE,
+                stderr=PIPE,
                 text=True,
                 timeout=15,
+                encoding="utf-8",
+                errors="replace",
             )
         finally:
             os.unlink(profile_path)
         return result
 
     def _run_restore(self, ssid: str) -> None:
-        subprocess.run(
+        RunningProcess.run(
             ["netsh", "wlan", "connect", f"ssid={ssid}", f"name={ssid}"],
-            capture_output=True,
+            stdout=PIPE,
+            stderr=PIPE,
             text=True,
             timeout=15,
+            encoding="utf-8",
+            errors="replace",
         )
 
 
@@ -188,40 +204,47 @@ class _MacOSWifiManager(HostWifiManager):
 
     def get_current_ssid(self) -> str | None:
         try:
-            result = subprocess.run(
+            result = RunningProcess.run(
                 [
                     "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
                     "-I",
                 ],
-                capture_output=True,
+                stdout=PIPE,
+                stderr=PIPE,
                 text=True,
                 timeout=10,
+                encoding="utf-8",
+                errors="replace",
             )
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
                     line = line.strip()
                     if line.startswith("SSID:"):
                         return line.split(":", 1)[1].strip()
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        except (TimeoutExpired, FileNotFoundError, OSError, RuntimeError):
             pass
         return None
 
-    def _run_connect(
-        self, ssid: str, password: str
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+    def _run_connect(self, ssid: str, password: str) -> CompletedProcess[str]:
+        return RunningProcess.run(
             ["networksetup", "-setairportnetwork", "en0", ssid, password],
-            capture_output=True,
+            stdout=PIPE,
+            stderr=PIPE,
             text=True,
             timeout=30,
+            encoding="utf-8",
+            errors="replace",
         )
 
     def _run_restore(self, ssid: str) -> None:
-        subprocess.run(
+        RunningProcess.run(
             ["networksetup", "-setairportnetwork", "en0", ssid],
-            capture_output=True,
+            stdout=PIPE,
+            stderr=PIPE,
             text=True,
             timeout=30,
+            encoding="utf-8",
+            errors="replace",
         )
 
 
@@ -232,36 +255,43 @@ class _LinuxWifiManager(HostWifiManager):
 
     def get_current_ssid(self) -> str | None:
         try:
-            result = subprocess.run(
+            result = RunningProcess.run(
                 ["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
-                capture_output=True,
+                stdout=PIPE,
+                stderr=PIPE,
                 text=True,
                 timeout=10,
+                encoding="utf-8",
+                errors="replace",
             )
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
                     if line.startswith("yes:"):
                         return line.split(":", 1)[1]
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        except (TimeoutExpired, FileNotFoundError, OSError, RuntimeError):
             pass
         return None
 
-    def _run_connect(
-        self, ssid: str, password: str
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+    def _run_connect(self, ssid: str, password: str) -> CompletedProcess[str]:
+        return RunningProcess.run(
             ["nmcli", "device", "wifi", "connect", ssid, "password", password],
-            capture_output=True,
+            stdout=PIPE,
+            stderr=PIPE,
             text=True,
             timeout=30,
+            encoding="utf-8",
+            errors="replace",
         )
 
     def _run_restore(self, ssid: str) -> None:
-        subprocess.run(
+        RunningProcess.run(
             ["nmcli", "device", "wifi", "connect", ssid],
-            capture_output=True,
+            stdout=PIPE,
+            stderr=PIPE,
             text=True,
             timeout=30,
+            encoding="utf-8",
+            errors="replace",
         )
 
 
@@ -366,7 +396,7 @@ async def run_net_loopback_autoresearch(
         print("  ESP32 will start HTTP server and GET its own endpoints via 127.0.0.1")
         print()
 
-        response = await client.send("runNetLoopback", timeout=30.0)
+        response = await client.send("runNetLoopback", {}, timeout=30.0)
         test_result = response.data
 
         if not isinstance(test_result, dict):
@@ -428,7 +458,671 @@ async def run_net_loopback_autoresearch(
     finally:
         if client:
             try:
-                await client.send("stopNet", timeout=10.0)
+                await client.send("stopNet", {}, timeout=10.0)
+            except KeyboardInterrupt as ki:
+                handle_keyboard_interrupt(ki)
+            except Exception:
+                pass
+            await client.close()
+
+
+# WiFiServer::begin() sets SOF_REUSEADDR and recreates its PCB per call, so a
+# listen failure is most likely tcp_new() returning NULL on an exhausted lwIP
+# PCB pool. Wait past TIME_WAIT before retrying so recovery distinguishes
+# transient exhaustion from a genuine leak.
+kListenRetryDelayS = 30.0
+# Keep enough of the deadline to report the outcome of the retry.
+kListenReserveSeconds = 15.0
+
+# How many times to reopen the companion board's serial RPC before giving up.
+# Three covers the observed USB-JTAG CDC re-enumeration window without letting
+# a genuinely dead board stall the run.
+kPeerConnectAttempts = 3
+
+# CYW43 association is not instant, and a re-join after stopNet has been
+# observed to take longer than the original 10 s budget allowed.
+#
+# `connectSta()` does not retry, so a transient association failure is
+# terminal until the join is re-issued -- no amount of extra polling recovers
+# a radio whose status() is stuck at FAILED. So poll ~15 s per attempt and
+# re-issue the join a few times, which subsumes the single 60-poll sweep this
+# replaces.
+kJoinAttempts = 4
+kJoinPollsPerAttempt = 30
+# Reserve enough of the run deadline for the post-failure wifiStatus report and
+# the teardown pings. Polling to the very last second loses the diagnostics
+# this change exists to produce.
+kJoinReserveSeconds = 20.0
+
+
+def _describe_failed_client_tests(data: dict[str, Any]) -> str:
+    """Name the sub-tests that failed, and why, in one line.
+
+    runNetClientTest returns a 12-entry `results` array. Raising it verbatim
+    put the single failing row in the middle of eleven passing ones, on one
+    unwrapped line -- when `GET /leds` came back with no response at all, the
+    interesting row was the hardest part of the message to find. Lead with
+    the diagnosis; the caller still appends the full payload.
+    """
+    results = data.get("results")
+    if not isinstance(results, list):
+        return "response carried no 'results' array"
+    failures: list[str] = []
+    for index, entry in enumerate(results):
+        if not isinstance(entry, dict):
+            # A row that is not a dict cannot be shown to have passed, and
+            # skipping it would let a malformed report read as "nothing
+            # failed" -- the same silent skip this helper exists to remove.
+            failures.append(f"result[{index}] is not an object: {entry!r}")
+            continue
+        if entry.get("passed") is True:
+            continue
+        name = entry.get("test", "<unnamed test>")
+        why = entry.get("error", "no error reported")
+        # status_line is the field that distinguishes "answered wrongly" from
+        # "did not answer", so it is worth naming even when empty.
+        detail = (
+            f"status_line={entry.get('status_line')!r} "
+            f"body_read={entry.get('body_read')} "
+            f"content_length={entry.get('content_length')}"
+        )
+        failures.append(f"{name}: {why} ({detail})")
+    if not failures:
+        return "no sub-test reported a failure"
+    return f"{len(failures)} of {len(results)} sub-tests failed -- " + "; ".join(
+        failures
+    )
+
+
+def _port_is_locked(port: str) -> bool:
+    """Whether `port` currently refuses a plain open with EBUSY.
+
+    Linux-only and best effort; False when the platform cannot say, so a
+    caller never acts on a guess.
+    """
+    noctty = getattr(os, "O_NOCTTY", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not noctty and not nonblock:
+        return False
+    try:
+        probe = os.open(port, os.O_RDWR | noctty | nonblock)
+    except OSError as exc:
+        return exc.errno == errno.EBUSY
+    os.close(probe)
+    return False
+
+
+def _reclaim_stale_port_locks(ports: "list[str]") -> bool:
+    """Reclaim ports the fbuild daemon still holds for a dead client.
+
+    `fbuild daemon locks` reports these directly -- the port stays [HELD]
+    with open=true, readers=0 and writer=none while the owning client is
+    annotated `(dead)`. The deploy that took the lock has exited by the time
+    a peer flow builds its serial interface, so the attach hits EBUSY and is
+    reported as `serial driver may be wedged`, which it is not. Restarting
+    the daemon drops the stale entry; the lock is daemon-held state, not
+    anything at the device. See FastLED/fbuild#1429.
+
+    Called before any client connects, so restarting cannot pull a live
+    session out from under one. Returns whether a restart was performed, and
+    says so on stdout: needing this is worth seeing, not smoothing away.
+    """
+    locked: list[str] = []
+    for port in ports:
+        if port and _port_is_locked(port):
+            locked.append(port)
+    if not locked:
+        return False
+    print(
+        f"  Port(s) {', '.join(locked)} held by the fbuild daemon for an exited "
+        f"client; restarting it to reclaim (FastLED/fbuild#1429)"
+    )
+    try:
+        from ci.util.fbuild_runner import Daemon
+
+        Daemon.stop()
+        Daemon.ensure_running()
+    except KeyboardInterrupt as ki:
+        handle_keyboard_interrupt(ki)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Could not restart the fbuild daemon: {exc}")
+        return False
+    still: list[str] = []
+    for port in locked:
+        if _port_is_locked(port):
+            still.append(port)
+    if still:
+        print(f"  Still held after restart: {', '.join(still)}")
+    return True
+
+
+def _describe_port_holder(port: str, proc_root: str) -> str:
+    """Name the process holding `port`, when the OS will say.
+
+    `attach failed: open_port(...) exceeded 3s; serial driver may be wedged`
+    is what the serial layer reports for what is actually an ordinary EBUSY.
+    Measured on this bench: a tty accepts multiple openers happily, and the
+    error appears only once some process sets TIOCEXCL and leaves it set --
+    setting it by hand reproduces the identical "Device or resource busy".
+    The board stays enumerated and healthy throughout, and the lock dies with
+    the holding process. See FastLED/fbuild#1429.
+
+    Only reports when the port is genuinely unopenable. Another process
+    merely *holding* an fd is harmless -- that was measured too, opening in
+    0.0 s alongside a live holder -- so naming a holder in that case would
+    accuse the wrong thing.
+
+    Linux-only and best effort: returns "" when it cannot tell, and never
+    raises. `proc_root` is passed explicitly -- "/proc" from production
+    callers, a fixture tree from tests -- so this can be tested against a real
+    directory rather than by patching os.
+    """
+    # Through the symlink first. `/dev/serial/by-id/usb-...` is the stable
+    # name a bench config wants to use, but /proc/<pid>/fd/<n> links to the
+    # canonical `/dev/ttyACM0`, so matching on the configured basename finds
+    # no holder and the probe below reports EBUSY with nothing to blame --
+    # which is the diagnostic this helper exists to give.
+    node = os.path.realpath(port).rsplit("/", 1)[-1]
+    if not node:
+        return ""
+    # Establish that there is contention at all before blaming anyone.
+    # O_NOCTTY/O_NONBLOCK are POSIX-only; this whole helper is a Linux
+    # best-effort diagnostic, so degrade to silence rather than raising on a
+    # platform that has neither.
+    noctty = getattr(os, "O_NOCTTY", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not noctty and not nonblock:
+        return ""
+    try:
+        probe = os.open(port, os.O_RDWR | noctty | nonblock)
+    except OSError as exc:
+        if exc.errno != errno.EBUSY:
+            return ""
+    else:
+        os.close(probe)
+        return ""  # opens fine; whoever holds an fd is not the problem
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return ""
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        fd_dir = f"{proc_root}/{entry}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue  # exited, or not ours to inspect
+        for fd in fds:
+            try:
+                target = os.readlink(f"{fd_dir}/{fd}")
+            except OSError:
+                continue
+            if target.rsplit("/", 1)[-1] != node:
+                continue
+            try:
+                with open(f"{proc_root}/{entry}/comm", encoding="utf-8") as handle:
+                    name = handle.read().strip()
+            except OSError:
+                name = "?"
+            return (
+                f"{port} is locked against other openers by "
+                f"{name} (pid {entry}); the device itself is fine"
+            )
+    return ""
+
+
+async def _connect_peer_with_retry(
+    peer: RpcClient,
+    label: str,
+    port: str,
+    remaining_timeout: "Callable[[], float]",
+    attempts: int,
+) -> None:
+    """Connect the companion board, retrying a silent first RPC.
+
+    The most frequent failure on this fixture is not a network fault at all:
+    `No response with ID 1 within 15.0s` while attaching to the ESP32-C6,
+    before any cycle runs. Across the captured logs it is always the C6 and
+    never the RP2350W, which points at the C6's USB-JTAG CDC re-enumerating
+    after the post-flash reset -- the port path is unchanged, so a connect
+    that lands inside that window attaches to an endpoint that never answers.
+
+    A fixed `boot_wait` cannot cover this, because the wait is over before the
+    endpoint is replaced. Reconnecting is what recovers it. Each retry is
+    reported so the need for one stays visible instead of being smoothed away.
+
+    Every wait is clamped by `remaining_timeout`, the run's own budget helper.
+    Unclamped, three mute attempts would spend ~43 s of boot waits, pings and
+    back-offs before any later call noticed the deadline had passed, so a
+    recovery mechanism would end up consuming the run it exists to save.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        # Every remaining_timeout() call sits outside a try on purpose. It
+        # signals expiry by raising RpcTimeoutError, the same type a mute
+        # endpoint raises; caught here it would retry a run that has already
+        # run out of time and report it as an unresponsive board.
+        #
+        # Each budget is also read immediately before the call it bounds, not
+        # once per attempt. connect() can itself consume most of the budget,
+        # so a ping timeout computed before it would be stale and could
+        # outlive the caller's deadline.
+        failure: Exception | None = None
+
+        boot_wait = min(3.0, remaining_timeout())
+        # Bound the whole open, not just the boot wait. The serial layer
+        # self-bounds the port open at about 3 s -- that is where
+        # "open_port(...) exceeded 3s" comes from -- but it knows nothing of
+        # this caller's deadline, so with under 3 s left the attach alone can
+        # outlive it before the ping and back-off checks get to look. Six is
+        # the natural ceiling: three for the open, three for the boot wait.
+        open_budget = min(6.0, remaining_timeout())
+        try:
+            await asyncio.wait_for(
+                peer.connect(boot_wait=boot_wait, drain_boot=True),
+                timeout=open_budget,
+            )
+        except KeyboardInterrupt as ki:
+            handle_keyboard_interrupt(ki)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Deliberately broad. Observed on the bench: attempts 1-2 failed
+            # mute (RpcTimeoutError), and the third reconnect failed with
+            # "attach failed: open_port(...) exceeded 3s" from the serial
+            # layer -- a different type entirely, which escaped a narrow
+            # (RpcError, RpcTimeoutError, OSError) list and propagated raw,
+            # so this helper's own diagnostic never printed. Every failure to
+            # bring the peer up is the same fault class here, and the last
+            # error is re-raised verbatim once the attempts are spent.
+            failure = exc
+
+        if failure is None:
+            ping_timeout = min(10.0, remaining_timeout())
+            try:
+                # Prove the endpoint answers. connect() only opens the port;
+                # a stale CDC endpoint opens fine and stays mute.
+                await peer.send("ping", {}, timeout=ping_timeout)
+            except KeyboardInterrupt as ki:
+                handle_keyboard_interrupt(ki)
+                raise
+            except Exception as exc:  # noqa: BLE001
+                failure = exc
+
+        if failure is None:
+            if attempt > 1:
+                print(f"  {label} answered on connect attempt {attempt}/{attempts}")
+            return
+
+        last_error = failure
+        # Close on every failure, including the last. `wait_for` cancels the
+        # open mid-flight, so skipping this on the final attempt would hand
+        # the caller a half-opened transport along with the exception.
+        with contextlib.suppress(Exception):
+            await peer.close()
+        if attempt == attempts:
+            break
+        print(
+            f"  {label} did not answer on {port} "
+            f"(attempt {attempt}/{attempts}: {failure}); reconnecting"
+        )
+        # Also outside any suppression: if the budget went while we were
+        # failing, stop rather than sleep past the deadline.
+        #
+        # Backs off progressively. A flat 2 s was measured to be too short:
+        # the peer went from "opens but stays mute" on attempts 1-2 to
+        # "will not open at all" by attempt 3, i.e. reconnecting quickly made
+        # the port worse rather than better. Give the CDC time to finish
+        # re-enumerating instead of hammering it.
+        backoff = min(2.0 * attempt, 8.0)
+        await asyncio.sleep(min(backoff, remaining_timeout()))
+    holder = _describe_port_holder(port, "/proc")
+    contention = f"; {holder}" if holder else ""
+    raise RpcTimeoutError(
+        f"{label} did not answer its serial RPC on {port} after {attempts} "
+        f"connect attempts; last error: {last_error}{contention}"
+    )
+
+
+def _summarize_client_tests(label: str, data: dict[str, Any]) -> None:
+    """Print the sub-test tally so the payload leg is visible, not inferred.
+
+    runNetClientTest only surfaces a single `success` boolean, but that boolean
+    is `passed == 12` over a fixed battery that includes the 4096-byte FNV-1a
+    POST /echo round trip. #3899 asks for decisive evidence of >=4 KiB payloads
+    in both directions, so print the tally and the payload row rather than
+    leaving it to be deduced from the exit status.
+
+    A missing field is treated as a failure rather than printed as None: the
+    point of this function is to make the payload leg auditable, and a report
+    that cannot substantiate it is not evidence of a pass.
+    """
+    for field in ("tests_passed", "tests_failed"):
+        value = data.get(field)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RpcError(
+                f"{label}: runNetClientTest response is missing an integer "
+                f"{field!r}; cannot substantiate the payload leg: {data!r}"
+            )
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise RpcError(
+            f"{label}: runNetClientTest response has no 'results' array; "
+            f"cannot substantiate the payload leg: {data!r}"
+        )
+    print(
+        f"  {label}: tests_passed={data['tests_passed']} "
+        f"tests_failed={data['tests_failed']}"
+    )
+    payload_rows = [
+        entry
+        for entry in results
+        if isinstance(entry, dict)
+        and (
+            "echo" in str(entry.get("test", "")).lower()
+            or "byte" in str(entry.get("test", "")).lower()
+        )
+    ]
+    if not payload_rows:
+        raise RpcError(
+            f"{label}: no payload echo row in runNetClientTest results; "
+            f"the >=4 KiB leg did not run: {results!r}"
+        )
+    for entry in payload_rows:
+        print(
+            f"    {label} payload: test={entry.get('test')!r} "
+            f"bytes={entry.get('bytes')} passed={entry.get('passed')}"
+        )
+
+
+async def run_net_peer_autoresearch(
+    upload_port: str,
+    peer_upload_port: str,
+    serial_iface: "SerialInterface | None",
+    timeout: float = 120.0,
+) -> int:
+    """Validate RP2350W <-> ESP32-C6 networking without touching host WiFi.
+
+    Both firmware images have already been deployed through fbuild by the
+    caller. The C6 hosts its SoftAP and HTTP server, while the RP2350W joins
+    as a station. Each cycle validates HTTP in both directions, tears down the
+    RP network state, and verifies that its serial JSON-RPC endpoint remains
+    responsive before reconnecting.
+    """
+    from ci.util.serial_interface import create_serial_interface
+
+    print()
+    print("=" * 60)
+    print("NETWORK AUTORESEARCH MODE: RP2350W <-> ESP32-C6 PEER")
+    print("=" * 60)
+    print("  Host WiFi is not used or changed by this mode.")
+
+    deadline = time.monotonic() + timeout
+    primary: RpcClient | None = None
+    peer: RpcClient | None = None
+
+    def rpc_timeout(max_wait: float = 15.0) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RpcTimeoutError("--net-peer deadline expired")
+        return min(max_wait, remaining)
+
+    async def rpc_data(
+        client: RpcClient,
+        method: str,
+        params: dict[str, Any] | None = None,
+        max_wait: float = 15.0,
+    ) -> dict[str, Any]:
+        response = await client.send(
+            method, params or {}, timeout=rpc_timeout(max_wait)
+        )
+        if not isinstance(response.data, dict):
+            raise RpcError(f"{method} returned a non-object response")
+        return response.data
+
+    async def assert_ping(client: RpcClient, name: str) -> None:
+        await rpc_data(client, "ping")
+        print(f"  {name} serial RPC ping: {Fore.GREEN}PASS{Style.RESET_ALL}")
+
+    try:
+        # The primary interface was built by the normal fbuild-backed setup
+        # phase. Construct the companion interface the same way; no raw
+        # pyserial connection and no direct flash utility is involved.
+        peer_iface = create_serial_interface(peer_upload_port)
+        primary = RpcClient(
+            upload_port, timeout=rpc_timeout(), serial_interface=serial_iface
+        )
+        peer = RpcClient(
+            peer_upload_port, timeout=rpc_timeout(), serial_interface=peer_iface
+        )
+        # Before either client connects: a deploy that has already exited can
+        # leave its port locked in the daemon, and the attach would then fail
+        # as "serial driver may be wedged". Safe here precisely because no
+        # session exists yet. See FastLED/fbuild#1429.
+        _reclaim_stale_port_locks([upload_port, peer_upload_port])
+        print(f"  Connecting RP2350W on {upload_port}...")
+        await primary.connect(boot_wait=3.0, drain_boot=True)
+        print(f"  Connecting ESP32-C6 on {peer_upload_port}...")
+        await _connect_peer_with_retry(
+            peer, "ESP32-C6", peer_upload_port, rpc_timeout, kPeerConnectAttempts
+        )
+
+        primary_status = await rpc_data(primary, "status")
+        if "rp2350" not in str(primary_status.get("platform", "")).lower():
+            raise RpcError(
+                "Primary --net-peer board did not identify as RP2350: "
+                f"{primary_status.get('platform')!r}"
+            )
+        peer_status = await rpc_data(peer, "status")
+        if "esp32-c6" not in str(peer_status.get("platform", "")).lower():
+            raise RpcError(
+                "Companion --net-peer board did not identify as ESP32-C6: "
+                f"{peer_status.get('platform')!r}"
+            )
+
+        c6_server = await rpc_data(peer, "startNetServer")
+        if not c6_server.get("success"):
+            raise RpcError(f"ESP32-C6 startNetServer failed: {c6_server}")
+        ssid = c6_server.get("ssid")
+        password = c6_server.get("password")
+        c6_ip = c6_server.get("ip")
+        c6_port = c6_server.get("port")
+        if (
+            not isinstance(ssid, str)
+            or not isinstance(password, str)
+            or not isinstance(c6_ip, str)
+            or not isinstance(c6_port, int)
+        ):
+            raise RpcError(f"ESP32-C6 returned incomplete AP details: {c6_server}")
+
+        for cycle in range(1, 11):
+            print(f"\n--- Peer network cycle {cycle}/10 ---")
+            connect = await rpc_data(
+                primary, "wifiConnect", {"ssid": ssid, "password": password}
+            )
+            if not connect.get("success"):
+                raise RpcError(f"RP2350W wifiConnect failed: {connect}")
+
+            # connectSta() issues a single WiFi.beginNoBlock() and never
+            # retries (src/platforms/arm/rp/wifi_rp.cpp.hpp), so one transient
+            # CYW43 association failure leaves status()=FAILED for good. Re-issue
+            # the join rather than failing the cycle on a single attempt.
+            rp_ip: str | None = None
+            wifi_status: dict[str, Any] = {}
+            join_started = time.monotonic()
+            attempts = 0
+            polls = 0
+            cut_short = False
+            for attempt in range(kJoinAttempts):
+                attempts = attempt + 1
+                if attempt > 0:
+                    print(
+                        f"  RP2350W association reported "
+                        f"{wifi_status.get('status')!r}; re-issuing join "
+                        f"({attempts}/{kJoinAttempts})"
+                    )
+                    reconnect = await rpc_data(
+                        primary, "wifiConnect", {"ssid": ssid, "password": password}
+                    )
+                    if not reconnect.get("success"):
+                        raise RpcError(f"RP2350W wifiConnect failed: {reconnect}")
+                for _ in range(kJoinPollsPerAttempt):
+                    # Stop polling once the whole-run deadline is close enough
+                    # that continuing would starve the remaining cycles -- and,
+                    # more importantly, would consume the budget the failure
+                    # diagnostics below need in order to report at all.
+                    poll_budget = deadline - time.monotonic() - kJoinReserveSeconds
+                    if poll_budget <= 0:
+                        cut_short = True
+                        break
+                    polls += 1
+                    # Clamp the poll itself to the budget, not just the check
+                    # before it. Checking first and then letting the RPC wait
+                    # its own 15 s can land the next check inside the reserve
+                    # -- and if that RPC times out, the run dies before the
+                    # join-failure report this reserve exists to protect.
+                    wifi_status = await rpc_data(
+                        primary, "wifiStatus", max_wait=min(15.0, poll_budget)
+                    )
+                    candidate_ip = wifi_status.get("ip")
+                    if wifi_status.get("connected") and isinstance(candidate_ip, str):
+                        rp_ip = candidate_ip
+                        break
+                    if str(wifi_status.get("status")) == "FAILED":
+                        break  # terminal for this attempt; re-issue the join
+                    await asyncio.sleep(min(0.5, rpc_timeout()))
+                if rp_ip:
+                    break
+            join_elapsed = time.monotonic() - join_started
+            if not rp_ip:
+                # Report the polls actually made, not the configured maximum:
+                # quoting the maximum would overstate the evidence whenever
+                # the deadline reserve cut the sweep short, which is exactly
+                # the case a reader needs to tell apart from a full
+                # unsuccessful one.
+                stopped_early = (
+                    " (stopped early to reserve deadline for this report)"
+                    if cut_short
+                    else ""
+                )
+                raise RpcTimeoutError(
+                    "RP2350W did not join the ESP32-C6 AP after "
+                    f"{join_elapsed:.1f}s across {attempts} attempt(s) and "
+                    f"{polls} wifiStatus poll(s){stopped_early}; "
+                    f"last wifiStatus={wifi_status!r}"
+                )
+            print(
+                f"  RP2350W joined in {join_elapsed:.1f}s "
+                f"(attempt {attempts}) -> {rp_ip}"
+            )
+
+            rp_server = await rpc_data(primary, "startNetServer")
+            rp_port = rp_server.get("port")
+            if not rp_server.get("success") or not isinstance(rp_port, int):
+                # WiFiServer::begin() closes and recreates its PCB each call
+                # and sets SOF_REUSEADDR, so a bind blocked by TIME_WAIT is
+                # ruled out. tcp_new() returning NULL on an exhausted lwIP PCB
+                # pool is the leading candidate (~24 connections per cycle),
+                # but begin() reports only a bool, so nothing here can confirm
+                # which resource ran out. Retrying after a wait distinguishes
+                # transient from persistent, which is all it can honestly
+                # claim; naming the resource needs a firmware-side error code.
+                # Cap the drain against the caller's deadline: waiting the
+                # full interval past it would trade a diagnostic for a
+                # timeout, and there would be nothing left to report with.
+                remaining = deadline - time.monotonic()
+                drain_s = min(kListenRetryDelayS, remaining - kListenReserveSeconds)
+                if drain_s <= 0:
+                    raise RpcError(
+                        f"RP2350W startNetServer failed at cycle {cycle}: "
+                        f"{rp_server}. Not enough of the run deadline remains "
+                        "to test whether it recovers."
+                    )
+                print(
+                    f"  startNetServer failed at cycle {cycle}: {rp_server}; "
+                    f"waiting {drain_s:.0f}s and retrying once to see whether "
+                    "the condition is transient"
+                )
+                await asyncio.sleep(drain_s)
+                rp_server = await rpc_data(primary, "startNetServer")
+                rp_port = rp_server.get("port")
+                if not rp_server.get("success") or not isinstance(rp_port, int):
+                    raise RpcError(
+                        f"RP2350W startNetServer failed at cycle {cycle}, and "
+                        f"again after a {drain_s:.0f}s wait: {rp_server}. The "
+                        "condition is persistent rather than transient; the "
+                        "specific resource is not identified here."
+                    )
+                print(
+                    "  startNetServer recovered after the wait -> the condition "
+                    "is transient. Which resource was exhausted is not "
+                    "established by recovery alone."
+                )
+
+            rp_to_c6 = await rpc_data(
+                primary,
+                "runNetClientTest",
+                {"host_ip": c6_ip, "port": c6_port},
+                max_wait=30.0,
+            )
+            if not rp_to_c6.get("success"):
+                raise RpcError(
+                    f"RP2350W -> ESP32-C6 HTTP failed: "
+                    f"{_describe_failed_client_tests(rp_to_c6)}; "
+                    f"full result: {rp_to_c6}"
+                )
+            _summarize_client_tests("RP2350W -> ESP32-C6", rp_to_c6)
+            c6_to_rp = await rpc_data(
+                peer,
+                "runNetClientTest",
+                {"host_ip": rp_ip, "port": rp_port},
+                max_wait=30.0,
+            )
+            if not c6_to_rp.get("success"):
+                # The RP is the server for this direction, so ask it why it
+                # gave up. A 408 alone does not say which budget expired or
+                # how much of the request had arrived.
+                server_stats: Any = None
+                try:
+                    server_stats = await rpc_data(primary, "netServerStats")
+                except KeyboardInterrupt as ki:
+                    handle_keyboard_interrupt(ki)
+                    raise
+                except (RpcError, RpcTimeoutError) as exc:  # noqa: BLE001
+                    server_stats = f"<unavailable: {exc}>"
+                raise RpcError(
+                    f"ESP32-C6 -> RP2350W HTTP failed: {c6_to_rp}; "
+                    f"RP server stats: {server_stats!r}"
+                )
+            _summarize_client_tests("ESP32-C6 -> RP2350W", c6_to_rp)
+
+            stop_result = await rpc_data(primary, "stopNet")
+            if not stop_result.get("success"):
+                raise RpcError(f"RP2350W stopNet failed: {stop_result}")
+            await assert_ping(primary, "RP2350W")
+
+        await assert_ping(peer, "ESP32-C6")
+        print(
+            f"\n{Fore.GREEN}NET PEER AUTORESEARCH PASSED (10 reconnect cycles){Style.RESET_ALL}"
+        )
+        return 0
+    except KeyboardInterrupt as ki:
+        print("\n\n  Interrupted by user")
+        handle_keyboard_interrupt(ki)
+        return 130
+    except (RpcError, RpcTimeoutError) as e:
+        print(f"\n  {Fore.RED}Network peer autoresearch failed: {e}{Style.RESET_ALL}")
+        return 1
+    except Exception as e:
+        print(f"\n  {Fore.RED}Network peer autoresearch error: {e}{Style.RESET_ALL}")
+        return 1
+    finally:
+        for client in (primary, peer):
+            if client is None:
+                continue
+            try:
+                await client.send("stopNet", {}, timeout=2.0)
             except KeyboardInterrupt as ki:
                 handle_keyboard_interrupt(ki)
             except Exception:
@@ -472,7 +1166,6 @@ async def run_net_autoresearch(
         print("  No current WiFi connection detected")
 
     client: RpcClient | None = None
-    host_server: _HostHttpServer | None = None
 
     try:
         # Connect to device via RPC
@@ -494,13 +1187,12 @@ async def run_net_autoresearch(
         print(f"\n  {Fore.RED}Network autoresearch error: {e}{Style.RESET_ALL}")
         return 1
     finally:
-        # Cleanup
-        if host_server:
-            host_server.stop()
+        # Cleanup. The HTTP server in client mode is owned and stopped by
+        # _run_net_client_autoresearch itself; nothing to stop here.
         if client:
             # Send stopNet to clean up device resources
             try:
-                await client.send("stopNet", timeout=10.0)
+                await client.send("stopNet", {}, timeout=10.0)
             except KeyboardInterrupt as ki:
                 handle_keyboard_interrupt(ki)
             except Exception:
@@ -524,7 +1216,7 @@ async def _run_net_server_autoresearch(
     import httpx
 
     print("\n--- Step 1: Start WiFi AP + HTTP Server on ESP32 ---")
-    response = await client.send("startNetServer", timeout=30.0)
+    response = await client.send("startNetServer", {}, timeout=30.0)
     server_info = response.data
 
     if not isinstance(server_info, dict) or not server_info.get("success"):
@@ -670,7 +1362,7 @@ async def _run_net_client_autoresearch(
     6. Cleanup
     """
     print("\n--- Step 1: Start WiFi AP on ESP32 ---")
-    response = await client.send("startNetClient", timeout=30.0)
+    response = await client.send("startNetClient", {}, timeout=30.0)
     ap_info = response.data
 
     if not isinstance(ap_info, dict) or not ap_info.get("success"):

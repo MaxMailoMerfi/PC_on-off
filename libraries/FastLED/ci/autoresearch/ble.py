@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from colorama import Fore, Style
 
 from ci.rpc_client import RpcClient, RpcTimeoutError
 from ci.util.ble_interface import BLE_CHAR_TX_UUID, BleInterface
+from ci.util.ble_notify_assembler import BleNotificationAssembler
 from ci.util.global_interrupt_handler import handle_keyboard_interrupt
 
 
@@ -65,8 +66,8 @@ async def run_ble_autoresearch(
         print(f"  {Fore.GREEN}Connected to device (serial){Style.RESET_ALL}")
 
         # Step 2: Start BLE on device via serial RPC
-        print("\n--- Step 2: Start BLE GATT server on ESP32 ---")
-        response = await serial_client.send("startBle", timeout=30.0)
+        print("\n--- Step 2: Start BLE GATT server on the connected device ---")
+        response = await serial_client.send("startBle", {}, timeout=30.0)
         ble_info = response.data
 
         if not isinstance(ble_info, dict) or not ble_info.get("success"):
@@ -78,7 +79,15 @@ async def run_ble_autoresearch(
             print(f"  {Fore.RED}Failed to start BLE: {error}{Style.RESET_ALL}")
             return 1
 
-        device_name = ble_info.get("device_name", "FastLED-C6")
+        # No C6-shaped default: this path also serves RP2350W, and inventing
+        # a name here produced scan logs that named the wrong board.
+        device_name = ble_info.get("device_name")
+        if not isinstance(device_name, str) or not device_name:
+            print(
+                f"  {Fore.RED}Device did not report a BLE advertising name; "
+                f"cannot scan for it{Style.RESET_ALL}"
+            )
+            return 1
         print(
             f"  {Fore.GREEN}BLE started: name={device_name}, "
             f"service={ble_info.get('service_uuid', '?')}{Style.RESET_ALL}"
@@ -99,7 +108,7 @@ async def run_ble_autoresearch(
         # Step 3b: Query BLE status over serial (diagnostics)
         print("\n--- Step 3b: Query BLE status (serial) ---")
         try:
-            status_response = await serial_client.send("bleStatus", timeout=10.0)
+            status_response = await serial_client.send("bleStatus", {}, timeout=10.0)
             ble_status = status_response.data
             print(f"  BLE status: {json.dumps(ble_status, indent=2)}")
         except KeyboardInterrupt as ki:
@@ -127,15 +136,21 @@ async def run_ble_autoresearch(
         tests_failed = 0
         pong_received = False
 
-        # Try notifications first (preferred mechanism)
-        async for line in ble_iface.read_lines(timeout=3.0):
-            payload = line
-            if payload.startswith("REMOTE: "):
-                payload = payload[8:]
-            try:
-                parsed = json.loads(payload)
-                result = parsed.get("result", {})
-                if isinstance(result, dict) and result.get("message") == "pong":
+        # Try notifications first (preferred mechanism). Each response is
+        # chunked across ATT-MTU-sized notifications, so fragments are
+        # reassembled per message rather than concatenated into one buffer
+        # that a single malformed value would poison (FastLED#3955).
+        assembler = BleNotificationAssembler()
+        async for fragment in ble_iface.read_lines(timeout=3.0):
+            for parsed in assembler.push(fragment):
+                if not isinstance(parsed, dict):
+                    continue
+                message = cast("dict[str, Any]", parsed)
+                result_value = message.get("result", {})
+                if not isinstance(result_value, dict):
+                    continue
+                result = cast("dict[str, Any]", result_value)
+                if result.get("message") == "pong":
                     print(
                         f"  {Fore.GREEN}PASS{Style.RESET_ALL} - "
                         f"Received pong via NOTIFY (transport={result.get('transport', '?')}, "
@@ -144,8 +159,8 @@ async def run_ble_autoresearch(
                     tests_passed += 1
                     pong_received = True
                     break
-            except json.JSONDecodeError:
-                continue
+            if pong_received:
+                break
 
         # Fallback: read TX characteristic value directly
         if not pong_received and ble_iface._client:
@@ -189,7 +204,7 @@ async def run_ble_autoresearch(
         ble_iface = None
 
         try:
-            stop_response = await serial_client.send("stopBle", timeout=10.0)
+            stop_response = await serial_client.send("stopBle", {}, timeout=10.0)
             print(f"  stopBle response: {stop_response.data}")
         except KeyboardInterrupt as ki:
             handle_keyboard_interrupt(ki)
@@ -237,7 +252,7 @@ async def run_ble_autoresearch(
                 pass
         if serial_client:
             try:
-                await serial_client.send("stopBle", timeout=5.0)
+                await serial_client.send("stopBle", {}, timeout=5.0)
             except KeyboardInterrupt as ki:
                 handle_keyboard_interrupt(ki)
             except Exception:

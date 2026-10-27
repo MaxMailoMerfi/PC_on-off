@@ -4,6 +4,7 @@
 Provides eanble_if and is_derived for compilers before C++14.
 */
 
+#include "fl/stl/adl_barrier.h"
 #include "fl/stl/move.h"
 #include "fl/stl/int.h"
 #include "fl/stl/noexcept.h"
@@ -19,8 +20,8 @@ struct integral_constant {
     enum : T { value = v };
     using value_type = T;
     using type = integral_constant;
-    constexpr operator value_type() const FL_NOEXCEPT { return value; }
-    constexpr value_type operator()() const FL_NOEXCEPT { return value; }
+    constexpr operator value_type() const FL_NO_EXCEPT { return value; }
+    constexpr value_type operator()() const FL_NO_EXCEPT { return value; }
 };
 
 // Define true_type and false_type
@@ -47,7 +48,7 @@ template <typename T> struct add_rvalue_reference<T&> {
 
 // Define declval for use in SFINAE expressions
 template <typename T>
-typename add_rvalue_reference<T>::type declval() FL_NOEXCEPT;
+typename add_rvalue_reference<T>::type declval() FL_NO_EXCEPT;
 
 // Define enable_if for SFINAE
 template <bool Condition, typename T = void> struct enable_if {};
@@ -70,8 +71,8 @@ template <typename Base, typename Derived> struct is_base_of {
   private:
     typedef u8 yes;
     typedef u16 no;
-    static yes test(Base *) FL_NOEXCEPT; // Matches if Derived is convertible to Base*
-    static no test(...) FL_NOEXCEPT;     // Fallback if not convertible
+    static yes test(Base *) FL_NO_EXCEPT; // Matches if Derived is convertible to Base*
+    static no test(...) FL_NO_EXCEPT;     // Fallback if not convertible
     enum {
         kSizeDerived = sizeof(test(static_cast<Derived *>(nullptr))),
     };
@@ -229,19 +230,22 @@ template <> struct is_void<void> {
     enum : bool { value = true };
 };
 
+namespace adl_barrier {  // see fl/stl/adl_barrier.h
 // Implementation of forward
 template <typename T>
-constexpr T &&forward(typename remove_reference<T>::type &t) FL_NOEXCEPT {
+constexpr T &&forward(typename remove_reference<T>::type &t) FL_NO_EXCEPT {
     return static_cast<T &&>(t);
 }
 
 // Overload for rvalue references
 template <typename T>
-constexpr T &&forward(typename remove_reference<T>::type &&t) FL_NOEXCEPT {
+constexpr T &&forward(typename remove_reference<T>::type &&t) FL_NO_EXCEPT {
     FL_STATIC_ASSERT(!is_lvalue_reference<T>::value,
                   "Cannot forward an rvalue as an lvalue");
     return static_cast<T &&>(t);
 }
+}  // namespace adl_barrier
+
 
 // Define remove_cv trait
 template <typename T> struct remove_cv {
@@ -847,10 +851,10 @@ template <typename T> struct has_member_swap {
     template <typename U, void (U::*M)(U &)> struct helper {};
 
     // picks this overload if helper<U, &U::swap> is valid
-    template <typename U> static yes test(helper<U, &U::swap> *) FL_NOEXCEPT;
+    template <typename U> static yes test(helper<U, &U::swap> *) FL_NO_EXCEPT;
 
     // fallback otherwise
-    template <typename> static no test(...) FL_NOEXCEPT;
+    template <typename> static no test(...) FL_NO_EXCEPT;
 
   public:
     static constexpr bool value = sizeof(test<T>(nullptr)) == sizeof(yes);
@@ -861,7 +865,7 @@ template <typename T, bool = has_member_swap<T>::value> struct swap_impl;
 
 // POD case - now using move semantics for better performance
 template <typename T> struct swap_impl<T, false> {
-    static void apply(T &a, T &b) FL_NOEXCEPT {
+    static void apply(T &a, T &b) FL_NO_EXCEPT {
         T tmp = fl::move(a);
         a = fl::move(b);
         b = fl::move(tmp);
@@ -870,17 +874,26 @@ template <typename T> struct swap_impl<T, false> {
 
 // non‑POD case (requires T implements swap)
 template <typename T> struct swap_impl<T, true> {
-    static void apply(T &a, T &b) FL_NOEXCEPT { a.swap(b); }
+    static void apply(T &a, T &b) FL_NO_EXCEPT { a.swap(b); }
 };
 
 // single entry‑point
-template <typename T> void swap(T &a, T &b) FL_NOEXCEPT {
+//
+// Unlike the other generic templates (see fl/stl/adl_barrier.h), swap stays
+// directly in fl so unqualified `swap(a, b)` on fl types keeps finding it via
+// ADL. `b` is its own template parameter, constrained to the same type, which
+// makes this overload less specialized than std::swap(T&, T&). When std::swap
+// is visible (e.g. inside std::reverse / std::sort on CRGB, FastLED#4827) std
+// wins instead of the call being ambiguous; otherwise this one is used.
+template <typename T, typename U>
+enable_if_t<is_same<T, U>::value> swap(T &a, U &b) FL_NO_EXCEPT {
     // if T is a POD, use use a simple data copy swap.
     // if T is not a POD, use the T::Swap method.
     swap_impl<T>::apply(a, b);
 }
 
-template <typename T> void swap_by_copy(T &a, T &b) FL_NOEXCEPT {
+
+template <typename T> void swap_by_copy(T &a, T &b) FL_NO_EXCEPT {
     // Force copy semantics (for cases where move might not be safe)
     T tmp = a;
     a = b;
@@ -1021,12 +1034,12 @@ using underlying_type_t = typename underlying_type<T>::type;
     template <typename T, typename U>                                          \
     typename enable_if<                                                        \
         is_same<U, CLASS>::value && is_pod<T>::value, bool>::type             \
-    operator OP(const T &pod, const CLASS &obj) FL_NOEXCEPT {                  \
+    operator OP(const T &pod, const CLASS &obj) FL_NO_EXCEPT {                  \
         return pod OP obj;                                                     \
     }                                                                          \
     template <typename T>                                                      \
     typename enable_if<is_pod<T>::value, bool>::type operator OP(             \
-        const CLASS &obj, const T &pod) FL_NOEXCEPT {                          \
+        const CLASS &obj, const T &pod) FL_NO_EXCEPT {                          \
         return obj OP pod;                                                     \
     }
 
@@ -1153,15 +1166,39 @@ struct callable_traits<T, typename enable_if<
 template <fl::size... Is>
 struct index_sequence {
     using type = index_sequence;
-    static constexpr fl::size size() FL_NOEXCEPT { return sizeof...(Is); }
+    static constexpr fl::size size() FL_NO_EXCEPT { return sizeof...(Is); }
 };
 
-template <fl::size N, fl::size... Is>
-struct make_index_sequence_impl : make_index_sequence_impl<N - 1, N - 1, Is...> {};
+// Log-depth construction: build the sequence for N/2 and concatenate it with
+// itself shifted by N/2 (plus one extra index when N is odd). The naive
+// N-1 recursion instantiated 256 nested templates for the gamma LUT, which
+// cost ~50 ms of front-end time in every TU that included gamma_lut.h.
+// No short names like S1/I1 here: board variants define pin names as
+// macros (the SparkFun XRP's pins_arduino.h defines S1..S4), which would
+// expand inside these declarations.
+template <typename LhsSeq, typename RhsSeq>
+struct index_sequence_concat;
 
-template <fl::size... Is>
-struct make_index_sequence_impl<0, Is...> {
-    using type = index_sequence<Is...>;
+template <fl::size... Lhs, fl::size... Rhs>
+struct index_sequence_concat<index_sequence<Lhs...>, index_sequence<Rhs...>> {
+    using type = index_sequence<Lhs..., (sizeof...(Lhs) + Rhs)...>;
+};
+
+template <fl::size N>
+struct make_index_sequence_impl {
+    using type = typename index_sequence_concat<
+        typename make_index_sequence_impl<N / 2>::type,
+        typename make_index_sequence_impl<N - N / 2>::type>::type;
+};
+
+template <>
+struct make_index_sequence_impl<0> {
+    using type = index_sequence<>;
+};
+
+template <>
+struct make_index_sequence_impl<1> {
+    using type = index_sequence<0>;
 };
 
 template <fl::size N>

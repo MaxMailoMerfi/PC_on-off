@@ -63,6 +63,64 @@ CRGB downconvert(const fl::CRGB16 &rgb) {
 
 FL_TEST_FILE(FL_FILEPATH) {
 
+FL_TEST_CASE("palette mapping preserves destination at zero opacity") {
+    CRGBPalette16 palette(CRGB(200, 100, 50));
+    fl::u8 index[] = {0};
+    const CRGB original(37, 81, 129);
+    CRGB destination[] = {original};
+
+    map_data_into_colors_through_palette(index, 1, destination, palette, 255,
+                                         0);
+    FL_CHECK_EQ(destination[0], original);
+
+    destination[0] = original;
+    CRGB expected = original;
+    expected.nscale8(255);
+    CRGB contribution = ColorFromPalette(palette, 0);
+    contribution.nscale8_video(1);
+    expected += contribution;
+    map_data_into_colors_through_palette(index, 1, destination, palette, 255,
+                                         1);
+    FL_CHECK_EQ(destination[0], expected);
+
+    map_data_into_colors_through_palette(index, 1, destination, palette, 255,
+                                         255);
+    FL_CHECK_EQ(destination[0], ColorFromPalette(palette, 0));
+}
+
+FL_TEST_CASE("palette cross-fade respects zero and nonzero change budgets") {
+    CRGBPalette16 current(CRGB::Black);
+    CRGBPalette16 target(CRGB::Red);
+
+    nblendPaletteTowardPalette(current, target, 0);
+    for (int i = 0; i < 16; ++i) {
+        FL_CHECK_EQ(current[i], CRGB::Black);
+    }
+
+    nblendPaletteTowardPalette(current, target, 1);
+    FL_CHECK_EQ(current[0], CRGB(1, 0, 0));
+    for (int i = 1; i < 16; ++i) {
+        FL_CHECK_EQ(current[i], CRGB::Black);
+    }
+}
+
+FL_TEST_CASE("Oklab blending is opt-in and preserves endpoints") {
+    const CRGB first(12, 34, 56);
+    const CRGB second(210, 180, 90);
+
+    FL_CHECK_EQ(blend_oklab(first, second, 0), first);
+    FL_CHECK_EQ(blend_oklab(first, second, 255), second);
+
+    // In linear-light Oklab, halfway from black to white has L=0.5 and
+    // therefore RGB channels of 0.5 cubed, or approximately 32/255.
+    FL_CHECK_EQ(blend_oklab(CRGB::Black, CRGB::White, 128), CRGB(32, 32, 32));
+    // This interpolation reconstructs a negative red channel, which must be
+    // clipped to the CRGB gamut instead of wrapping during conversion.
+    FL_CHECK_EQ(blend_oklab(CRGB::Green, CRGB::Blue, 128), CRGB(0, 63, 107));
+    FL_CHECK_NE(blend_oklab(CRGB::Red, CRGB::Blue, 128),
+                blend(CRGB::Red, CRGB::Blue, 128));
+}
+
 FL_TEST_CASE("CHSV palettes upscale consistently") {
     CHSVPalette16 hsv16(
         make_hsv(0), make_hsv(1), make_hsv(2), make_hsv(3),
@@ -252,4 +310,33 @@ FL_TEST_CASE("ColorFromPaletteHD supports existing RGB palette families") {
         0u);
 }
 
+FL_TEST_CASE("palette mapping span stops at destination length") {
+    CRGBPalette256 palette(CRGB::Black);
+    palette[1] = CRGB::Red;
+    palette[2] = CRGB::Blue;
+    fl::u8 indices[] = {1, 2};
+
+    CRGB short_output[] = {CRGB::Black, CRGB::Green};
+    map_data_into_colors_through_palette(
+        fl::span<fl::u8>(indices, 2), fl::span<CRGB>(short_output, 1),
+        palette, 255, 255, NOBLEND);
+    FL_CHECK_EQ(short_output[0], CRGB::Red);
+    FL_CHECK_EQ(short_output[1], CRGB::Green);
+
+    CRGB full_output[] = {CRGB::Black, CRGB::Black};
+    map_data_into_colors_through_palette(
+        fl::span<fl::u8>(indices, 2), fl::span<CRGB>(full_output, 2),
+        palette, 255, 255, NOBLEND);
+    FL_CHECK_EQ(full_output[0], CRGB::Red);
+    FL_CHECK_EQ(full_output[1], CRGB::Blue);
+}
+
 } // FL_TEST_FILE
+
+FL_TEST_CASE("RGB and HSV progmem palette types are distinct (issue #807)") {
+    // Both were `typedef fl::u32 X[16]`, i.e. THE SAME TYPE. So an RGB
+    // progmem palette bound silently to every CHSV palette constructor, and
+    // loadProgmemPalette(CHSV*, ...) reinterpreted red/green/blue as
+    // hue/sat/val -- garbage, with nothing to catch it.
+    FL_CHECK(!(fl::is_same<TProgmemRGBPalette16, TProgmemHSVPalette16>::value));
+}

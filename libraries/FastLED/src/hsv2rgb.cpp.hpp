@@ -11,12 +11,13 @@
 #include "fl/math/math.h"
 
 #include "hsv2rgb.h"
+#include "fl/stl/noexcept.h"
 
 
 /// HSV to RGB implementation in raw C, platform independent
-void hsv2rgb_raw_C (const CHSV & hsv, CRGB & rgb);
+void hsv2rgb_raw_C (const CHSV & hsv, CRGB & rgb) FL_NO_EXCEPT;
 /// HSV to RGB implementation in raw C, for the AVR platform only
-void hsv2rgb_raw_avr(const CHSV & hsv, CRGB & rgb);
+void hsv2rgb_raw_avr(const CHSV & hsv, CRGB & rgb) FL_NO_EXCEPT;
 
 #if defined(FL_IS_AVR) && !defined(FL_IS_AVR_ATTINY)
 void hsv2rgb_raw(const CHSV & hsv, CRGB & rgb)
@@ -25,7 +26,7 @@ void hsv2rgb_raw(const CHSV & hsv, CRGB & rgb)
 }
 #else
 void hsv2rgb_raw(const CHSV & hsv, CRGB & rgb)
-{
+FL_NO_EXCEPT {
     hsv2rgb_raw_C( hsv, rgb);
 }
 #endif
@@ -43,14 +44,14 @@ void hsv2rgb_raw(const CHSV & hsv, CRGB & rgb)
 #define HSV_SECTION_3 (0x40)
 
 /// Inline version of hsv2rgb_spectrum which returns a CRGB object.
-CRGB hsv2rgb_spectrum( const CHSV& hsv) {
+CRGB hsv2rgb_spectrum( const CHSV& hsv) FL_NO_EXCEPT {
     CRGB rgb;
     hsv2rgb_spectrum(hsv, rgb);
     return rgb;
 }
 
 void hsv2rgb_raw_C (const CHSV & hsv, CRGB & rgb)
-{
+FL_NO_EXCEPT {
     // Convert hue, saturation and brightness ( HSV/HSB ) to RGB
     // "Dimming" is used on saturation and brightness to make
     // the output more visually linear.
@@ -235,7 +236,7 @@ void hsv2rgb_raw_avr(const CHSV & hsv, CRGB & rgb)
 #endif
 
 void hsv2rgb_spectrum( const CHSV& hsv, CRGB& rgb)
-{
+FL_NO_EXCEPT {
     CHSV hsv2(hsv);
     hsv2.hue = scale8( hsv2.hue, 191);
     hsv2rgb_raw(hsv2, rgb);
@@ -259,14 +260,14 @@ void hsv2rgb_spectrum( const CHSV& hsv, CRGB& rgb)
 #define K85  85
 /// @endcond
 
-CRGB hsv2rgb_rainbow( const CHSV& hsv) {
+CRGB hsv2rgb_rainbow( const CHSV& hsv) FL_NO_EXCEPT {
     CRGB rgb;
     hsv2rgb_rainbow(hsv, rgb);
     return rgb;
 }
 
 void hsv2rgb_rainbow( const CHSV& hsv, CRGB& rgb)
-{
+FL_NO_EXCEPT {
     // Yellow has a higher inherent brightness than
     // any other color; 'pure' yellow is perceived to
     // be 93% as bright as white.  In order to make
@@ -422,7 +423,13 @@ void hsv2rgb_rainbow( const CHSV& hsv, CRGB& rgb)
     // This is one of the good places to scale the green down,
     // although the client can scale green down as well.
     if( G2 ) g = g >> 1;
-    if( Gscale ) g = scale8_video_LEAVING_R1_DIRTY( g, Gscale);
+    // Deliberately the cleaning variant. The _LEAVING_R1_DIRTY form only pays
+    // off when several calls are batched before one cleanup_R1(), and this is a
+    // lone call whose dirty R1 outlives it on three separate paths: sat == 255
+    // and val == 255 both skip their blocks entirely, and the sat == 0 branch
+    // below just assigns 255s. Any of those returns to the caller with AVR's
+    // __zero_reg__ non-zero. See issue #668.
+    if( Gscale ) g = scale8_video( g, Gscale);
 
     // Scale down colors if we're desaturated at all
     // and add the brightness_floor to r, g, and b.
@@ -460,7 +467,9 @@ void hsv2rgb_rainbow( const CHSV& hsv, CRGB& rgb)
     // Now scale everything down if we're at value < 255.
     if( val != 255 ) {
 
-        val = scale8_video_LEAVING_R1_DIRTY( val, val);
+        // This call is followed by branching before any other scale8 batch,
+        // so use the cleaning form rather than carrying dirty R1 through C++.
+        val = scale8_video( val, val);
         if( val == 0 ) {
             r=0; g=0; b=0;
         } else {
@@ -492,7 +501,7 @@ void hsv2rgb_rainbow( const CHSV& hsv, CRGB& rgb)
     rgb.b = b;
 }
 
-void hsv2rgb_fullspectrum( const CHSV& hsv, CRGB& rgb) {
+void hsv2rgb_fullspectrum( const CHSV& hsv, CRGB& rgb) FL_NO_EXCEPT {
   const auto f = [](const int n, const fl::u8 h) -> fl::u32 {
     constexpr int kZero = 0 << 8;
     constexpr int kOne  = 1 << 8;
@@ -511,32 +520,32 @@ void hsv2rgb_fullspectrum( const CHSV& hsv, CRGB& rgb) {
 }
 
 /// Inline version of hsv2rgb_fullspectrum which returns a CRGB object.
-CRGB hsv2rgb_fullspectrum( const CHSV& hsv) {
+CRGB hsv2rgb_fullspectrum( const CHSV& hsv) FL_NO_EXCEPT {
     CRGB rgb;
     hsv2rgb_fullspectrum(hsv, rgb);
     return rgb;
 }
 
 
-void hsv2rgb_raw(const CHSV * phsv, CRGB * prgb, int numLeds) {
+void hsv2rgb_raw(const CHSV * phsv, CRGB * prgb, int numLeds) FL_NO_EXCEPT {
     for(int i = 0; i < numLeds; ++i) {
         hsv2rgb_raw(phsv[i], prgb[i]);
     }
 }
 
-void hsv2rgb_rainbow( const CHSV* phsv, CRGB * prgb, int numLeds) {
+void hsv2rgb_rainbow( const CHSV* phsv, CRGB * prgb, int numLeds) FL_NO_EXCEPT {
     for(int i = 0; i < numLeds; ++i) {
         hsv2rgb_rainbow(phsv[i], prgb[i]);
     }
 }
 
-void hsv2rgb_spectrum( const CHSV* phsv, CRGB * prgb, int numLeds) {
+void hsv2rgb_spectrum( const CHSV* phsv, CRGB * prgb, int numLeds) FL_NO_EXCEPT {
     for(int i = 0; i < numLeds; ++i) {
         hsv2rgb_spectrum(phsv[i], prgb[i]);
     }
 }
 
-void hsv2rgb_fullspectrum( const CHSV* phsv, CRGB * prgb, int numLeds) {
+void hsv2rgb_fullspectrum( const CHSV* phsv, CRGB * prgb, int numLeds) FL_NO_EXCEPT {
     for (int i = 0; i < numLeds; ++i) {
         hsv2rgb_fullspectrum(phsv[i], prgb[i]);
     }
@@ -549,10 +558,12 @@ void hsv2rgb_fullspectrum( const CHSV* phsv, CRGB * prgb, int numLeds) {
 // nearly as fast as the normal HSV-to-RGB conversion.
 // See extended notes in the .h file.
 CHSV rgb2hsv_approximate( const CRGB& rgb)
-{
-    fl::u8 r = rgb.r;
-    fl::u8 g = rgb.g;
-    fl::u8 b = rgb.b;
+FL_NO_EXCEPT {
+    // These channels can exceed 255 while saturation is being undone. Keep
+    // the intermediate values wide until they are normalized below.
+    fl::u16 r = rgb.r;
+    fl::u16 g = rgb.g;
+    fl::u16 b = rgb.b;
     fl::u8 h, s, v;
 
     // find desaturation
@@ -608,8 +619,10 @@ CHSV rgb2hsv_approximate( const CRGB& rgb)
 
     //Serial.print("total="); Serial.print(total); Serial.println("");
 
-    // scale all channels up to compensate for low values
-    if( total < 255) {
+    // Normalize the channels to the range expected by the hue approximation.
+    // This scales low totals up as before, and also scales high totals down
+    // instead of letting wide intermediates wrap when stored in u8 channels.
+    if( total != 255) {
         if( total == 0) total = 1;
         fl::u32 scaleup = 65535 / (total);
         r = ((fl::u32)(r) * scaleup) / 256;
@@ -662,7 +675,7 @@ CHSV rgb2hsv_approximate( const CRGB& rgb)
 
     // start with which channel is highest
     // (ties don't matter)
-    fl::u8 highest = r;
+    fl::u16 highest = r;
     if( g > highest) highest = g;
     if( b > highest) highest = b;
 
@@ -678,9 +691,23 @@ CHSV rgb2hsv_approximate( const CRGB& rgb)
             h = HUE_RED;
             h += scale8( g, FIXFRAC8(32,85));
         } else {
-            // R-G < G, we're in Orange-Yellow
+            // R-G < G, we're in Orange-Yellow.
+            //
+            // This used to read `(g - 85) + (171 - r)`. Reaching this branch
+            // requires g >= r/2, and r is the largest channel, so r > 171 is
+            // the normal case here -- making (171 - r) negative. The sum was
+            // then truncated to u8 by qsub8() and wrapped to a large value,
+            // sending orange out into the greens: rgb(255,153,0) returned hue
+            // 122 instead of ~26. See issue #436.
+            //
+            // (255 - r) is the same measure of "how far r has fallen" but
+            // cannot go negative, and the sum (g - 85) + (255 - r) has a
+            // minimum of ~42 over this branch's own entry condition, so the
+            // wrap is structurally impossible rather than merely unlikely.
+            // Spans ~42..170, hence FIXFRAC8(32,170) to land the top of the
+            // range on HUE_YELLOW.
             h = HUE_ORANGE;
-            h += scale8( qsub8((g - 85) + (171 - r), 4), FIXFRAC8(32,85)); //221
+            h += scale8( qsub8((g - 85) + (255 - r), 4), FIXFRAC8(32,170));
         }
 
     } else if ( highest == g) {

@@ -18,13 +18,6 @@ class WorkflowType(Enum):
     WASM = "wasm"
 
 
-class BuildBackend(Enum):
-    """Compilation backend selection (fbuild vs PlatformIO's `pio run`)."""
-
-    FBUILD = "fbuild"
-    PLATFORMIO = "platformio"
-
-
 @dataclass(frozen=True)
 class CompilationConfig:
     """Immutable compilation configuration with validation."""
@@ -40,7 +33,6 @@ class CompilationConfig:
     verbose: bool = False
     # Output options
     output_path: Optional[Path] = None
-    merged_bin: bool = False
     log_failures: Optional[Path] = None
     max_failures: Optional[int] = None
 
@@ -48,7 +40,6 @@ class CompilationConfig:
     wasm_run: bool = False
 
     # Advanced options
-    global_cache_dir: Optional[Path] = None
     skip_filters: bool = (
         False  # True to skip @filter directives (override platform/memory constraints)
     )
@@ -57,27 +48,9 @@ class CompilationConfig:
     # Info options
     build_info: Optional[Path] = None  # Output file path for build info JSON
 
-    # Build backend selection (default fbuild; --backend=platformio forces `pio run`)
-    backend: BuildBackend = BuildBackend.FBUILD
-
     def validate(self) -> list[str]:
         """Validate configuration and return list of error messages."""
         errors: list[str] = []
-
-        # Validate merged-bin requirements
-        if self.merged_bin:
-            if len(self.examples) != 1:
-                errors.append(
-                    f"--merged-bin requires exactly one sketch, got {len(self.examples)}"
-                )
-            if len(self.boards) != 1:
-                errors.append(
-                    f"--merged-bin requires exactly one board, got {len(self.boards)}"
-                )
-            if self.boards and not self.boards[0].board_name.startswith("esp"):
-                errors.append(
-                    f"--merged-bin only supports ESP32/ESP8266, got {self.boards[0].board_name}"
-                )
 
         # Validate output path requirements
         if self.output_path:
@@ -119,12 +92,13 @@ class CompilationArgumentParser:
         """Parse arguments and return validated config."""
         parser = self._create_parser()
 
-        # Parse arguments with intelligent unknown handling
-        try:
-            parsed = parser.parse_intermixed_args(args)
-            unknown: list[str] = []
-        except SystemExit:
-            parsed, unknown = parser.parse_known_args(args)
+        # Parse interspersed positional examples while retaining unknown values
+        # for the explicit option/error handling below.
+        parsed, unknown = parser.parse_known_intermixed_args(args)
+
+        unknown_options = [arg for arg in unknown if arg.startswith("-")]
+        if unknown_options:
+            parser.error(f"unrecognized arguments: {' '.join(unknown_options)}")
 
         # Add unknown non-flag arguments as examples
         if unknown:
@@ -156,7 +130,7 @@ class CompilationArgumentParser:
     def _create_parser(self) -> argparse.ArgumentParser:
         """Create argument parser with all options."""
         parser = argparse.ArgumentParser(
-            description="Compile FastLED examples for various boards using PioCompiler"
+            description="Compile FastLED examples for various boards with fbuild"
         )
 
         # Positional arguments
@@ -169,7 +143,12 @@ class CompilationArgumentParser:
         parser.add_argument(
             "positional_examples",
             type=str,
-            help="Examples to compile (positional arguments after board name)",
+            help=(
+                "Examples to compile (positional arguments after board name). "
+                "'all' compiles every example; 'smoke' compiles "
+                "tests/platforms/_standard/SMOKE_SKETCHES.txt plus examples "
+                "changed against GITHUB_BASE_REF / FASTLED_SMOKE_BASE_REF."
+            ),
             nargs="*",
         )
 
@@ -179,6 +158,18 @@ class CompilationArgumentParser:
         )
         parser.add_argument(
             "--exclude-examples", type=str, help="Examples that should be excluded"
+        )
+        parser.add_argument(
+            "--shard-index",
+            type=int,
+            help="Zero-based shard index for an 'all' example build. "
+            "Requires --shard-count.",
+        )
+        parser.add_argument(
+            "--shard-count",
+            type=int,
+            help="Split an 'all' example build into this many deterministic shards. "
+            "Requires --shard-index.",
         )
         parser.add_argument(
             "--no-filter",
@@ -192,7 +183,7 @@ class CompilationArgumentParser:
         parser.add_argument(
             "--extra-packages",
             type=str,
-            help="Comma-separated list of extra PlatformIO library packages to install (e.g., 'OctoWS2811')",
+            help="Comma-separated list of extra lib_deps entries (e.g., 'OctoWS2811')",
         )
         parser.add_argument(
             "-v", "--verbose", action="store_true", help="Enable verbose output"
@@ -205,12 +196,6 @@ class CompilationArgumentParser:
             help="Output path for build artifact. Requires exactly one sketch. "
             "If path ends with '/', treated as directory. If has suffix, treated as file. "
             "Use '-o .' to save in current directory with sketch name.",
-        )
-        parser.add_argument(
-            "--merged-bin",
-            action="store_true",
-            help="Generate merged binary for QEMU/flashing (ESP32/ESP8266 only). "
-            "Produces a single flash image instead of separate bootloader/firmware/partition files.",
         )
         parser.add_argument(
             "--log-failures",
@@ -256,36 +241,12 @@ class CompilationArgumentParser:
             action="store_true",
             help="Disable parallel compilation (builds are already sequential, this is a no-op)",
         )
-        parser.add_argument(
-            "--global-cache",
-            type=str,
-            help="Override global PlatformIO cache directory path (for testing)",
-        )
-
-        # Build backend selection. Default is fbuild (fast, incremental).
-        # --backend=platformio / --platformio / --pio forces `pio run` (slower,
-        # but exercises the PlatformIO-native build for size/compat comparison).
-        parser.add_argument(
-            "--backend",
-            choices=[b.value for b in BuildBackend],
-            default=BuildBackend.FBUILD.value,
-            help="Select build backend: 'fbuild' (default, fast) or 'platformio' "
-            "(runs `pio run` for a PlatformIO-native build). Use 'platformio' "
-            "to compare against fbuild output or reproduce PlatformIO-only "
-            "size/link behavior.",
-        )
-        parser.add_argument(
-            "--platformio",
-            "--pio",
-            dest="platformio_backend",
-            action="store_true",
-            help="Shortcut for --backend=platformio (force PlatformIO `pio run`).",
-        )
+        # fbuild is the only board build backend; ``--fbuild`` is accepted
+        # for scripts that still pass it.
         parser.add_argument(
             "--fbuild",
-            dest="fbuild_backend",
             action="store_true",
-            help="Shortcut for --backend=fbuild (default).",
+            help="Accepted for compatibility; fbuild is the only backend.",
         )
 
         return parser
@@ -309,19 +270,6 @@ class CompilationArgumentParser:
             else []
         )
 
-        # Resolve build backend. Precedence (last wins among explicit flags):
-        #   --fbuild  -> fbuild
-        #   --platformio / --pio -> platformio
-        #   --backend=<value>  -> <value> (explicit takes precedence over shortcuts
-        #       only if also passed; argparse has no easy "was flag passed" signal
-        #       for choices with a default, so we honor the shortcut if set, else
-        #       the --backend value).
-        backend = BuildBackend(args.backend)
-        if getattr(args, "platformio_backend", False):
-            backend = BuildBackend.PLATFORMIO
-        if getattr(args, "fbuild_backend", False):
-            backend = BuildBackend.FBUILD
-
         return CompilationConfig(
             boards=boards,
             examples=examples,
@@ -330,17 +278,14 @@ class CompilationArgumentParser:
             extra_packages=extra_packages,
             verbose=args.verbose,
             output_path=Path(args.out) if args.out else None,
-            merged_bin=args.merged_bin,
             log_failures=Path(args.log_failures) if args.log_failures else None,
             max_failures=args.max_failures if hasattr(args, "max_failures") else None,
             wasm_run=args.run,
-            global_cache_dir=Path(args.global_cache) if args.global_cache else None,
             skip_filters=skip_filters,
             no_parallel=args.no_parallel,
             build_info=Path(args.build_info)
             if hasattr(args, "build_info") and args.build_info
             else None,
-            backend=backend,
         )
 
     def _resolve_boards(self, board_spec: Optional[str]) -> list[Board]:
@@ -382,23 +327,62 @@ class CompilationArgumentParser:
         """
         # Track if 'all' was used for auto-discovery
 
+        # `--examples A B C` parses A as the option value and B C as
+        # positionals; merge both (order-preserving, de-duplicated) instead of
+        # letting the positionals silently drop the --examples value (#4805).
+        requested: list[str] = []
+        if args.examples:
+            requested.extend(ex for ex in args.examples.split(",") if ex)
         if args.positional_examples:
-            examples = [self._normalize_example(ex) for ex in args.positional_examples]
-        elif args.examples:
-            examples = [self._normalize_example(ex) for ex in args.examples.split(",")]
+            requested.extend(args.positional_examples)
+        if requested:
+            examples = []
+            for ex in requested:
+                normalized = self._normalize_example(ex)
+                if normalized not in examples:
+                    examples.append(normalized)
         else:
             # Default to Blink if no examples specified
             examples = ["Blink"]
 
         # Check for special 'all' keyword
-        if "all" in examples:
+        requested_all = "all" in examples
+        if requested_all:
             # Remove 'all' keyword and discover all examples
             examples = self._discover_all_examples()
+        elif "smoke" in examples:
+            # Reduced PR set: the smoke manifest plus examples the PR changes
+            # (ci/compiler/smoke_examples.py, #4415). Any other names given
+            # alongside the keyword are kept.
+            from ci.compiler.smoke_examples import resolve_smoke_examples
+
+            extra = [ex for ex in examples if ex != "smoke"]
+            examples = resolve_smoke_examples(project_root=self.project_root)
+            examples.extend(ex for ex in extra if ex not in examples)
 
         # Apply exclusions
         if hasattr(args, "exclude_examples") and args.exclude_examples:
             excludes = set(args.exclude_examples.split(","))
             examples = [ex for ex in examples if ex not in excludes]
+
+        # Large cross-platform sweeps can exceed a single CI job's timeout.
+        # Keep the selection derived from the sorted discovery result so every
+        # shard is deterministic, disjoint, and collectively exhaustive.
+        shard_index = getattr(args, "shard_index", None)
+        shard_count = getattr(args, "shard_count", None)
+        if (shard_index is None) != (shard_count is None):
+            raise ValueError("--shard-index and --shard-count must be used together")
+        if shard_index is not None and shard_count is not None:
+            if not requested_all:
+                raise ValueError("example sharding requires the 'all' keyword")
+            if shard_count <= 0:
+                raise ValueError("--shard-count must be a positive integer")
+            if shard_index < 0 or shard_index >= shard_count:
+                raise ValueError(
+                    "--shard-index must be in the range "
+                    f"0..{shard_count - 1}, got {shard_index}"
+                )
+            examples = examples[shard_index::shard_count]
 
         # Validate examples exist
         for example in examples:

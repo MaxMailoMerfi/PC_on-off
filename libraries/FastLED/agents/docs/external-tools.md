@@ -65,16 +65,17 @@ Multi-agent PR review: launches 4 parallel agents (2x CLAUDE.md compliance, 1x b
 ### Arduino (Not Applicable)
 
 **hardware-mcp/arduino-mcp-server** — 21 tools wrapping `arduino-cli`
-- **Verdict: NOT RECOMMENDED.** FastLED uses PlatformIO, not arduino-cli.
+- **Verdict: NOT RECOMMENDED.** FastLED development builds use fbuild and the repository's maintained wrappers, not arduino-cli.
 
 ### Embedded Debugging
 
 **Adancurusul/embedded-debugger-mcp** — 60 stars, Rust, probe-rs debugging
 - **Verdict: NOT RELEVANT.** JTAG/SWD probe-based for ARM Cortex-M. ESP32 uses different debug infrastructure.
 
-### PlatformIO MCP
+### fbuild MCP
 
-**Does not exist.** No dedicated PlatformIO MCP server found. Gap in the ecosystem.
+fbuild provides its own MCP server through `fbuild mcp`, so a separate
+build-tool MCP integration is unnecessary.
 
 ### On-Device MCP (ESP32 as server)
 
@@ -102,7 +103,7 @@ These capabilities have no community skill and FastLED's custom tools are superi
 
 1. **C++ Embedded Memory Safety** — ISR volatile checking, DMA alignment, stack depth analysis
 2. **LED Protocol Timing Analysis** — SPI/RMT clock verification, T1/T2/T3 validation
-3. **PlatformIO/Meson Build Optimization** — Cross-compilation matrix, unity build tuning
+3. **fbuild/Meson Build Optimization** — Cross-compilation matrix, unity build tuning
 4. **C++ API Documentation** — Doxygen-aware header documentation generation
 
 FastLED's existing skills (`/memory-audit`, `/timing-analysis`, `/platform-port`) already cover these gaps better than anything available in the community.
@@ -150,6 +151,6 @@ If LSP has issues on Windows: `npx tweakcc --apply` from Piebald-AI/tweakcc patc
 | code-review plugin | **TRY** | Multi-agent review with confidence scoring |
 | superpowers (selective) | **TRY** | systematic-debugging, verification skills |
 | serial-mcp-server | **OPTIONAL** | Only if interactive serial debugging needed |
-| arduino-mcp-server | **SKIP** | Wrong build system (arduino-cli vs PlatformIO) |
+| arduino-mcp-server | **SKIP** | Wrong build system (arduino-cli vs fbuild) |
 | embedded-debugger-mcp | **SKIP** | Wrong debug infrastructure (probe-rs vs ESP tools) |
 | rohitg00 toolkit | **REFERENCE** | Use as discovery catalog, not direct install |

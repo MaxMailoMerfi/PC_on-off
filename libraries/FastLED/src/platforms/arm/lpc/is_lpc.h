@@ -14,7 +14,7 @@
 ///
 /// Detection uses MCUXpresso / CMSIS device-header defines (e.g.
 /// CPU_LPC845M301JBD48, CPU_LPC1115FBD48) as well as bare project-level defines
-/// that fbuild / PlatformIO configurations are expected to provide
+/// that fbuild configurations are expected to provide
 /// (__LPC845__, __LPC804__, __LPC11xx__).
 ///
 /// **Macro naming convention** (FastLED #2999): every platform / subtype
@@ -110,4 +110,22 @@
 #if defined(FL_IS_ARM_LPC_845) || defined(FL_IS_ARM_LPC_804) || \
     defined(FL_IS_ARM_LPC_11) || defined(FL_IS_ARM_LPC_15)
 #define FL_IS_ARM_LPC
+#endif
+
+// LPC845 clockless AUTO defaults to the USART+DMA channel engine. Define
+// FASTLED_LPC_UART_DMA=0 before including FastLED to force the older bit-bang
+// default. Non-LPC845 builds normalize the feature macro to 0 so downstream
+// gates can use `#if FASTLED_LPC_UART_DMA`.
+#if !defined(FASTLED_LPC_UART_DMA)
+#if defined(FL_IS_ARM_LPC_845)
+#define FASTLED_LPC_UART_DMA 1
+#else
+#define FASTLED_LPC_UART_DMA 0
+#endif
+#endif
+
+// The DMA ISR hub is defaulted on with LPC845 UART DMA so frames longer than
+// one 1024-byte DMA descriptor keep streaming. Users can still override it.
+#if FASTLED_LPC_UART_DMA && !defined(FASTLED_LPC_DMA_ISR)
+#define FASTLED_LPC_DMA_ISR 1
 #endif

@@ -48,7 +48,9 @@ struct EdgeTimestamp {
  * - Ultra-fast edge capture: <130 ns ISR latency
  * - Circular buffer: Lock-free communication between ISRs
  * - Filtering: Skip signals, jitter filter, timeout detection
- * - Edge capture rate: >1 MHz
+ * - Sustained edge capture rate: ~385 kHz measured on ESP32-C6 @ 160 MHz
+ *   (FastLED#3586). Too slow for WS28xx (~300 ns T0H) — use the
+ *   PARLIO_RX oversampling backend for clockless LED validation.
  *
  * Pin Configuration:
  * - IMPORTANT: The pin must be configured (pinMode) by the user BEFORE calling begin()
@@ -101,7 +103,7 @@ public:
      * rx->begin(config);
      * @endcode
      */
-    static fl::shared_ptr<GpioIsrRx> create(int pin) FL_NOEXCEPT;
+    static fl::shared_ptr<GpioIsrRx> create(int pin) FL_NO_EXCEPT;
 
     /**
      * @brief Virtual destructor
@@ -125,13 +127,13 @@ public:
      * - signal_range_max_ns: Pulses longer than this terminate reception (idle timeout)
      * - skip_signals: Number of edges to skip before capturing
      */
-    virtual bool begin(const RxConfig& config) override = 0;
+    virtual bool begin(const RxConfig& config) FL_NO_EXCEPT override = 0;
 
     /**
      * @brief Check if receive operation is complete
      * @return true if receive finished, false if still in progress
      */
-    virtual bool finished() const override = 0;
+    virtual bool finished() const FL_NO_EXCEPT override = 0;
 
     /**
      * @brief Wait for edge timestamps with timeout
@@ -144,7 +146,7 @@ public:
      * - Returns SUCCESS if buffer filled OR idle timeout elapsed
      * - Returns TIMEOUT if wait timeout occurs
      */
-    virtual RxWaitResult wait(u32 timeout_ms) override = 0;
+    virtual RxWaitResult wait(u32 timeout_ms) FL_NO_EXCEPT override = 0;
 
     /**
      * @brief Get captured edge timestamps as a span
@@ -165,7 +167,7 @@ public:
      * using the provided timing thresholds.
      */
     virtual fl::result<u32, DecodeError> decode(const ChipsetTiming4Phase &timing,
-                                                       fl::span<u8> out) override = 0;
+                                                       fl::span<u8> out) FL_NO_EXCEPT override = 0;
 
     /**
      * @brief Manually inject edge timings for testing (Phase 1)
@@ -175,7 +177,7 @@ public:
      * Stores EdgeTime entries directly in internal edge buffer as EdgeTimestamp.
      * After injection, use decode() to process edges.
      */
-    virtual bool injectEdges(fl::span<const EdgeTime> edges) override = 0;
+    virtual bool injectEdges(fl::span<const EdgeTime> edges) FL_NO_EXCEPT override = 0;
 
 protected:
     GpioIsrRx() = default;

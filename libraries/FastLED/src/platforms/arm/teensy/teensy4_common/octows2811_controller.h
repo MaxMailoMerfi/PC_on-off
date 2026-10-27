@@ -1,5 +1,11 @@
 // IWYU pragma: private
 
+// COctoWS2811Controller is intentionally NOT bridged onto ChannelManager (#4588).
+// It is an opt-in wrapper, compiled only under USE_OCTOWS2811. The PJRC
+// OctoWS2811 library owns its own DMA and framebuffers, so there is no FastLED
+// channel engine to bridge onto; a bridge would only duplicate the ObjectFLED
+// path that every other legacy Teensy 4 addLeds<>() controller already uses.
+
 #ifndef __INC_OCTOWS2811_CONTROLLER_H
 #define __INC_OCTOWS2811_CONTROLLER_H
 
@@ -16,7 +22,7 @@ class COctoWS2811Controller : public CPixelLEDController<RGB_ORDER, 8, 0xFF> {
   OctoWS2811  *pocto;
   u8 *drawbuffer,*framebuffer;
 
-  void _init(int nLeds) FL_NOEXCEPT {
+  void _init(int nLeds) FL_NO_EXCEPT {
     if(pocto == nullptr) {
       drawbuffer = (u8*)fl::malloc(nLeds * 8 * 3);
       framebuffer = (u8*)fl::malloc(nLeds * 8 * 3);
@@ -32,11 +38,11 @@ class COctoWS2811Controller : public CPixelLEDController<RGB_ORDER, 8, 0xFF> {
   }
 public:
   COctoWS2811Controller() { pocto = nullptr; }
-  virtual int size() { return CLEDController::size() * 8; }
+  int size() const FL_NO_EXCEPT override { return CLEDController::size() * 8; }
 
   virtual void init() { /* do nothing yet */ }
 
-  virtual void showPixels(PixelController<RGB_ORDER, 8, 0xFF> &pixels) FL_NOEXCEPT {
+  virtual void showPixels(PixelController<RGB_ORDER, 8, 0xFF> &pixels) FL_NO_EXCEPT {
     u32 size = pixels.size();
     u32 sizeTimes8 = 8U * size;
     _init(size);

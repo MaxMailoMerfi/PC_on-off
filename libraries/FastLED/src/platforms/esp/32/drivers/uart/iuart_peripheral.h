@@ -70,16 +70,18 @@ struct UartPeripheralConfig {
     u32 mRxBufferSize;      ///< RX ring buffer size (typically 0 for LED control)
     u8 mStopBits;           ///< Stop bits: 1 or 2 (UART_STOP_BITS_1=1, UART_STOP_BITS_2=2)
     int mUartNum;                ///< UART peripheral number (0, 1, or 2)
+    u8 mDataBits;           ///< Data bits per frame: 5-8 (wave10 uses 8, wave8-frame uses 6)
 
     /// @brief Default constructor (for mock testing)
-    UartPeripheralConfig() FL_NOEXCEPT
+    UartPeripheralConfig() FL_NO_EXCEPT
         : mBaudRate(0),
           mTxPin(-1),
           mRxPin(-1),
           mTxBufferSize(0),
           mRxBufferSize(0),
           mStopBits(1),
-          mUartNum(0) {}
+          mUartNum(0),
+          mDataBits(8) {}
 
     /// @brief Constructor with all parameters
     UartPeripheralConfig(u32 baud_rate,
@@ -88,14 +90,16 @@ struct UartPeripheralConfig {
                          u32 tx_buffer_size,
                          u32 rx_buffer_size,
                          u8 stop_bits,
-                         int uart_num) FL_NOEXCEPT
+                         int uart_num,
+                         u8 data_bits = 8) FL_NO_EXCEPT
         : mBaudRate(baud_rate),
           mTxPin(tx_pin),
           mRxPin(rx_pin),
           mTxBufferSize(tx_buffer_size),
           mRxBufferSize(rx_buffer_size),
           mStopBits(stop_bits),
-          mUartNum(uart_num) {}
+          mUartNum(uart_num),
+          mDataBits(data_bits) {}
 };
 
 //=============================================================================
@@ -159,7 +163,7 @@ public:
     ///
     /// Call once during initialization. Must succeed before any other
     /// methods can be used.
-    virtual bool initialize(const UartPeripheralConfig& config) FL_NOEXCEPT = 0;
+    virtual bool initialize(const UartPeripheralConfig& config) FL_NO_EXCEPT = 0;
 
     /// @brief Deinitialize UART peripheral and release resources
     ///
@@ -167,7 +171,7 @@ public:
     ///
     /// Call after all transmissions are complete. Frees TX/RX buffers
     /// and releases UART hardware.
-    virtual void deinitialize() FL_NOEXCEPT = 0;
+    virtual void deinitialize() FL_NO_EXCEPT = 0;
 
     /// @brief Check if peripheral is initialized
     /// @return true if initialized, false otherwise
@@ -175,7 +179,7 @@ public:
     /// Used to detect if peripheral was reset (for testing).
     /// Production hardware: Always returns true after initialize() succeeds.
     /// Mock implementation: Returns false after deinitialize() is called.
-    virtual bool isInitialized() const FL_NOEXCEPT = 0;
+    virtual bool isInitialized() const FL_NO_EXCEPT = 0;
 
     //=========================================================================
     // Transmission Methods
@@ -197,7 +201,7 @@ public:
     /// - If TX buffer is full: Blocks until space available (or timeout)
     ///
     /// Each byte is automatically framed with start bit (LOW) and stop bit (HIGH).
-    virtual bool writeBytes(const u8* data, size_t length) FL_NOEXCEPT = 0;
+    virtual bool writeBytes(const u8* data, size_t length) FL_NO_EXCEPT = 0;
 
     /// @brief Wait for all queued bytes to be transmitted
     /// @param timeout_ms Timeout in milliseconds (0 = non-blocking poll)
@@ -215,7 +219,7 @@ public:
     /// Returns false if:
     /// - Timeout occurs before completion
     /// - Hardware error occurs during transmission
-    virtual bool waitTxDone(u32 timeout_ms) FL_NOEXCEPT = 0;
+    virtual bool waitTxDone(u32 timeout_ms) FL_NO_EXCEPT = 0;
 
     //=========================================================================
     // State Queries
@@ -226,14 +230,14 @@ public:
     ///
     /// Used to poll transmission status without blocking. Equivalent to
     /// calling waitTxDone(0) but more explicit.
-    virtual bool isBusy() const FL_NOEXCEPT = 0;
+    virtual bool isBusy() const FL_NO_EXCEPT = 0;
 
     /// @brief Get current UART configuration
     /// @return Reference to current configuration
     ///
     /// Returns the configuration passed to initialize(). Useful for
     /// debugging and validation.
-    virtual const UartPeripheralConfig& getConfig() const FL_NOEXCEPT = 0;
+    virtual const UartPeripheralConfig& getConfig() const FL_NO_EXCEPT = 0;
 };
 
 } // namespace fl
